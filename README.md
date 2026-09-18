@@ -244,8 +244,12 @@ okagent pubkey james@example.com --slot ECC3 # same key as `onlykey-agent james@
 okagent pubkey james@example.com --slot RSA1 # same key as `onlykey-agent james@example.com -sk RSA1 -e rsa2048`
 ```
 
-An empty ECC slot answers "Error no ECC Private Key set in this slot"; slots
-above 16 get no answer at all from firmware v3.0.4.
+An empty ECC slot answers "Error no ECC Private Key set in this slot" and an
+empty RSA slot "Error no RSA Private Key set in this slot"; ECC slots above
+16 get no answer at all from firmware v3.0.4. Checked on hardware so far:
+derived ed25519 and stored RSA (2048-bit) public keys are byte-identical to
+the Python agent's. `OKAGENT_LOG=onlykey_agent=trace` logs every report the
+token sends, which is the quickest way to see what a slot really answers.
 
 ## License
 
