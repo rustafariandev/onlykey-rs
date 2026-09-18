@@ -1,0 +1,49 @@
+[workspace]
+members = ["okagent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/rustafariandev/onlykey-rs"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[package]
+name = "onlykey-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Derive SSH keys and sign with an OnlyKey hardware token, plus an SSH agent built on it"
+keywords = ["onlykey", "ssh", "ssh-agent", "hardware-token", "hid"]
+categories = ["authentication", "cryptography", "hardware-support"]
+readme = "README.md"
+
+[features]
+default = []
+# `serde` derives on `Curve`, for config files.
+serde = ["dep:serde"]
+
+[dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256"] }
+ssh-encoding = "0.2"
+signature = "2"
+sha2 = "0.10"
+deunicode = "1"
+hex = "0.4"
+thiserror = "2"
+tracing = "0.1"
+nix = { version = "0.30", features = ["fs", "user"] }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+ed25519-dalek = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+
+[lints]
+workspace = true
