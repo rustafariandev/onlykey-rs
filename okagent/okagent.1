@@ -1,0 +1,571 @@
+.TH OKAGENT 1 "2026-09-18" "okagent 0.1.0" "User Commands"
+.SH NAME
+okagent \- SSH agent backed by an OnlyKey hardware token
+.SH SYNOPSIS
+.SY okagent
+.RI [ options ]
+.B status
+.YS
+.SY okagent
+.RI [ options ]
+.B pubkey
+.RB [ \-\-pubkey\-file
+.IR file ]
+.RI [ identity .\|.\|.]
+.YS
+.SY okagent
+.RI [ options ]
+.B run
+.RB [ \-\-pubkey\-file
+.IR file ]
+.RI [ identity .\|.\|.]
+.B \-\-
+.I command
+.RI [ arg .\|.\|.]
+.YS
+.SY okagent
+.RI [ options ]
+.B shell
+.RB [ \-\-pubkey\-file
+.IR file ]
+.RI [ identity .\|.\|.]
+.YS
+.SY okagent
+.RI [ options ]
+.B ssh
+.I identity
+.RI [ ssh-arg .\|.\|.]
+.YS
+.SY okagent
+.RI [ options ]
+.B serve
+.RB [ \-\-socket
+.IR path ]
+.RB [ \-\-daemon ]
+.RB [ \-\-pubkey\-file
+.IR file ]
+.RI [ identity .\|.\|.]
+.YS
+.SH DESCRIPTION
+.B okagent
+is an SSH agent whose private keys live on an
+.UR https://onlykey.io
+OnlyKey
+.UE
+hardware token.
+No key material is stored on the host: for every operation the token
+re-derives the key from an
+.I identity
+string such as
+.BR james@example.com ,
+and every signature must be confirmed on the device by entering a
+three-digit challenge on its buttons.
+.PP
+Given the same identity and curve,
+.B okagent
+derives the same public key as the Python
+.B onlykey\-agent
+program, so existing
+.I authorized_keys
+entries keep working.
+.PP
+Keys that the OnlyKey app has written into one of the token's sixteen ECC
+slots or four RSA slots ("stored keys") can be used as well, by naming the
+slot with
+.B \-\-slot
+or the
+.B slot
+configuration key.
+The identity then only labels the key; it is not involved in signing.
+RSA keys exist only as stored keys.
+.PP
+An identity has the form
+.RI [ user @] host .
+A
+.IB scheme ://
+prefix, a
+.BI : port
+suffix and a
+.BI / path
+suffix are accepted and ignored.
+Non-ASCII characters are transliterated to ASCII before the identity is
+hashed; a warning is logged when this happens.
+Identities may be omitted from the command line when the configuration file
+lists them (see
+.BR "CONFIGURATION FILE" ).
+.PP
+The agent implements only the
+.I request identities
+and
+.I sign request
+operations of the SSH agent protocol.
+Adding, removing or locking keys is refused, which OpenSSH reports as
+unsupported.
+.SH COMMANDS
+.TP
+.B status
+Print the firmware version and lock state of the attached OnlyKey.
+.TP
+.BI pubkey " " [ identity \fR.\|.\|.]
+Print the public key of each identity, one per line, in
+.I authorized_keys
+format.
+The comment field is
+.BI <ssh:// identity | curve >
+where
+.I curve
+is
+.B ed25519
+or
+.BR nist256p1 ,
+matching the Python agent.
+A stored key's comment has the slot as a third field,
+.BI <ssh:// identity | curve | ECC n >
+or
+.BI <ssh:// identity |rsa|RSA n >,
+so that a derived and a stored key for the same identity can be told apart.
+.TP
+.BI run " " [ identity \fR.\|.\|.] " \-\- " command " " [ arg \fR.\|.\|.]
+Start a temporary agent on a private socket, run
+.I command
+with
+.B SSH_AUTH_SOCK
+pointing at it, and stop the agent when the command exits.
+.B okagent
+exits with the command's exit status.
+.TP
+.BI shell " " [ identity \fR.\|.\|.]
+Like
+.BR run ,
+but runs
+.B $SHELL
+(or
+.I /bin/sh
+if unset).
+.TP
+.BI ssh " identity " [ ssh-arg \fR.\|.\|.]
+Derive the identity's key and run
+.BR ssh (1)
+against it.
+The host part of the identity is the destination and the user part, if
+any, becomes the login name.
+.B ssh
+is told to use only this key
+.RB ( "IdentitiesOnly=yes" )
+by way of a temporary public key file.
+Any further arguments are passed to
+.B ssh
+after the destination, so they normally form a remote command.
+.TP
+.BI serve " " [ identity \fR.\|.\|.]
+Run a long-lived agent on a unix socket.
+Without
+.BR \-\-daemon ,
+the agent stays in the foreground and prints a line of the form
+.PP
+.RS
+.RS
+.EX
+SSH_AUTH_SOCK=\fIpath\fR; export SSH_AUTH_SOCK;
+.EE
+.RE
+.PP
+on standard error.
+The agent stops on SIGINT, SIGTERM or SIGHUP and removes its socket.
+An existing live socket at the path is never replaced.
+.RE
+.SH OPTIONS
+The following options apply to every command and may be given before or
+after the command name.
+.TP
+.BI \-\-config " file"
+Read
+.I file
+instead of the default configuration file.
+A missing explicit file is an error; a missing default file is not.
+.TP
+.BI \-\-curve " curve"
+Curve for identities given on the command line, and the default for
+configuration entries without one.
+.I curve
+is
+.B ed25519
+(the default) or
+.B nistp256
+(also spelled
+.B p256
+or
+.BR nist256p1 ).
+.TP
+.BI \-\-slot " slot"
+Use the key stored in
+.I slot
+for the identities given on the command line, instead of deriving one.
+.I slot
+is
+.B ECC1
+to
+.B ECC16
+(a bare number means an ECC slot) or
+.B RSA1
+to
+.BR RSA4 ,
+as numbered in the OnlyKey app.
+For an ECC slot the
+.B \-\-curve
+(or its default) must match the key type the slot was written with;
+otherwise the command fails and names the curve the slot actually holds.
+An RSA slot takes no curve, and giving
+.B \-\-curve
+with one is an error; whether the slot holds a 2048- or 4096-bit key is
+read from the token.
+An empty slot is reported as such by the firmware.
+This option applies only to identities on the command line; configuration
+entries carry their own
+.B slot
+key.
+.TP
+.BI \-\-notify\-command " command"
+Run
+.I command
+whenever a signature needs confirming, with the challenge prompt appended
+as its last argument.
+.I command
+is split on whitespace; the first word is the program.
+The prompt is still written to the terminal as well.
+See
+.BR "CHALLENGE PROMPT" .
+.TP
+.BR \-v ", " \-\-verbose
+Log more on standard error.
+Once for informational messages, twice for debug output, three times for
+trace output.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.PP
+The
+.BR pubkey ", " run ", " shell " and " serve
+commands also accept:
+.TP
+.BI \-\-pubkey\-file " file"
+A file of lines as printed by
+.BR "okagent pubkey" .
+Keys whose comment matches one of the agent's identities are listed to SSH
+clients even while the OnlyKey is unplugged or locked, so that
+.B ssh
+can choose the right key before the device is unlocked.
+Blank lines and lines starting with
+.B #
+are ignored.
+.PP
+The
+.B serve
+command also accepts:
+.TP
+.BI \-\-socket " path"
+Listen on
+.I path
+instead of the default socket.
+.TP
+.BR \-d ", " \-\-daemon
+Fork into the background.
+The parent prints the
+.B SSH_AUTH_SOCK
+shell snippet on standard output, suitable for
+.BR eval ,
+and exits.
+The child detaches from the terminal and redirects standard input and
+output to
+.IR /dev/null ;
+log output still goes to standard error.
+.SH CHALLENGE PROMPT
+When an SSH client asks for a signature,
+.B okagent
+writes a line such as
+.PP
+.RS
+.EX
+OnlyKey: enter 3 1 5 to sign as james@example.com (ssh-connection login as "james"), or press any button if challenge mode is off
+.EE
+.RE
+.PP
+to the controlling terminal
+.RI ( /dev/tty ),
+or to standard error when there is none.
+For a stored key the prompt says
+.BI "with stored key ECC" n
+or
+.BI "with stored key RSA" n
+after the identity.
+The signature completes once the digits are entered on the token.
+If the device does not answer within about 22 seconds, is unplugged, is
+locked, or the wrong digits are entered, the request fails and the SSH
+client is told so; the agent keeps running.
+.PP
+A background agent has no useful terminal, so use
+.B \-\-notify\-command
+or the
+.B notify\-command
+configuration key to hand the prompt to a program, for example
+.BR "notify\-send OnlyKey" .
+The program receives the whole prompt as its last argument and the parts
+separately in the environment variables
+.B OKAGENT_DIGITS
+(the three digits separated by spaces),
+.B OKAGENT_IDENTITY
+and, for a stored key,
+.B OKAGENT_SLOT
+(for example
+.BR ECC3 ).
+.PP
+Every signature is verified against the public key before it is returned to
+the client.
+.PP
+An RSA key signs a SHA-256 or SHA-512 digest, as chosen by the client's
+.B rsa\-sha2\-256
+or
+.B rsa\-sha2\-512
+request; a client asking for the legacy SHA-1
+.B ssh\-rsa
+signature is refused.
+.SH CONFIGURATION FILE
+.B okagent
+reads
+.I $XDG_CONFIG_HOME/okagent/config.toml
+(falling back to
+.IR ~/.config/okagent/config.toml )
+unless
+.B \-\-config
+or
+.B OKAGENT_CONFIG
+names another file.
+The file is TOML.
+Unknown keys are an error.
+Command-line options override the corresponding keys.
+.TP
+.BI curve " = \(dq" curve \(dq
+Default curve; see
+.BR \-\-curve .
+.TP
+.BI notify-command " = \(dq" command \(dq
+See
+.BR \-\-notify\-command .
+.TP
+.BI socket " = \(dq" path \(dq
+Socket path for
+.BR serve ;
+see
+.BR \-\-socket .
+.TP
+.BI pubkey-file " = \(dq" file \(dq
+See
+.BR \-\-pubkey\-file .
+.TP
+.B [[identity]]
+One table per identity, used when no identities are given on the command
+line.
+Each has a required
+.B name
+key holding the
+.RI [ user @] host
+string, an optional
+.B curve
+key that overrides the default curve for that identity only, and an optional
+.B slot
+key
+.RB ( \(dqECC3\(dq ,
+the number
+.B 3
+or
+.BR \(dqRSA1\(dq )
+that uses the stored key in that slot instead of a derived one; see
+.BR \-\-slot .
+An RSA slot entry must not have a
+.B curve
+key.
+.PP
+Example:
+.PP
+.RS
+.EX
+curve = "ed25519"
+notify-command = "notify-send OnlyKey"
+# socket = "/run/user/1000/okagent/agent.sock"
+# pubkey-file = "/home/james/.ssh/onlykey.pub"
+
+[[identity]]
+name = "james@example.com"
+
+[[identity]]
+name = "git@github.com"
+curve = "nistp256"
+
+[[identity]]
+name = "james@legacy.example.com"
+slot = "ECC3"
+
+[[identity]]
+name = "james@old.example.com"
+slot = "RSA1"
+.EE
+.RE
+.SH ENVIRONMENT
+.TP
+.B OKAGENT_CONFIG
+Configuration file to read; same as
+.BR \-\-config .
+.TP
+.B OKAGENT_LOG
+Log filter in
+.B tracing_subscriber
+.B EnvFilter
+syntax, for example
+.B debug
+or
+.BR onlykey_agent=trace .
+When set it replaces the level chosen by
+.BR \-\-verbose .
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the default configuration file.
+.TP
+.B XDG_RUNTIME_DIR
+Base directory for sockets.
+.TP
+.B SHELL
+Shell started by
+.BR "okagent shell" .
+.TP
+.B SSH_AUTH_SOCK
+Set for the child of
+.BR run ", " shell " and " ssh .
+Printed by
+.B serve
+for the user to export.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/okagent/config.toml
+Default configuration file.
+.TP
+.I $XDG_RUNTIME_DIR/okagent/agent.sock
+Default socket for
+.BR serve .
+If
+.B XDG_RUNTIME_DIR
+is unset,
+.IR /tmp/okagent\- uid /agent.sock
+is used instead.
+The socket and its directory are created with owner-only permissions.
+.TP
+.IR $XDG_RUNTIME_DIR/okagent/run\- pid .sock
+Temporary socket used by
+.BR run ", " shell " and " ssh ;
+removed on exit.
+.TP
+.I /dev/hidraw*
+The token is opened directly through the Linux hidraw interface.
+A udev rule is needed to open it without root; see the OnlyKey
+documentation for
+.IR 49\-onlykey.rules .
+"Permission denied" from
+.B okagent status
+means the rule is missing.
+.SH EXIT STATUS
+.B okagent
+exits 0 on success and 1 on error.
+.B run
+and
+.B shell
+exit with the status of the command they ran, or 128 if it was killed by a
+signal;
+.B ssh
+exits with the status of
+.BR ssh (1).
+.SH EXAMPLES
+Publish a key and log in with it:
+.PP
+.RS
+.EX
+okagent pubkey james@example.com >> ~/.ssh/authorized_keys.example.com
+okagent ssh james@example.com
+okagent run james@example.com \-\- ssh example.com
+.EE
+.RE
+.PP
+Use a P-256 key for GitHub and run a command with it:
+.PP
+.RS
+.EX
+okagent \-\-curve nistp256 pubkey git@github.com
+okagent \-\-curve nistp256 run git@github.com \-\- git push
+.EE
+.RE
+.PP
+Use an ed25519 key that the OnlyKey app stored in slot 3:
+.PP
+.RS
+.EX
+okagent \-\-slot ECC3 pubkey james@legacy.example.com
+okagent \-\-slot ECC3 ssh james@legacy.example.com
+.EE
+.RE
+.PP
+Use the RSA key the OnlyKey app stored in slot 1:
+.PP
+.RS
+.EX
+okagent \-\-slot RSA1 pubkey james@old.example.com
+okagent \-\-slot RSA1 ssh james@old.example.com
+.EE
+.RE
+.PP
+Start a background agent for the current shell session:
+.PP
+.RS
+.EX
+eval "$(okagent serve \-\-daemon james@example.com)"
+ssh\-add \-L
+.EE
+.RE
+.PP
+Run the agent as a systemd user service with desktop notifications:
+.PP
+.RS
+.EX
+# ~/.config/systemd/user/okagent.service
+[Unit]
+Description=OnlyKey SSH agent
+
+[Service]
+ExecStart=%h/.cargo/bin/okagent serve \-\-notify\-command "notify\-send OnlyKey"
+Restart=on\-failure
+
+[Install]
+WantedBy=default.target
+.EE
+.RE
+.PP
+Then
+.B systemctl \-\-user enable \-\-now okagent
+and
+.BR "export SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/okagent/agent.sock" .
+.SH NOTES
+Only the original OnlyKey is supported, not the OnlyKey DUO.
+The agent covers SSH only; GPG and age keys are out of scope.
+.SH SEE ALSO
+.BR ssh (1),
+.BR ssh\-add (1),
+.BR ssh\-agent (1),
+.BR notify\-send (1)
+.PP
+.UR https://github.com/rustafariandev/onlykey\-rs
+Project repository
+.UE
+.br
+.UR https://docs.crp.to/
+OnlyKey documentation
+.UE

@@ -5,34 +5,44 @@
 //! as `james@example.com`; the private key never leaves the token, and every
 //! signature must be confirmed by entering a 3-digit challenge on its buttons.
 //! Given the same identity and curve this crate derives exactly the same
-//! public key as the Python `onlykey-agent`.
+//! public key as the Python `onlykey-agent`. Keys written into one of the
+//! token's ECC or RSA slots with the OnlyKey app ("stored keys") can be used
+//! the same way; see [`KeySpec::stored`] and [`KeySpec::rsa`].
 //!
 //! # Deriving a key and signing
 //!
 //! ```no_run
-//! use onlykey_agent::{Curve, Identity, OnlyKey, challenge::TtyPrompt};
+//! use onlykey_agent::ssh_key::HashAlg;
+//! use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let identity: Identity = "james@example.com".parse()?;
+//! let key = KeySpec::derived("james@example.com".parse()?, Curve::Ed25519);
 //! let mut device = OnlyKey::open()?;           // finds the token, syncs its clock
-//! let key = device.ssh_public_key(&identity, Curve::Ed25519)?;
-//! println!("{}", key.to_openssh()?);          // authorized_keys line
+//! let public = device.ssh_public_key(&key)?;
+//! println!("{}", public.to_openssh()?);       // authorized_keys line
 //!
 //! // Prompts on the terminal, waits for the button presses, verifies the result.
-//! let sig = device.ssh_sign(&identity, Curve::Ed25519, &key, b"hello", None, &TtyPrompt)?;
+//! // The hash only matters for RSA keys.
+//! let sig = device.ssh_sign(&key, &public, b"hello", HashAlg::Sha512, None, &TtyPrompt)?;
 //! assert_eq!(sig.algorithm(), onlykey_agent::ssh_key::Algorithm::Ed25519);
+//!
+//! // Keys the OnlyKey app wrote into slots ECC3 and RSA1, named after the same identity.
+//! let stored = KeySpec::stored("james@example.com".parse()?, Curve::Ed25519, "ECC3".parse()?);
+//! println!("{}", device.ssh_public_key(&stored)?.to_openssh()?);
+//! let rsa = KeySpec::rsa("james@example.com".parse()?, "RSA1".parse()?);
+//! println!("{}", device.ssh_public_key(&rsa)?.to_openssh()?);
 //! # Ok(()) }
 //! ```
 //!
 //! # Running an agent
 //!
 //! ```no_run
-//! use onlykey_agent::agent::{self, Agent, Entry, Opener};
-//! use onlykey_agent::{Curve, OnlyKey, challenge::TtyPrompt};
+//! use onlykey_agent::agent::{self, Agent, Opener};
+//! use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt};
 //! use std::sync::{Arc, atomic::AtomicBool};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let entries = vec![Entry { identity: "james@example.com".parse()?, curve: Curve::Ed25519 }];
+//! let entries = vec![KeySpec::derived("james@example.com".parse()?, Curve::Ed25519)];
 //! let opener: Opener = Arc::new(|| Ok(OnlyKey::open()?.boxed()));
 //! let agent = Arc::new(Agent::new(entries, opener, Arc::new(TtyPrompt)));
 //!
@@ -49,8 +59,9 @@
 //! - [`transport`]: [`HidTransport`], the seam between protocol and USB stack;
 //!   [`transport::HidapiTransport`] for hardware, [`transport::fake`] for tests.
 //! - [`device`]: [`OnlyKey`], the handshake and the two operations the agent
-//!   needs, [`OnlyKey::derive_public_key`] and [`OnlyKey::sign`].
-//! - [`identity`], [`keys`]: identity parsing and hashing, SSH encoding.
+//!   needs, [`OnlyKey::public_key`] and [`OnlyKey::sign`].
+//! - [`identity`], [`keys`]: identity parsing and hashing, curves and slots
+//!   ([`KeySpec`]), SSH encoding.
 //! - [`challenge`]: how the 3-digit challenge reaches the user.
 //! - [`agent`]: the SSH agent wire protocol and unix-socket server.
 //!
@@ -67,7 +78,9 @@ pub mod transport;
 
 pub use challenge::{Challenge, ChallengeSink};
 pub use device::{DeviceError, OnlyKey, Timeouts, challenge_digits};
-pub use identity::{Curve, Identity, IdentityError};
+pub use identity::{
+    Curve, EccSlot, Identity, IdentityError, KeyKind, KeySource, KeySpec, RsaSlot, Slot,
+};
 pub use protocol::{DeviceStatus, RawPublicKey};
 pub use transport::{HidTransport, TransportError};
 

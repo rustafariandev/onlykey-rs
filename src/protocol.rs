@@ -77,13 +77,19 @@ pub fn settime_report(epoch: u32) -> Report {
         .expect("4-byte payload always fits")
 }
 
-/// The `OKGETPUBKEY` request for a derived key: slot 132, payload is a
-/// one-byte curve tag followed by the 32-byte identity hash.
-pub fn getpubkey_report(curve: Curve, identity_hash: &[u8; 32]) -> Report {
+/// Modulus and signature lengths of the RSA keys the token can hold.
+pub const RSA_LENGTHS: [usize; 2] = [256, 512];
+
+/// The `OKGETPUBKEY` request: `slot` is 132 for a derived key, the ECC slot
+/// (101 to 116) or the RSA slot (1 to 4) of a stored one; the payload is a
+/// one-byte tag (the curve tag, or `0x00` for RSA) followed by the 32-byte
+/// identity hash. The firmware only reads the payload when it derives, but
+/// the Python agent sends it for stored keys too.
+pub fn getpubkey_report(slot: u8, tag: u8, identity_hash: &[u8; 32]) -> Report {
     let mut payload = [0u8; 33];
-    payload[0] = curve.derivation_tag();
+    payload[0] = tag;
     payload[1..].copy_from_slice(identity_hash);
-    encode_report(Opcode::GetPubKey, Some(DERIVED_KEY_SLOT), None, &payload)
+    encode_report(Opcode::GetPubKey, Some(slot), None, &payload)
         .expect("33-byte payload always fits")
 }
 
@@ -179,14 +185,29 @@ pub enum RawPublicKey {
     Ed25519([u8; 32]),
     /// Uncompressed point without the SEC1 `0x04` tag: `X || Y`.
     NistP256([u8; 64]),
+    /// RSA modulus, big-endian, 256 or 512 bytes. The exponent is always 65537.
+    Rsa(Vec<u8>),
 }
 
 impl RawPublicKey {
-    pub fn curve(&self) -> Curve {
+    /// The ECC curve, or `None` for RSA.
+    pub fn curve(&self) -> Option<Curve> {
         match self {
-            RawPublicKey::Ed25519(_) => Curve::Ed25519,
-            RawPublicKey::NistP256(_) => Curve::NistP256,
+            RawPublicKey::Ed25519(_) => Some(Curve::Ed25519),
+            RawPublicKey::NistP256(_) => Some(Curve::NistP256),
+            RawPublicKey::Rsa(_) => None,
         }
+    }
+}
+
+/// Which curve a public key report carries: 32 bytes for ed25519, 64 for
+/// P-256, so a uniform tail means ed25519. This is the Python agent's test;
+/// it matters for stored keys, whose type is fixed when the slot is written.
+pub fn pubkey_report_curve(report: &Report) -> Curve {
+    if report[32..].iter().all(|&b| b == report[32]) {
+        Curve::Ed25519
+    } else {
+        Curve::NistP256
     }
 }
 
@@ -235,9 +256,61 @@ mod tests {
             .try_into()
             .unwrap();
         let want = report_from_hex(g["frames"]["getpubkey_ed25519"].as_str().unwrap());
-        assert_eq!(getpubkey_report(Curve::Ed25519, &hash), want);
+        assert_eq!(getpubkey_report(DERIVED_KEY_SLOT, 0x01, &hash), want);
         let want = report_from_hex(g["frames"]["getpubkey_p256"].as_str().unwrap());
-        assert_eq!(getpubkey_report(Curve::NistP256, &hash), want);
+        assert_eq!(getpubkey_report(DERIVED_KEY_SLOT, 0x02, &hash), want);
+    }
+
+    #[test]
+    fn rsa_slot_frames_match_python() {
+        use sha2::Digest;
+        let g = goldens();
+        let hash: [u8; 32] = hex::decode(g["identities"][0]["hash_hex"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let want = report_from_hex(g["frames"]["getpubkey_rsa1"].as_str().unwrap());
+        assert_eq!(getpubkey_report(1, 0x00, &hash), want);
+        // An RSA signature request carries the hash of the blob.
+        let blob: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        for (name, digest) in [
+            ("sha256_of_100", sha2::Sha256::digest(&blob).to_vec()),
+            ("sha512_of_100", sha2::Sha512::digest(&blob).to_vec()),
+        ] {
+            let want: Vec<Report> = g["sign_frames_rsa1"][name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| report_from_hex(f.as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                chunk_large_message(Opcode::Sign, 1, &digest).unwrap(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_slot_frames_match_python() {
+        let g = goldens();
+        let hash: [u8; 32] = hex::decode(g["identities"][0]["hash_hex"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let want = report_from_hex(g["frames"]["getpubkey_ecc3_ed25519"].as_str().unwrap());
+        assert_eq!(getpubkey_report(103, 0x01, &hash), want);
+        let want = report_from_hex(g["frames"]["getpubkey_ecc3_p256"].as_str().unwrap());
+        assert_eq!(getpubkey_report(103, 0x02, &hash), want);
+        // A stored-key signature carries the blob alone, no identity hash.
+        let blob: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        let want: Vec<Report> = g["sign_frames_ecc3"]["100"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| report_from_hex(f.as_str().unwrap()))
+            .collect();
+        assert_eq!(chunk_large_message(Opcode::Sign, 103, &blob).unwrap(), want);
     }
 
     #[test]
@@ -362,5 +435,8 @@ mod tests {
             parse_pubkey_report(Curve::NistP256, &r),
             RawPublicKey::NistP256(r)
         );
+        assert_eq!(pubkey_report_curve(&r), Curve::Ed25519);
+        r[40] = 9;
+        assert_eq!(pubkey_report_curve(&r), Curve::NistP256);
     }
 }

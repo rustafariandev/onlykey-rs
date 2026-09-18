@@ -11,10 +11,17 @@
 //! [[identity]]
 //! name = "git@github.com"
 //! curve = "nistp256"
+//!
+//! [[identity]]
+//! name = "james@legacy.example.com"
+//! slot = "ECC3"                # key stored in the token by the OnlyKey app
+//!
+//! [[identity]]
+//! name = "james@old.example.com"
+//! slot = "RSA1"                # RSA keys take no curve
 //! ```
 
-use onlykey_agent::agent::Entry;
-use onlykey_agent::identity::{Curve, Identity};
+use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -35,6 +42,8 @@ pub struct Config {
 pub struct IdentityEntry {
     pub name: String,
     pub curve: Option<Curve>,
+    /// Stored slot (`ECC3`, `3` or `RSA1`); absent means a derived key.
+    pub slot: Option<Slot>,
 }
 
 #[derive(Debug, Error)]
@@ -51,6 +60,8 @@ pub enum ConfigError {
     },
     #[error("bad identity in config: {0}")]
     Identity(#[from] onlykey_agent::identity::IdentityError),
+    #[error("identity {name:?}: `curve` does not apply to RSA slot {slot}")]
+    CurveForRsa { name: String, slot: Slot },
 }
 
 impl Config {
@@ -79,13 +90,25 @@ impl Config {
     }
 
     /// Entries from the config, applying `default_curve` where none is given.
-    pub fn entries(&self, default_curve: Curve) -> Result<Vec<Entry>, ConfigError> {
+    pub fn entries(&self, default_curve: Curve) -> Result<Vec<KeySpec>, ConfigError> {
         self.identity
             .iter()
             .map(|e| {
-                Ok(Entry {
+                let curve = e.curve.unwrap_or(default_curve);
+                let kind = match (e.slot, e.curve) {
+                    (None, _) => KeyKind::Derived(curve),
+                    (Some(Slot::Ecc(slot)), _) => KeyKind::StoredEcc { slot, curve },
+                    (Some(Slot::Rsa(slot)), None) => KeyKind::StoredRsa(slot),
+                    (Some(slot @ Slot::Rsa(_)), Some(_)) => {
+                        return Err(ConfigError::CurveForRsa {
+                            name: e.name.clone(),
+                            slot,
+                        });
+                    }
+                };
+                Ok(KeySpec {
                     identity: e.name.parse::<Identity>()?,
-                    curve: e.curve.unwrap_or(default_curve),
+                    kind,
                 })
             })
             .collect()
@@ -117,16 +140,50 @@ mod tests {
             [[identity]]
             name = "git@github.com"
             curve = "ed25519"
+            [[identity]]
+            name = "james@legacy.example.com"
+            slot = "ECC3"
+            [[identity]]
+            name = "james@other.example.com"
+            curve = "ed25519"
+            slot = 4
+            [[identity]]
+            name = "james@old.example.com"
+            slot = "RSA1"
             "#,
         )
         .unwrap();
         assert_eq!(cfg.curve, Some(Curve::NistP256));
         assert_eq!(cfg.notify_command.as_deref(), Some("notify-send OnlyKey"));
         let entries = cfg.entries(cfg.curve.unwrap_or_default()).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].curve, Curve::NistP256);
-        assert_eq!(entries[1].curve, Curve::Ed25519);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].kind, KeyKind::Derived(Curve::NistP256));
+        assert_eq!(entries[1].kind, KeyKind::Derived(Curve::Ed25519));
         assert_eq!(entries[1].identity.to_string(), "git@github.com");
+        assert_eq!(
+            entries[2].kind,
+            KeyKind::StoredEcc {
+                slot: "ECC3".parse().unwrap(),
+                curve: Curve::NistP256
+            }
+        );
+        assert_eq!(
+            entries[3].kind,
+            KeyKind::StoredEcc {
+                slot: "ECC4".parse().unwrap(),
+                curve: Curve::Ed25519
+            }
+        );
+        assert_eq!(entries[4].kind, KeyKind::StoredRsa("RSA1".parse().unwrap()));
+        assert_eq!(entries[4].label(), "<ssh://james@old.example.com|rsa|RSA1>");
+
+        let cfg =
+            Config::parse("[[identity]]\nname = \"a@b\"\nslot = \"RSA2\"\ncurve = \"ed25519\"")
+                .unwrap();
+        assert!(matches!(
+            cfg.entries(Curve::Ed25519),
+            Err(ConfigError::CurveForRsa { .. })
+        ));
     }
 
     #[test]
@@ -134,6 +191,10 @@ mod tests {
         assert!(Config::parse("bogus = 1").is_err());
         let cfg = Config::parse("[[identity]]\nname = \"\"").unwrap();
         assert!(cfg.entries(Curve::Ed25519).is_err());
+        for bad in ["\"ECC32\"", "\"RSA5\"", "0", "\"three\""] {
+            let text = format!("[[identity]]\nname = \"a@b\"\nslot = {bad}");
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

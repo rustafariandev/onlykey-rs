@@ -4,11 +4,12 @@ use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
-use onlykey_agent::agent::{self, Agent, Entry, Opener};
+use onlykey_agent::agent::{self, Agent, Opener};
 use onlykey_agent::challenge::{ChallengeSink, CommandNotifier, MultiSink, TtyPrompt};
 use onlykey_agent::device::{OnlyKey, Timeouts};
-use onlykey_agent::identity::{Curve, Identity};
+use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use onlykey_agent::protocol::DeviceStatus;
+use onlykey_agent::ssh_key::HashAlg;
 use onlykey_agent::ssh_key::PublicKey;
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,6 +33,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub curve: Option<Curve>,
 
+    /// Use the key stored in this slot (ECC1 to ECC16, or RSA1 to RSA4) for
+    /// identities given on the command line, instead of deriving one.
+    #[arg(long, global = true, value_name = "SLOT")]
+    pub slot: Option<Slot>,
+
     /// Command run with the challenge prompt as its last argument
     /// (e.g. "notify-send OnlyKey"); also used when no terminal is available.
     #[arg(long, global = true)]
@@ -53,7 +59,7 @@ pub enum Cmd {
     Run(RunArgs),
     /// Start $SHELL with SSH_AUTH_SOCK pointing at a temporary agent.
     Shell(IdentityArgs),
-    /// Connect with ssh using the identity's derived key.
+    /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
     /// Sign a fixed test message and verify it (hardware check).
     #[command(hide = true)]
@@ -116,23 +122,47 @@ pub struct DebugSignArgs {
 struct Context_ {
     config: Config,
     curve: Curve,
+    /// Whether `--curve` was given explicitly rather than defaulted.
+    curve_given: bool,
+    /// Applies to identities on the command line only.
+    slot: Option<Slot>,
     sink: Arc<dyn ChallengeSink>,
     timeouts: Timeouts,
 }
 
 impl Context_ {
-    fn entries(&self, args: &IdentityArgs) -> Result<Vec<Entry>> {
+    fn key(&self, identity: &str) -> Result<KeySpec> {
+        let kind = match self.slot {
+            None => KeyKind::Derived(self.curve),
+            Some(Slot::Ecc(slot)) => KeyKind::StoredEcc {
+                slot,
+                curve: self.curve,
+            },
+            Some(Slot::Rsa(slot)) => {
+                if self.curve_given {
+                    bail!("--curve does not apply to RSA slot {slot}");
+                }
+                KeyKind::StoredRsa(slot)
+            }
+        };
+        Ok(KeySpec {
+            identity: identity.parse::<Identity>()?,
+            kind,
+        })
+    }
+
+    fn entries(&self, args: &IdentityArgs) -> Result<Vec<KeySpec>> {
         let entries = if args.identity.is_empty() {
+            if self.slot.is_some() {
+                bail!(
+                    "--slot applies to identities given on the command line; use `slot` in [[identity]] for config entries"
+                );
+            }
             self.config.entries(self.curve)?
         } else {
             args.identity
                 .iter()
-                .map(|s| {
-                    Ok(Entry {
-                        identity: s.parse::<Identity>()?,
-                        curve: self.curve,
-                    })
-                })
+                .map(|s| self.key(s))
                 .collect::<Result<Vec<_>>>()?
         };
         if entries.is_empty() {
@@ -192,6 +222,8 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
     let ctx = Context_ {
         config,
         curve,
+        curve_given: cli.curve.is_some(),
+        slot: cli.slot,
         sink: Arc::new(MultiSink(sinks)),
         timeouts: Timeouts::default(),
     };
@@ -343,25 +375,25 @@ fn ssh(ctx: &Context_, args: SshArgs) -> Result<ExitCode> {
 }
 
 fn debug_sign(ctx: &Context_, args: DebugSignArgs) -> Result<ExitCode> {
-    let identity: Identity = args.identity.parse()?;
+    let spec = ctx.key(&args.identity)?;
     let message: Vec<u8> = (0..args.len).map(|i| i as u8).collect();
     let mut device = OnlyKey::open_with_timeouts(ctx.timeouts)?;
-    let raw_key = device.derive_public_key(&identity, ctx.curve)?;
-    let key = onlykey_agent::keys::public_key(&raw_key, &identity.label(ctx.curve))?;
+    let key = device.ssh_public_key(&spec)?;
     println!("{}", key.to_openssh()?);
-    let raw_sig = device.sign(
-        &identity,
-        ctx.curve,
+    let hash = HashAlg::Sha512;
+    let sig = device.ssh_sign(
+        &spec,
+        &key,
         &message,
+        hash,
         Some("debug-sign".into()),
         ctx.sink.as_ref(),
     )?;
-    let sig = onlykey_agent::keys::signature(ctx.curve, &raw_sig)?;
-    onlykey_agent::keys::verify(&key, &message, &sig)?;
     println!(
-        "signature over {} bytes verified ({} device payload bytes)",
+        "{} signature over {} bytes verified ({} device payload bytes)",
+        sig.algorithm(),
         args.len,
-        args.len + 32
+        spec.sign_message(&message, hash)?.len()
     );
     Ok(ExitCode::SUCCESS)
 }
