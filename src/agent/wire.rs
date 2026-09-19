@@ -10,10 +10,13 @@ use thiserror::Error;
 pub const SSH_AGENTC_REQUEST_RSA_IDENTITIES: u8 = 1;
 pub const SSH_AGENT_RSA_IDENTITIES_ANSWER: u8 = 2;
 pub const SSH_AGENT_FAILURE: u8 = 5;
+pub const SSH_AGENT_SUCCESS: u8 = 6;
 pub const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
+pub const SSH_AGENTC_LOCK: u8 = 22;
+pub const SSH_AGENTC_UNLOCK: u8 = 23;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
 pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 /// Sign request flags asking for `rsa-sha2-256` / `rsa-sha2-512`.
@@ -57,6 +60,10 @@ pub enum Request {
         data: Vec<u8>,
         flags: u32,
     },
+    /// `ssh-add -x`: lock the agent with a passphrase.
+    Lock(Vec<u8>),
+    /// `ssh-add -X`: unlock it again.
+    Unlock(Vec<u8>),
     /// A protocol extension; none are implemented.
     Extension,
     /// Any message type this agent does not implement.
@@ -69,6 +76,8 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
     match kind {
         SSH_AGENTC_REQUEST_RSA_IDENTITIES => Ok(Request::RequestRsaIdentities),
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
+        SSH_AGENTC_LOCK => Ok(Request::Lock(Vec::<u8>::decode(&mut rest)?)),
+        SSH_AGENTC_UNLOCK => Ok(Request::Unlock(Vec::<u8>::decode(&mut rest)?)),
         SSH_AGENTC_EXTENSION => Ok(Request::Extension),
         SSH2_AGENTC_SIGN_REQUEST => {
             let key_blob = Vec::<u8>::decode(&mut rest)?;
@@ -107,6 +116,10 @@ pub fn sign_response(sig: &Signature) -> Vec<u8> {
 
 pub fn failure() -> Vec<u8> {
     vec![SSH_AGENT_FAILURE]
+}
+
+pub fn success() -> Vec<u8> {
+    vec![SSH_AGENT_SUCCESS]
 }
 
 /// `SSH_AGENT_RSA_IDENTITIES_ANSWER` with no keys: there are no SSH v1 keys.
@@ -222,6 +235,26 @@ mod tests {
         assert_eq!(parse_request(&[27, 1, 2]).unwrap(), Request::Extension);
         assert_eq!(rsa_identities_answer(), vec![2, 0, 0, 0, 0]);
         assert_eq!(extension_failure(), vec![28]);
+    }
+
+    #[test]
+    fn lock_requests_carry_the_passphrase() {
+        let mut body = vec![SSH_AGENTC_LOCK];
+        b"hunter2".as_slice().encode(&mut body).unwrap();
+        assert_eq!(
+            parse_request(&body).unwrap(),
+            Request::Lock(b"hunter2".to_vec())
+        );
+        body[0] = SSH_AGENTC_UNLOCK;
+        assert_eq!(
+            parse_request(&body).unwrap(),
+            Request::Unlock(b"hunter2".to_vec())
+        );
+        assert!(matches!(
+            parse_request(&[SSH_AGENTC_LOCK, 0, 0]),
+            Err(WireError::Malformed(_))
+        ));
+        assert_eq!(success(), vec![6]);
     }
 
     #[test]

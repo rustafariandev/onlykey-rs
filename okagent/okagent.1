@@ -107,8 +107,13 @@ The agent implements only the
 and
 .I sign request
 operations of the SSH agent protocol.
-Adding, removing or locking keys is refused, which OpenSSH reports as
+Adding or removing keys is refused, which OpenSSH reports as
 unsupported.
+.B ssh-add \-x
+locks the agent with a passphrase: until
+.B ssh-add \-X
+unlocks it with the same passphrase, it lists no keys and refuses to sign.
+This lock is the SSH agent's own and is separate from the OnlyKey's PIN.
 Protocol extensions are answered with the extension-failure code and the
 SSH protocol 1 key listing with an empty list, as
 .BR ssh-agent (1)

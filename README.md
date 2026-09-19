@@ -234,11 +234,15 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
 - Every signature is verified against the public key before it is returned.
   Any device error, timeout or wrong challenge answers the SSH client with
   `SSH_AGENT_FAILURE` and keeps the agent running.
-- Only `SSH2_AGENTC_REQUEST_IDENTITIES` and `SSH2_AGENTC_SIGN_REQUEST` are
-  implemented. Extension requests get `SSH_AGENT_EXTENSION_FAILURE` and the
-  SSH protocol 1 listing an empty `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as
-  OpenSSH's agent replies; everything else gets a failure reply, which
-  OpenSSH treats as "unsupported".
+- `SSH2_AGENTC_REQUEST_IDENTITIES`, `SSH2_AGENTC_SIGN_REQUEST`,
+  `SSH_AGENTC_LOCK` and `SSH_AGENTC_UNLOCK` are implemented. `ssh-add -x`
+  locks the agent with a passphrase (kept only as a salted hash) and until
+  `ssh-add -X` unlocks it the agent lists no keys and refuses to sign; this
+  is separate from the OnlyKey's PIN. Extension requests get
+  `SSH_AGENT_EXTENSION_FAILURE` and the SSH protocol 1 listing an empty
+  `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's agent replies; everything
+  else, such as adding keys, gets a failure reply, which OpenSSH treats as
+  "unsupported".
 
 Differences from the Python agent:
 

@@ -8,6 +8,7 @@ use crate::identity::KeySpec;
 use crate::keys;
 use crate::transport::HidTransport;
 use nix::sys::stat::{Mode, umask};
+use sha2::{Digest, Sha256};
 use ssh_key::HashAlg;
 use ssh_key::PublicKey;
 use std::collections::HashMap;
@@ -50,6 +51,42 @@ pub struct Agent {
     /// Serialises every device operation, including the wait for the user.
     device_lock: Mutex<()>,
     cache: Mutex<HashMap<KeySpec, PublicKey>>,
+    /// `ssh-add -x` state: a salted hash of the passphrase while locked.
+    passphrase_lock: Mutex<Option<PassphraseHash>>,
+}
+
+/// A salted SHA-256 of the lock passphrase, so the passphrase itself is not
+/// kept in memory. Compared in constant time.
+struct PassphraseHash {
+    salt: [u8; 16],
+    digest: [u8; 32],
+}
+
+impl PassphraseHash {
+    fn new(passphrase: &[u8]) -> Self {
+        let mut salt = [0u8; 16];
+        let mut file = std::fs::File::open("/dev/urandom").expect("/dev/urandom");
+        std::io::Read::read_exact(&mut file, &mut salt).expect("random salt");
+        let digest = Self::digest(&salt, passphrase);
+        PassphraseHash { salt, digest }
+    }
+
+    fn digest(salt: &[u8; 16], passphrase: &[u8]) -> [u8; 32] {
+        Sha256::new()
+            .chain_update(salt)
+            .chain_update(passphrase)
+            .finalize()
+            .into()
+    }
+
+    fn matches(&self, passphrase: &[u8]) -> bool {
+        let candidate = Self::digest(&self.salt, passphrase);
+        self.digest
+            .iter()
+            .zip(candidate.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
 }
 
 impl Agent {
@@ -60,6 +97,43 @@ impl Agent {
             sink,
             device_lock: Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
+            passphrase_lock: Mutex::new(None),
+        }
+    }
+
+    /// Whether `ssh-add -x` has locked the agent.
+    pub fn is_locked(&self) -> bool {
+        self.passphrase_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// Lock with `passphrase`; fails if already locked, as in OpenSSH.
+    pub fn lock(&self, passphrase: &[u8]) -> bool {
+        let mut lock = self
+            .passphrase_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if lock.is_some() {
+            return false;
+        }
+        *lock = Some(PassphraseHash::new(passphrase));
+        true
+    }
+
+    /// Unlock if `passphrase` is the one the agent was locked with.
+    pub fn unlock(&self, passphrase: &[u8]) -> bool {
+        let mut lock = self
+            .passphrase_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match lock.as_ref() {
+            Some(hash) if hash.matches(passphrase) => {
+                *lock = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -164,10 +238,18 @@ impl Agent {
     /// Handle one request body and produce the reply body.
     pub fn handle(&self, body: &[u8]) -> Vec<u8> {
         match wire::parse_request(body) {
+            Ok(Request::RequestIdentities) if self.is_locked() => {
+                tracing::debug!("listing identities: agent is locked, none");
+                wire::identities_answer(&[])
+            }
             Ok(Request::RequestIdentities) => {
                 let keys = self.public_keys();
                 tracing::debug!(count = keys.len(), "listing identities");
                 wire::identities_answer(&keys)
+            }
+            Ok(Request::Sign { .. }) if self.is_locked() => {
+                tracing::warn!("sign request refused: agent is locked");
+                wire::failure()
             }
             Ok(Request::Sign {
                 key_blob,
@@ -181,6 +263,24 @@ impl Agent {
                         tracing::warn!(error = %e, "sign request failed");
                         wire::failure()
                     }
+                }
+            }
+            Ok(Request::Lock(passphrase)) => {
+                if self.lock(&passphrase) {
+                    tracing::info!("agent locked");
+                    wire::success()
+                } else {
+                    tracing::warn!("lock request refused: already locked");
+                    wire::failure()
+                }
+            }
+            Ok(Request::Unlock(passphrase)) => {
+                if self.unlock(&passphrase) {
+                    tracing::info!("agent unlocked");
+                    wire::success()
+                } else {
+                    tracing::warn!("unlock request refused: not locked or wrong passphrase");
+                    wire::failure()
                 }
             }
             Ok(Request::RequestRsaIdentities) => {
@@ -503,6 +603,44 @@ mod tests {
         assert_eq!(agent.handle(&[27]), wire::extension_failure());
         assert_eq!(agent.handle(&[1]), wire::rsa_identities_answer());
         assert_eq!(agent.handle(&[]), wire::failure());
+    }
+
+    #[test]
+    fn lock_hides_keys_and_refuses_signing_until_unlocked() {
+        let e = entry();
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
+        let raw = protocol::RawPublicKey::Ed25519([0x22; 32]);
+        let key = keys::public_key(&raw, &e.label()).unwrap();
+        assert_eq!(agent.preload([key.clone()]), 1);
+
+        let mut lock = vec![wire::SSH_AGENTC_LOCK];
+        b"hunter2".as_slice().encode(&mut lock).unwrap();
+        assert_eq!(agent.handle(&lock), wire::success());
+        assert!(agent.is_locked());
+        // Locking twice fails, as in OpenSSH.
+        assert_eq!(agent.handle(&lock), wire::failure());
+        assert_eq!(
+            agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]),
+            vec![12, 0, 0, 0, 0]
+        );
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        key.to_bytes().unwrap().encode(&mut sign).unwrap();
+        b"data".as_slice().encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        assert_eq!(agent.handle(&sign), wire::failure());
+
+        let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter3".as_slice().encode(&mut wrong).unwrap();
+        assert_eq!(agent.handle(&wrong), wire::failure());
+        assert!(agent.is_locked());
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        assert_eq!(agent.handle(&unlock), wire::success());
+        assert!(!agent.is_locked());
+        // Unlocking an unlocked agent fails.
+        assert_eq!(agent.handle(&unlock), wire::failure());
+        assert_eq!(agent.public_keys(), vec![key]);
     }
 
     #[test]

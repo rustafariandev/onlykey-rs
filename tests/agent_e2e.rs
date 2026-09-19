@@ -109,6 +109,55 @@ fn stored_entries() -> Vec<KeySpec> {
     ]
 }
 
+/// Run `ssh-add` with `passphrase` supplied through SSH_ASKPASS.
+fn ssh_add_with_passphrase(h: &Harness, dir: &Path, flag: &str, passphrase: &str) -> bool {
+    let askpass = dir.join("askpass.sh");
+    std::fs::write(&askpass, format!("#!/bin/sh\necho '{passphrase}'\n")).unwrap();
+    std::fs::set_permissions(
+        &askpass,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    h.cmd("ssh-add")
+        .arg(flag)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn listed_keys(h: &Harness) -> usize {
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("ssh-") || l.starts_with("ecdsa-"))
+        .count()
+}
+
+#[test]
+fn ssh_add_locks_and_unlocks_the_agent() {
+    if !have("ssh-add") {
+        eprintln!("ssh-add not installed; skipping");
+        return;
+    }
+    let h = Harness::start(entries());
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(listed_keys(&h), 2);
+    assert!(ssh_add_with_passphrase(&h, dir.path(), "-x", "hunter2"));
+    assert_eq!(listed_keys(&h), 0, "a locked agent lists no keys");
+    assert!(!ssh_add_with_passphrase(&h, dir.path(), "-X", "wrong"));
+    assert_eq!(listed_keys(&h), 0);
+    assert!(ssh_add_with_passphrase(&h, dir.path(), "-X", "hunter2"));
+    assert_eq!(listed_keys(&h), 2);
+    assert_eq!(h.challenges(), 0);
+}
+
 fn have(tool: &str) -> bool {
     Command::new(tool)
         .arg("-V")
