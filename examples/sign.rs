@@ -1,0 +1,33 @@
+//! Sign stdin with a derived key and print the signature blob as base64,
+//! after the user confirms the challenge on the device.
+//!
+//! ```sh
+//! echo -n hello | cargo run --example sign -- james@example.com
+//! ```
+
+use onlykey_agent::challenge::TtyPrompt;
+use onlykey_agent::{Curve, Identity, OnlyKey};
+use std::io::Read;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let identity: Identity = std::env::args()
+        .nth(1)
+        .ok_or("usage: sign <[user@]host> < data")?
+        .parse()?;
+    let mut data = Vec::new();
+    std::io::stdin().read_to_end(&mut data)?;
+
+    let mut device = OnlyKey::open()?;
+    let key = device.ssh_public_key(&identity, Curve::Ed25519)?;
+    let sig = device.ssh_sign(
+        &identity,
+        Curve::Ed25519,
+        &key,
+        &data,
+        Some("example".into()),
+        &TtyPrompt,
+    )?;
+    println!("{}", key.to_openssh()?);
+    println!("{} {}", sig.algorithm(), hex::encode(sig.as_bytes()));
+    Ok(())
+}

@@ -1,0 +1,120 @@
+{
+ "identities": [
+  {
+   "input": "james@example.com",
+   "user": "james",
+   "host": "example.com",
+   "derivation_input": "james@example.com",
+   "hash_hex": "e873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a"
+  },
+  {
+   "input": "example.com",
+   "user": null,
+   "host": "example.com",
+   "derivation_input": "example.com",
+   "hash_hex": "a379a6f6eeafb9a55e378c118034e2751e682fab9f2d30ab13d2125586ce1947"
+  },
+  {
+   "input": "ssh://james@example.com:2222/path",
+   "user": "james",
+   "host": "example.com",
+   "derivation_input": "james@example.com",
+   "hash_hex": "e873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a"
+  },
+  {
+   "input": "j\u00e4mes@h\u00f4st.example",
+   "user": "j\u00e4mes",
+   "host": "h\u00f4st.example",
+   "derivation_input": "james@host.example",
+   "hash_hex": "b2f89a4e986ffc976d9be6d0da689c33b7bc81f785e7076dbc231b1627834e10"
+  },
+  {
+   "input": "git@github.com",
+   "user": "git",
+   "host": "github.com",
+   "derivation_input": "git@github.com",
+   "hash_hex": "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5"
+  },
+  {
+   "input": "root@10.0.0.1",
+   "user": "root",
+   "host": "10.0.0.1",
+   "derivation_input": "root@10.0.0.1",
+   "hash_hex": "6a20a4eb71f9483b1bf4a1a849c18b0b29b191fc0d3f0e50fa2abee734c4e20a"
+  }
+ ],
+ "frames": {
+  "settime_1700000000": "ffffffffe46553f10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "getpubkey_ed25519": "ffffffffec8401e873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a00000000000000000000000000000000000000000000000000",
+  "getpubkey_p256": "ffffffffec8402e873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a00000000000000000000000000000000000000000000000000"
+ },
+ "sign_frames": {
+  "56": [
+   "ffffffffedc938000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363700"
+  ],
+  "58": [
+   "ffffffffedc9ff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738",
+   "ffffffffedc901390000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "115": [
+   "ffffffffedc9ff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738",
+   "ffffffffedc9ff393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7071",
+   "ffffffffedc901720000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  ]
+ },
+ "challenges": [
+  {
+   "payload_hex": "00e873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a",
+   "digits": [
+    2,
+    6,
+    6
+   ],
+   "digits_8c": [
+    3,
+    3,
+    4
+   ]
+  },
+  {
+   "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051e873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a",
+   "digits": [
+    2,
+    4,
+    2
+   ],
+   "digits_8c": [
+    1,
+    5,
+    2
+   ]
+  },
+  {
+   "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2be873dea4d72ffa9926e7117de13172a8afe1b2ee778d46eaee362901582ab68a",
+   "digits": [
+    5,
+    2,
+    6
+   ],
+   "digits_8c": [
+    3,
+    4,
+    4
+   ]
+  }
+ ],
+ "pubkeys": {
+  "ed25519_raw": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "ed25519_line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c <ssh://james@example.com|ed25519>",
+  "p256_raw_xy": "fb50388f29498d0a93ad25ec4c34037b9d3cc3cca4787eb6fedabe2b3003eac89f7765ca9d6288e6ff734f5cd08f3a5921cf54b21bb398b50ac0d2577fa07472",
+  "p256_line": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPtQOI8pSY0Kk60l7Ew0A3udPMPMpHh+tv7aviswA+rIn3dlyp1iiOb/c09c0I86WSHPVLIbs5i1CsDSV3+gdHI= <ssh://james@example.com|nist256p1>"
+ },
+ "ed25519_sig_example": {
+  "msg": "68656c6c6f20776f726c64",
+  "sig": "1b11b54888ee61743d072f36ce1ffdcde233b39ace8754db41cd299af9d8a63f5ccda750aa6316da57e8f2617811a21e612a6deb6d4408894a89f1a4ec3fc004"
+ },
+ "p256_sig_example": {
+  "msg": "68656c6c6f20776f726c64",
+  "sig_rs": "91c15f8d858bee40b910bb288ce170a7380ea4347712a2b47bcc971b2a80cfc71143fb5bb0f29d723583e43addf72dccf7f9215aa735b6c591f6113bdf2cd8e6"
+ }
+}
