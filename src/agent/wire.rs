@@ -2,7 +2,7 @@
 //! their replies (draft-miller-ssh-agent).
 
 use ssh_encoding::{Decode, Encode};
-use ssh_key::{PublicKey, Signature};
+use ssh_key::{HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
 use thiserror::Error;
 
@@ -11,6 +11,22 @@ pub const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
+/// Sign request flags asking for `rsa-sha2-256` / `rsa-sha2-512`.
+pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
+pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
+
+/// The hash a sign request asks for on an RSA key. `None` is plain
+/// `ssh-rsa` (SHA-1), which the token cannot produce. When both flags are
+/// set SHA-256 wins, as in OpenSSH's agent.
+pub fn rsa_hash(flags: u32) -> Option<HashAlg> {
+    if flags & SSH_AGENT_RSA_SHA2_256 != 0 {
+        Some(HashAlg::Sha256)
+    } else if flags & SSH_AGENT_RSA_SHA2_512 != 0 {
+        Some(HashAlg::Sha512)
+    } else {
+        None
+    }
+}
 
 /// Largest frame accepted from a client (OpenSSH uses the same bound).
 pub const MAX_FRAME: usize = 256 * 1024;
@@ -139,6 +155,15 @@ pub fn describe_data(data: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rsa_hash_follows_flags() {
+        use super::*;
+        assert_eq!(rsa_hash(0), None);
+        assert_eq!(rsa_hash(SSH_AGENT_RSA_SHA2_256), Some(HashAlg::Sha256));
+        assert_eq!(rsa_hash(SSH_AGENT_RSA_SHA2_512), Some(HashAlg::Sha512));
+        assert_eq!(rsa_hash(6), Some(HashAlg::Sha256));
+    }
+
     use super::*;
     use ssh_key::public::{Ed25519PublicKey, KeyData};
 

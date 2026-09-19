@@ -1,13 +1,12 @@
-//! The two device operations the agent needs: deriving a public key and
+//! The two device operations the agent needs: fetching a public key and
 //! signing a challenge, plus the connect handshake.
 
 use crate::challenge::{Challenge, ChallengeSink};
-use crate::identity::{Curve, Identity};
-use crate::protocol::{
-    self, DeviceStatus, MAX_LARGE_PAYLOAD, Opcode, RawPublicKey, Report, Response,
-};
+use crate::identity::{Curve, EccSlot, KeyKind, KeySpec};
+use crate::protocol::{self, DeviceStatus, Opcode, RSA_LENGTHS, RawPublicKey, Report, Response};
 use crate::transport::{HidTransport, HidapiTransport, TransportError};
 use sha2::{Digest, Sha256};
+use ssh_key::HashAlg;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -22,6 +21,8 @@ pub enum DeviceError {
     Protocol(#[from] protocol::ProtocolError),
     #[error(transparent)]
     Key(#[from] crate::keys::KeyError),
+    #[error(transparent)]
+    Spec(#[from] crate::identity::IdentityError),
     #[error("OnlyKey is locked; enter your PIN on the device first")]
     Locked,
     #[error("OnlyKey has no PIN set; initialise it with the OnlyKey app first")]
@@ -34,8 +35,16 @@ pub enum DeviceError {
     WrongChallenge,
     #[error("timed out waiting for confirmation on OnlyKey")]
     ConfirmationTimeout,
-    #[error("data to sign is {0} bytes; the device accepts at most {max} bytes", max = MAX_LARGE_PAYLOAD - 32)]
-    BlobTooLong(usize),
+    #[error("data to sign is {len} bytes; the device accepts at most {max} bytes")]
+    BlobTooLong { len: usize, max: usize },
+    #[error("slot {slot} holds a {found} key, not the requested {requested}")]
+    CurveMismatch {
+        slot: EccSlot,
+        requested: Curve,
+        found: Curve,
+    },
+    #[error("RSA reply of {0} bytes is neither a 2048- nor a 4096-bit value")]
+    RsaLength(usize),
     #[error(
         "nistp256 cannot sign a {0}-byte message: the firmware would treat it as a precomputed hash"
     )]
@@ -58,6 +67,8 @@ pub struct Timeouts {
     pub pubkey: Duration,
     /// Wait for the user to confirm and the device to sign.
     pub sign: Duration,
+    /// Silence that ends a multi-report reply (RSA modulus or signature).
+    pub gap: Duration,
 }
 
 impl Default for Timeouts {
@@ -69,6 +80,7 @@ impl Default for Timeouts {
             status: Duration::from_millis(1000),
             pubkey: Duration::from_millis(1500),
             sign: Duration::from_secs(22),
+            gap: Duration::from_millis(500),
         }
     }
 }
@@ -166,88 +178,144 @@ impl<T: HidTransport> OnlyKey<T> {
         }
     }
 
-    /// Ask the device for the public key it derives for `identity` on `curve`.
-    pub fn derive_public_key(
-        &mut self,
-        identity: &Identity,
-        curve: Curve,
-    ) -> Result<RawPublicKey, DeviceError> {
+    /// Ask the device for the public key of `key`: derived from the identity
+    /// hash, or read from the stored slot.
+    ///
+    /// A stored ECC slot's key type is fixed when it is written, so the reply
+    /// is checked against the requested curve and
+    /// [`DeviceError::CurveMismatch`] names the curve the slot actually
+    /// holds. An RSA modulus arrives as several reports; its length (256 or
+    /// 512 bytes) is whatever the slot holds.
+    pub fn public_key(&mut self, key: &KeySpec) -> Result<RawPublicKey, DeviceError> {
         self.require_unlocked()?;
-        let hash = identity.derivation_hash();
-        tracing::debug!(%identity, %curve, hash = %hex::encode(hash), "requesting public key");
-        self.transport
-            .write_report(&protocol::getpubkey_report(curve, &hash))?;
-        let report = self.await_data(self.timeouts.pubkey)?;
-        let key = protocol::parse_pubkey_report(curve, &report);
-        if curve == Curve::Ed25519 && report[32..].iter().any(|&b| b != 0) {
-            tracing::debug!("public key report carries non-zero tail bytes");
+        let hash = key.identity.derivation_hash();
+        tracing::debug!(identity = %key.identity, key = %key.kind, hash = %hex::encode(hash), "requesting public key");
+        self.transport.write_report(&protocol::getpubkey_report(
+            key.pubkey_slot(),
+            key.pubkey_tag(),
+            &hash,
+        ))?;
+        match key.kind {
+            KeyKind::StoredRsa(_) => {
+                let modulus = self.await_data_all(self.timeouts.pubkey)?;
+                if !RSA_LENGTHS.contains(&modulus.len()) {
+                    return Err(DeviceError::RsaLength(modulus.len()));
+                }
+                Ok(RawPublicKey::Rsa(modulus))
+            }
+            KeyKind::StoredEcc { slot, curve } => {
+                let report = self.await_data(self.timeouts.pubkey)?;
+                let found = protocol::pubkey_report_curve(&report);
+                if found != curve {
+                    return Err(DeviceError::CurveMismatch {
+                        slot,
+                        requested: curve,
+                        found,
+                    });
+                }
+                Ok(protocol::parse_pubkey_report(curve, &report))
+            }
+            KeyKind::Derived(curve) => {
+                let report = self.await_data(self.timeouts.pubkey)?;
+                if curve == Curve::Ed25519 && report[32..].iter().any(|&b| b != 0) {
+                    tracing::debug!("public key report carries non-zero tail bytes");
+                }
+                Ok(protocol::parse_pubkey_report(curve, &report))
+            }
         }
-        Ok(key)
     }
 
-    /// Sign `blob` with the key derived for `identity` on `curve`.
+    /// Sign `blob` with `key`.
     ///
     /// Shows the challenge through `sink`, sends the request and waits for the
-    /// user to confirm. Returns the raw 64-byte signature.
+    /// user to confirm. Returns the raw signature: 64 bytes for an ECC key,
+    /// the 256- or 512-byte PKCS#1 v1.5 block for RSA. `hash` only matters
+    /// for RSA, where the token signs `hash(blob)`.
     pub fn sign(
         &mut self,
-        identity: &Identity,
-        curve: Curve,
+        key: &KeySpec,
         blob: &[u8],
+        hash: HashAlg,
         subject: Option<String>,
         sink: &dyn ChallengeSink,
-    ) -> Result<[u8; 64], DeviceError> {
+    ) -> Result<Vec<u8>, DeviceError> {
         let version = self.require_unlocked()?.to_owned();
-        if blob.len() + 32 > MAX_LARGE_PAYLOAD {
-            return Err(DeviceError::BlobTooLong(blob.len()));
+        if let Some(max) = key.max_blob_len()
+            && blob.len() > max
+        {
+            return Err(DeviceError::BlobTooLong {
+                len: blob.len(),
+                max,
+            });
         }
-        if curve == Curve::NistP256 && (blob.len() == 32 || blob.len() == 64) {
+        if key.curve() == Some(Curve::NistP256) && (blob.len() == 32 || blob.len() == 64) {
             return Err(DeviceError::AmbiguousBlobLength(blob.len()));
         }
-        let mut message = blob.to_vec();
-        message.extend_from_slice(&identity.derivation_hash());
-        let reports = protocol::chunk_large_message(Opcode::Sign, curve.sign_slot(), &message)?;
+        let message = key.sign_message(blob, hash)?;
+        let reports = protocol::chunk_large_message(Opcode::Sign, key.sign_slot(), &message)?;
 
         let digits = challenge_digits(&message, &version);
         sink.present(&Challenge {
             digits,
-            identity: identity.to_string(),
+            identity: key.identity.to_string(),
+            source: key.source(),
             subject,
         });
-        tracing::debug!(%identity, %curve, blob_len = blob.len(), ?digits, "sending sign request");
+        tracing::debug!(identity = %key.identity, key = %key.kind, blob_len = blob.len(), ?digits, "sending sign request");
         for report in &reports {
             self.transport.write_report(report)?;
         }
-        let report = self.await_data(self.timeouts.sign)?;
-        Ok(report)
+        if key.kind.is_rsa() {
+            let sig = self.await_data_all(self.timeouts.sign)?;
+            if !RSA_LENGTHS.contains(&sig.len()) {
+                return Err(DeviceError::RsaLength(sig.len()));
+            }
+            Ok(sig)
+        } else {
+            Ok(self.await_data(self.timeouts.sign)?.to_vec())
+        }
     }
 
-    /// [`Self::derive_public_key`] wrapped as an SSH public key whose comment
-    /// is `<ssh://user@host|curve>`, the same label the Python agent writes.
-    pub fn ssh_public_key(
-        &mut self,
-        identity: &Identity,
-        curve: Curve,
-    ) -> Result<ssh_key::PublicKey, DeviceError> {
-        let raw = self.derive_public_key(identity, curve)?;
-        Ok(crate::keys::public_key(&raw, &identity.label(curve))?)
+    /// [`Self::public_key`] wrapped as an SSH public key whose comment is
+    /// [`KeySpec::label`]: `<ssh://user@host|curve>` for a derived key, the
+    /// same label the Python agent writes.
+    pub fn ssh_public_key(&mut self, key: &KeySpec) -> Result<ssh_key::PublicKey, DeviceError> {
+        let raw = self.public_key(key)?;
+        Ok(crate::keys::public_key(&raw, &key.label())?)
     }
 
     /// [`Self::sign`] wrapped as an SSH signature, verified against
-    /// `public_key` before it is returned.
+    /// `public_key` before it is returned. For RSA, `hash` selects
+    /// `rsa-sha2-256` or `rsa-sha2-512`.
     pub fn ssh_sign(
         &mut self,
-        identity: &Identity,
-        curve: Curve,
+        key: &KeySpec,
         public_key: &ssh_key::PublicKey,
         data: &[u8],
+        hash: HashAlg,
         subject: Option<String>,
         sink: &dyn ChallengeSink,
     ) -> Result<ssh_key::Signature, DeviceError> {
-        let raw = self.sign(identity, curve, data, subject, sink)?;
-        let sig = crate::keys::signature(curve, &raw)?;
+        let raw = self.sign(key, data, hash, subject, sink)?;
+        let sig = crate::keys::signature(&key.kind.signature_algorithm(hash), &raw)?;
         crate::keys::verify(public_key, data, &sig)?;
         Ok(sig)
+    }
+
+    /// Wait for a multi-report reply: the first report within `timeout`, then
+    /// more until the token has been quiet for [`Timeouts::gap`].
+    fn await_data_all(&mut self, timeout: Duration) -> Result<Vec<u8>, DeviceError> {
+        let mut out = self.await_data(timeout)?.to_vec();
+        loop {
+            match await_response(&mut self.transport, &self.timeouts, self.timeouts.gap) {
+                Ok(Response::Data(report)) => out.extend_from_slice(&report),
+                Ok(Response::DeviceError(text)) => return Err(firmware_error(text)),
+                Ok(Response::Status(_) | Response::Filler) | Err(DeviceError::NoResponse(_)) => {
+                    return Ok(out);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Wait for a binary report, translating firmware errors.
@@ -328,7 +396,27 @@ fn await_response<T: HidTransport>(
 mod tests {
     use super::*;
     use crate::challenge::RecordingSink;
+    use crate::identity::{Identity, KeySource, RsaSlot, Slot};
     use crate::transport::fake::{ScriptedTransport, Step};
+
+    fn rsa(slot: u8) -> KeySpec {
+        KeySpec::rsa(
+            "james@example.com".parse().unwrap(),
+            RsaSlot::new(slot).unwrap(),
+        )
+    }
+
+    fn derived(curve: Curve) -> KeySpec {
+        KeySpec::derived("james@example.com".parse().unwrap(), curve)
+    }
+
+    fn stored(curve: Curve, slot: u8) -> KeySpec {
+        KeySpec::stored(
+            "james@example.com".parse().unwrap(),
+            curve,
+            EccSlot::new(slot).unwrap(),
+        )
+    }
 
     fn fast() -> Timeouts {
         Timeouts {
@@ -338,6 +426,7 @@ mod tests {
             status: Duration::from_millis(50),
             pubkey: Duration::from_millis(50),
             sign: Duration::from_millis(50),
+            gap: Duration::from_millis(20),
         }
     }
 
@@ -391,13 +480,18 @@ mod tests {
             Step::Reply(text("INITIALIZED")),
         ]);
         let mut ok = OnlyKey::handshake(t, fast(), 1).unwrap();
-        let id: Identity = "james@example.com".parse().unwrap();
         assert!(matches!(
-            ok.derive_public_key(&id, Curve::Ed25519),
+            ok.public_key(&derived(Curve::Ed25519)),
             Err(DeviceError::Locked)
         ));
         assert!(matches!(
-            ok.sign(&id, Curve::Ed25519, b"x", None, &RecordingSink::default()),
+            ok.sign(
+                &derived(Curve::Ed25519),
+                b"x",
+                HashAlg::Sha512,
+                None,
+                &RecordingSink::default()
+            ),
             Err(DeviceError::Locked)
         ));
     }
@@ -410,18 +504,70 @@ mod tests {
         let t = ScriptedTransport::new(vec![
             Step::ExpectWrite(protocol::settime_report(1)),
             Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
-            Step::ExpectWrite(protocol::getpubkey_report(
-                Curve::Ed25519,
-                &id.derivation_hash(),
-            )),
+            Step::ExpectWrite(protocol::getpubkey_report(132, 0x01, &id.derivation_hash())),
             Step::Timeout,
             Step::Reply(key_report),
         ]);
         let mut ok = OnlyKey::handshake(t, fast(), 1).unwrap();
         assert_eq!(
-            ok.derive_public_key(&id, Curve::Ed25519).unwrap(),
+            ok.public_key(&derived(Curve::Ed25519)).unwrap(),
             RawPublicKey::Ed25519([0x42; 32])
         );
+        ok.into_transport().assert_done();
+    }
+
+    #[test]
+    fn stored_public_key_uses_slot_and_checks_curve() {
+        let id: Identity = "james@example.com".parse().unwrap();
+        let mut ed_report = [0u8; 64];
+        ed_report[..32].copy_from_slice(&[0x42; 32]);
+        let p256_report: Report = std::array::from_fn(|i| 0x37 ^ i as u8);
+        let t = ScriptedTransport::new(vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+            Step::ExpectWrite(protocol::getpubkey_report(103, 0x01, &id.derivation_hash())),
+            Step::Reply(ed_report),
+            Step::ExpectWrite(protocol::getpubkey_report(104, 0x02, &id.derivation_hash())),
+            Step::Reply(p256_report),
+            // Asking for a P-256 key from the ed25519 slot is refused.
+            Step::ExpectWrite(protocol::getpubkey_report(103, 0x02, &id.derivation_hash())),
+            Step::Reply(ed_report),
+            Step::ExpectWrite(protocol::getpubkey_report(104, 0x01, &id.derivation_hash())),
+            Step::Reply(p256_report),
+        ]);
+        let mut ok = OnlyKey::handshake(t, fast(), 1).unwrap();
+        assert_eq!(
+            ok.public_key(&stored(Curve::Ed25519, 3)).unwrap(),
+            RawPublicKey::Ed25519([0x42; 32])
+        );
+        assert_eq!(
+            ok.public_key(&stored(Curve::NistP256, 4)).unwrap(),
+            RawPublicKey::NistP256(p256_report)
+        );
+        let err = ok.public_key(&stored(Curve::NistP256, 3)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DeviceError::CurveMismatch {
+                    requested: Curve::NistP256,
+                    found: Curve::Ed25519,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "slot ECC3 holds a ed25519 key, not the requested nistp256"
+        );
+        assert!(matches!(
+            ok.public_key(&stored(Curve::Ed25519, 4)),
+            Err(DeviceError::CurveMismatch {
+                requested: Curve::Ed25519,
+                found: Curve::NistP256,
+                ..
+            })
+        ));
         ok.into_transport().assert_done();
     }
 
@@ -443,13 +589,152 @@ mod tests {
         let mut ok = OnlyKey::handshake(ScriptedTransport::new(steps), fast(), 1).unwrap();
         let sink = RecordingSink::default();
         let got = ok
-            .sign(&id, Curve::Ed25519, &blob, Some("test".into()), &sink)
+            .sign(
+                &derived(Curve::Ed25519),
+                &blob,
+                HashAlg::Sha512,
+                Some("test".into()),
+                &sink,
+            )
             .unwrap();
         assert_eq!(got, sig);
         let shown = sink.0.lock().unwrap();
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].digits, challenge_digits(&message, "v3.0.4-prodc"));
         assert_eq!(shown[0].identity, "james@example.com");
+        assert_eq!(shown[0].source, KeySource::Derived);
+        ok.into_transport().assert_done();
+    }
+
+    #[test]
+    fn stored_sign_sends_blob_alone_with_slot() {
+        let g = goldens();
+        let blob: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        let chunks = protocol::chunk_large_message(Opcode::Sign, 103, &blob).unwrap();
+        assert_eq!(chunks.len(), 2);
+        let mut steps = vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+        ];
+        steps.extend(chunks.iter().map(|c| Step::ExpectWrite(*c)));
+        let sig: Report = std::array::from_fn(|i| 0x5A ^ i as u8);
+        steps.push(Step::Reply(sig));
+        let mut ok = OnlyKey::handshake(ScriptedTransport::new(steps), fast(), 1).unwrap();
+        let sink = RecordingSink::default();
+        let got = ok
+            .sign(
+                &stored(Curve::Ed25519, 3),
+                &blob,
+                HashAlg::Sha512,
+                None,
+                &sink,
+            )
+            .unwrap();
+        assert_eq!(got, sig);
+        let shown = sink.0.lock().unwrap();
+        assert_eq!(shown.len(), 1);
+        // The challenge is over the blob alone, as recorded from the Python agent.
+        let want: Vec<u8> = g["challenges_ecc3"][0]["digits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(shown[0].digits.to_vec(), want);
+        assert_eq!(
+            shown[0].source,
+            KeySource::Stored(Slot::Ecc(EccSlot::new(3).unwrap()))
+        );
+        ok.into_transport().assert_done();
+    }
+
+    fn numbered_reports(n: usize, seed: u8) -> Vec<Report> {
+        (0..n)
+            .map(|i| std::array::from_fn(|j| seed ^ (i as u8) ^ (j as u8)))
+            .collect()
+    }
+
+    #[test]
+    fn rsa_public_key_collects_reports_until_silence() {
+        let id: Identity = "james@example.com".parse().unwrap();
+        let hash = id.derivation_hash();
+        let four = numbered_reports(4, 0x30);
+        let eight = numbered_reports(8, 0x90);
+        let mut steps = vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+            Step::ExpectWrite(protocol::getpubkey_report(1, 0x00, &hash)),
+        ];
+        steps.extend(four.iter().map(|r| Step::Reply(*r)));
+        steps.push(Step::Timeout);
+        steps.push(Step::ExpectWrite(protocol::getpubkey_report(
+            2, 0x00, &hash,
+        )));
+        steps.extend(eight.iter().map(|r| Step::Reply(*r)));
+        // A reply that is neither 256 nor 512 bytes is rejected.
+        steps.push(Step::ExpectWrite(protocol::getpubkey_report(
+            3, 0x00, &hash,
+        )));
+        steps.extend(four[..3].iter().map(|r| Step::Reply(*r)));
+        steps.push(Step::ExpectWrite(protocol::getpubkey_report(
+            4, 0x00, &hash,
+        )));
+        steps.push(Step::Reply(text(
+            "Error no RSA Private Key set in this slot",
+        )));
+        let mut ok = OnlyKey::handshake(ScriptedTransport::new(steps), fast(), 1).unwrap();
+        assert_eq!(
+            ok.public_key(&rsa(1)).unwrap(),
+            RawPublicKey::Rsa(four.concat())
+        );
+        assert_eq!(
+            ok.public_key(&rsa(2)).unwrap(),
+            RawPublicKey::Rsa(eight.concat())
+        );
+        assert!(matches!(
+            ok.public_key(&rsa(3)),
+            Err(DeviceError::RsaLength(192))
+        ));
+        assert!(matches!(
+            ok.public_key(&rsa(4)),
+            Err(DeviceError::Firmware(_))
+        ));
+        ok.into_transport().assert_done();
+    }
+
+    #[test]
+    fn rsa_sign_sends_hash_and_collects_signature() {
+        let g = goldens();
+        let blob: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        let digest = sha2::Sha512::digest(&blob);
+        let chunks = protocol::chunk_large_message(Opcode::Sign, 1, &digest).unwrap();
+        assert_eq!(chunks.len(), 2);
+        let sig = numbered_reports(4, 0x77);
+        let mut steps = vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+        ];
+        steps.extend(chunks.iter().map(|c| Step::ExpectWrite(*c)));
+        steps.push(Step::Timeout);
+        steps.extend(sig.iter().map(|r| Step::Reply(*r)));
+        let mut ok = OnlyKey::handshake(ScriptedTransport::new(steps), fast(), 1).unwrap();
+        let sink = RecordingSink::default();
+        let got = ok
+            .sign(&rsa(1), &blob, HashAlg::Sha512, None, &sink)
+            .unwrap();
+        assert_eq!(got, sig.concat());
+        let shown = sink.0.lock().unwrap();
+        let want: Vec<u8> = g["challenges_rsa1"][1]["digits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(shown[0].digits.to_vec(), want);
+        assert_eq!(
+            shown[0].source,
+            KeySource::Stored(Slot::Rsa(RsaSlot::new(1).unwrap()))
+        );
         ok.into_transport().assert_done();
     }
 
@@ -473,14 +758,11 @@ mod tests {
             let t = ScriptedTransport::new(vec![
                 Step::ExpectWrite(protocol::settime_report(1)),
                 Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
-                Step::ExpectWrite(protocol::getpubkey_report(
-                    Curve::NistP256,
-                    &id.derivation_hash(),
-                )),
+                Step::ExpectWrite(protocol::getpubkey_report(132, 0x02, &id.derivation_hash())),
                 Step::Reply(text(reply)),
             ]);
             let mut ok = OnlyKey::handshake(t, fast(), 1).unwrap();
-            let err = ok.derive_public_key(&id, Curve::NistP256).unwrap_err();
+            let err = ok.public_key(&derived(Curve::NistP256)).unwrap_err();
             assert!(check(&err), "{reply}: {err}");
         }
     }
@@ -491,21 +773,17 @@ mod tests {
         let t = ScriptedTransport::new(vec![
             Step::ExpectWrite(protocol::settime_report(1)),
             Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
-            Step::ExpectWrite(protocol::getpubkey_report(
-                Curve::Ed25519,
-                &id.derivation_hash(),
-            )),
+            Step::ExpectWrite(protocol::getpubkey_report(132, 0x01, &id.derivation_hash())),
         ]);
         let mut ok = OnlyKey::handshake(t, fast(), 1).unwrap();
         assert!(matches!(
-            ok.derive_public_key(&id, Curve::Ed25519),
+            ok.public_key(&derived(Curve::Ed25519)),
             Err(DeviceError::NoResponse(_))
         ));
     }
 
     #[test]
     fn sign_rejects_bad_blob_lengths() {
-        let id: Identity = "james@example.com".parse().unwrap();
         let t = ScriptedTransport::new(vec![
             Step::ExpectWrite(protocol::settime_report(1)),
             Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
@@ -513,11 +791,33 @@ mod tests {
         let mut ok = OnlyKey::handshake(t, fast(), 1).unwrap();
         let sink = RecordingSink::default();
         assert!(matches!(
-            ok.sign(&id, Curve::Ed25519, &[0; 737], None, &sink),
-            Err(DeviceError::BlobTooLong(737))
+            ok.sign(
+                &derived(Curve::Ed25519),
+                &[0; 737],
+                HashAlg::Sha256,
+                None,
+                &sink
+            ),
+            Err(DeviceError::BlobTooLong { len: 737, max: 736 })
         ));
         assert!(matches!(
-            ok.sign(&id, Curve::NistP256, &[0; 64], None, &sink),
+            ok.sign(
+                &stored(Curve::Ed25519, 3),
+                &[0; 769],
+                HashAlg::Sha256,
+                None,
+                &sink
+            ),
+            Err(DeviceError::BlobTooLong { len: 769, max: 768 })
+        ));
+        assert!(matches!(
+            ok.sign(
+                &derived(Curve::NistP256),
+                &[0; 64],
+                HashAlg::Sha256,
+                None,
+                &sink
+            ),
             Err(DeviceError::AmbiguousBlobLength(64))
         ));
         assert!(sink.0.lock().unwrap().is_empty());

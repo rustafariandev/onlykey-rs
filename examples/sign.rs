@@ -6,24 +6,26 @@
 //! ```
 
 use onlykey_agent::challenge::TtyPrompt;
-use onlykey_agent::{Curve, Identity, OnlyKey};
+use onlykey_agent::ssh_key::HashAlg;
+use onlykey_agent::{Curve, KeySpec, OnlyKey};
 use std::io::Read;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let identity: Identity = std::env::args()
+    let identity = std::env::args()
         .nth(1)
         .ok_or("usage: sign <[user@]host> < data")?
         .parse()?;
+    let spec = KeySpec::derived(identity, Curve::Ed25519);
     let mut data = Vec::new();
     std::io::stdin().read_to_end(&mut data)?;
 
     let mut device = OnlyKey::open()?;
-    let key = device.ssh_public_key(&identity, Curve::Ed25519)?;
+    let key = device.ssh_public_key(&spec)?;
     let sig = device.ssh_sign(
-        &identity,
-        Curve::Ed25519,
+        &spec,
         &key,
         &data,
+        HashAlg::Sha512,
         Some("example".into()),
         &TtyPrompt,
     )?;

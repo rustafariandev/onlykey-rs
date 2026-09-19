@@ -3,6 +3,7 @@
 //! The agent may run without a controlling terminal (daemon mode, agent
 //! forwarding), so the prompt is abstracted behind [`ChallengeSink`].
 
+use crate::identity::KeySource;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
@@ -13,6 +14,8 @@ pub struct Challenge {
     pub digits: [u8; 3],
     /// Identity whose key is being used, e.g. `james@example.com`.
     pub identity: String,
+    /// Whether the key is derived from the identity or stored in a slot.
+    pub source: KeySource,
     /// What is being signed, if the request could be summarised.
     pub subject: Option<String>,
 }
@@ -21,13 +24,17 @@ impl Challenge {
     /// One-line human-readable prompt.
     pub fn message(&self) -> String {
         let [a, b, c] = self.digits;
+        let slot = match self.source {
+            KeySource::Derived => String::new(),
+            KeySource::Stored(slot) => format!(" with stored key {slot}"),
+        };
         let subject = self
             .subject
             .as_deref()
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
         format!(
-            "OnlyKey: enter {a} {b} {c} to sign as {}{subject}, or press any button if challenge mode is off",
+            "OnlyKey: enter {a} {b} {c} to sign as {}{slot}{subject}, or press any button if challenge mode is off",
             self.identity
         )
     }
@@ -57,7 +64,8 @@ impl ChallengeSink for TtyPrompt {
 
 /// Runs an external command with the prompt as its last argument, e.g.
 /// `notify-send OnlyKey`. Environment variables `OKAGENT_DIGITS` and
-/// `OKAGENT_IDENTITY` carry the parts separately.
+/// `OKAGENT_IDENTITY` carry the parts separately, and `OKAGENT_SLOT` names
+/// the slot (`ECC3`) when a stored key is used.
 #[derive(Debug, Clone)]
 pub struct CommandNotifier {
     program: String,
@@ -79,12 +87,16 @@ impl CommandNotifier {
 impl ChallengeSink for CommandNotifier {
     fn present(&self, challenge: &Challenge) {
         let [a, b, c] = challenge.digits;
-        let result = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .arg(challenge.message())
             .env("OKAGENT_DIGITS", format!("{a} {b} {c}"))
-            .env("OKAGENT_IDENTITY", &challenge.identity)
-            .spawn();
+            .env("OKAGENT_IDENTITY", &challenge.identity);
+        if let KeySource::Stored(slot) = challenge.source {
+            command.env("OKAGENT_SLOT", slot.to_string());
+        }
+        let result = command.spawn();
         match result {
             Ok(mut child) => {
                 std::thread::spawn(move || {
@@ -127,12 +139,23 @@ mod tests {
         let c = Challenge {
             digits: [3, 1, 5],
             identity: "james@example.com".into(),
+            source: KeySource::Derived,
             subject: Some("ssh login to host".into()),
         };
         let m = c.message();
         assert!(m.contains("3 1 5"));
         assert!(m.contains("james@example.com"));
         assert!(m.contains("(ssh login to host)"));
+        assert!(!m.contains("stored key"));
+        let stored = Challenge {
+            source: KeySource::Stored("ECC3".parse().unwrap()),
+            ..c
+        };
+        assert!(
+            stored
+                .message()
+                .contains("sign as james@example.com with stored key ECC3 (ssh login to host)")
+        );
     }
 
     #[test]

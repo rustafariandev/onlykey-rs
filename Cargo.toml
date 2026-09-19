@@ -28,7 +28,7 @@ serde = ["dep:serde"]
 
 [dependencies]
 hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev"] }
-ssh-key = { version = "0.6.7", features = ["ed25519", "p256"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
 ssh-encoding = "0.2"
 signature = "2"
 sha2 = "0.10"
@@ -44,6 +44,8 @@ serde_json = "1"
 tempfile = "3"
 ed25519-dalek = "2"
 p256 = { version = "0.13", features = ["ecdsa"] }
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
 
 [lints]
 workspace = true

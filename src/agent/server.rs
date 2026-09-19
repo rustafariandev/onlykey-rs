@@ -4,10 +4,11 @@
 use super::wire::{self, Request};
 use crate::challenge::ChallengeSink;
 use crate::device::{DeviceError, OnlyKey};
-use crate::identity::{Curve, Identity};
+use crate::identity::KeySpec;
 use crate::keys;
 use crate::transport::HidTransport;
 use nix::sys::stat::{Mode, umask};
+use ssh_key::HashAlg;
 use ssh_key::PublicKey;
 use std::collections::HashMap;
 use std::io;
@@ -24,19 +25,6 @@ pub type Device = OnlyKey<Box<dyn HidTransport>>;
 /// How the agent obtains a device for each operation.
 pub type Opener = Arc<dyn Fn() -> Result<Device, DeviceError> + Send + Sync>;
 
-/// One key the agent serves.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Entry {
-    pub identity: Identity,
-    pub curve: Curve,
-}
-
-impl Entry {
-    pub fn label(&self) -> String {
-        self.identity.label(self.curve)
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error(transparent)]
@@ -45,22 +33,27 @@ pub enum AgentError {
     Key(#[from] keys::KeyError),
     #[error("requested key is not served by this agent")]
     UnknownKey,
+    #[error(
+        "client asked for an ssh-rsa (SHA-1) signature, which the OnlyKey cannot produce; it must request rsa-sha2-256 or rsa-sha2-512"
+    )]
+    Sha1Requested,
     #[error(transparent)]
     Wire(#[from] wire::WireError),
 }
 
-/// Agent state shared between connections.
+/// Agent state shared between connections. Each [`KeySpec`] it serves is
+/// one identity in the SSH sense.
 pub struct Agent {
-    entries: Vec<Entry>,
+    entries: Vec<KeySpec>,
     opener: Opener,
     sink: Arc<dyn ChallengeSink>,
     /// Serialises every device operation, including the wait for the user.
     device_lock: Mutex<()>,
-    cache: Mutex<HashMap<Entry, PublicKey>>,
+    cache: Mutex<HashMap<KeySpec, PublicKey>>,
 }
 
 impl Agent {
-    pub fn new(entries: Vec<Entry>, opener: Opener, sink: Arc<dyn ChallengeSink>) -> Self {
+    pub fn new(entries: Vec<KeySpec>, opener: Opener, sink: Arc<dyn ChallengeSink>) -> Self {
         Agent {
             entries,
             opener,
@@ -70,18 +63,18 @@ impl Agent {
         }
     }
 
-    pub fn entries(&self) -> &[Entry] {
+    pub fn entries(&self) -> &[KeySpec] {
         &self.entries
     }
 
     /// Seed the key cache from previously exported public keys, matched by
-    /// their comment (`<ssh://user@host|curve>`). Returns how many matched.
+    /// their comment (see [`KeySpec::label`]). Returns how many matched.
     pub fn preload(&self, keys: impl IntoIterator<Item = PublicKey>) -> usize {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let mut matched = 0;
         for key in keys {
             if let Some(entry) = self.entries.iter().find(|e| e.label() == key.comment())
-                && keys::curve_of(&key) == Some(entry.curve)
+                && key.algorithm() == entry.kind.public_algorithm()
             {
                 cache.insert(entry.clone(), key);
                 matched += 1;
@@ -90,12 +83,13 @@ impl Agent {
         matched
     }
 
-    /// Public keys for every entry, deriving any that are not cached yet.
+    /// Public keys for every entry, fetching any that are not cached yet.
     ///
-    /// Entries whose key cannot be derived (device absent or locked) are
-    /// skipped with a warning so the client still sees the rest.
+    /// Entries whose key cannot be fetched (device absent or locked, empty
+    /// slot, wrong curve) are skipped with a warning so the client still sees
+    /// the rest.
     pub fn public_keys(&self) -> Vec<PublicKey> {
-        let missing: Vec<Entry> = {
+        let missing: Vec<KeySpec> = {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             self.entries
                 .iter()
@@ -116,12 +110,12 @@ impl Agent {
                                     .insert(entry.clone(), key);
                             }
                             Err(e) => {
-                                tracing::warn!(identity = %entry.identity, curve = %entry.curve, error = %e, "cannot derive public key")
+                                tracing::warn!(identity = %entry.identity, key = %entry.kind, error = %e, "cannot get public key")
                             }
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "cannot open OnlyKey to derive public keys"),
+                Err(e) => tracing::warn!(error = %e, "cannot open OnlyKey to get public keys"),
             }
         }
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -131,7 +125,7 @@ impl Agent {
             .collect()
     }
 
-    /// Derive every key now; fails on the first problem. Used by commands that
+    /// Fetch every key now; fails on the first problem. Used by commands that
     /// need all keys up front.
     pub fn derive_all(&self) -> Result<Vec<PublicKey>, AgentError> {
         let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -163,9 +157,8 @@ impl Agent {
         Ok(out)
     }
 
-    fn derive(&self, device: &mut Device, entry: &Entry) -> Result<PublicKey, AgentError> {
-        let raw = device.derive_public_key(&entry.identity, entry.curve)?;
-        Ok(keys::public_key(&raw, &entry.label())?)
+    fn derive(&self, device: &mut Device, entry: &KeySpec) -> Result<PublicKey, AgentError> {
+        Ok(device.ssh_public_key(entry)?)
     }
 
     /// Handle one request body and produce the reply body.
@@ -182,7 +175,7 @@ impl Agent {
                 flags,
             }) => {
                 tracing::debug!(len = data.len(), flags, "sign request");
-                match self.sign(&key_blob, &data) {
+                match self.sign(&key_blob, &data, flags) {
                     Ok(reply) => reply,
                     Err(e) => {
                         tracing::warn!(error = %e, "sign request failed");
@@ -201,26 +194,25 @@ impl Agent {
         }
     }
 
-    fn sign(&self, key_blob: &[u8], data: &[u8]) -> Result<Vec<u8>, AgentError> {
+    fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
         let (entry, key) = self.lookup(key_blob)?;
+        let hash = match wire::rsa_hash(flags) {
+            Some(hash) => hash,
+            None if entry.kind.is_rsa() => return Err(AgentError::Sha1Requested),
+            None => HashAlg::default(),
+        };
         let subject = wire::describe_data(data);
         let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut device = (self.opener)()?;
-        let raw = device.sign(
-            &entry.identity,
-            entry.curve,
-            data,
-            subject,
-            self.sink.as_ref(),
-        )?;
+        let raw = device.sign(&entry, data, hash, subject, self.sink.as_ref())?;
         drop(device);
-        let sig = keys::signature(entry.curve, &raw)?;
+        let sig = keys::signature(&entry.kind.signature_algorithm(hash), &raw)?;
         keys::verify(&key, data, &sig)?;
-        tracing::info!(identity = %entry.identity, curve = %entry.curve, "signed");
+        tracing::info!(identity = %entry.identity, key = %entry.kind, algorithm = %sig.algorithm(), "signed");
         Ok(wire::sign_response(&sig))
     }
 
-    fn lookup(&self, key_blob: &[u8]) -> Result<(Entry, PublicKey), AgentError> {
+    fn lookup(&self, key_blob: &[u8]) -> Result<(KeySpec, PublicKey), AgentError> {
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache
             .iter()
@@ -357,6 +349,7 @@ mod tests {
     use super::*;
     use crate::challenge::RecordingSink;
     use crate::device::Timeouts;
+    use crate::identity::{Curve, EccSlot};
     use crate::protocol::{self, Report};
     use crate::transport::fake::{ScriptedTransport, Step};
     use ssh_encoding::Decode;
@@ -375,6 +368,7 @@ mod tests {
             status: Duration::from_millis(50),
             pubkey: Duration::from_millis(50),
             sign: Duration::from_millis(50),
+            gap: Duration::from_millis(20),
         }
     }
 
@@ -387,11 +381,16 @@ mod tests {
         })
     }
 
-    fn entry() -> Entry {
-        Entry {
-            identity: "james@example.com".parse().unwrap(),
-            curve: Curve::Ed25519,
-        }
+    fn entry() -> KeySpec {
+        KeySpec::derived("james@example.com".parse().unwrap(), Curve::Ed25519)
+    }
+
+    fn stored_entry() -> KeySpec {
+        KeySpec::stored(
+            "james@example.com".parse().unwrap(),
+            Curve::Ed25519,
+            EccSlot::new(3).unwrap(),
+        )
     }
 
     #[test]
@@ -403,7 +402,8 @@ mod tests {
             Step::ExpectWrite(protocol::settime_report(1)),
             Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
             Step::ExpectWrite(protocol::getpubkey_report(
-                Curve::Ed25519,
+                132,
+                0x01,
                 &e.identity.derivation_hash(),
             )),
             Step::Reply(key_report),
@@ -440,6 +440,46 @@ mod tests {
         let right = keys::public_key(&raw, &e.label()).unwrap();
         assert_eq!(agent.preload([wrong, right]), 1);
         assert_eq!(agent.public_keys().len(), 1);
+    }
+
+    #[test]
+    fn stored_and_derived_keys_for_one_identity_stay_apart() {
+        let derived = entry();
+        let stored = stored_entry();
+        let mut derived_report = [0u8; 64];
+        derived_report[..32].copy_from_slice(&[0x11; 32]);
+        let mut stored_report = [0u8; 64];
+        stored_report[..32].copy_from_slice(&[0x33; 32]);
+        let hash = derived.identity.derivation_hash();
+        let opener = opener_with(vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+            Step::ExpectWrite(protocol::getpubkey_report(132, 0x01, &hash)),
+            Step::Reply(derived_report),
+            Step::ExpectWrite(protocol::getpubkey_report(103, 0x01, &hash)),
+            Step::Reply(stored_report),
+        ]);
+        let agent = Agent::new(
+            vec![derived.clone(), stored.clone()],
+            opener,
+            Arc::new(RecordingSink::default()),
+        );
+        let keys = agent.public_keys();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].comment(), "<ssh://james@example.com|ed25519>");
+        assert_eq!(keys[0].key_data().ed25519().unwrap().0, [0x11; 32]);
+        assert_eq!(keys[1].comment(), "<ssh://james@example.com|ed25519|ECC3>");
+        assert_eq!(keys[1].key_data().ed25519().unwrap().0, [0x33; 32]);
+
+        // Preloading from a file keeps the two apart by their comments.
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(
+            vec![derived, stored],
+            opener,
+            Arc::new(RecordingSink::default()),
+        );
+        assert_eq!(agent.preload(keys.clone()), 2);
+        assert_eq!(agent.public_keys(), keys);
     }
 
     #[test]

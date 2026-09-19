@@ -8,7 +8,9 @@ key never leaves the token: it is re-derived on the device from an identity
 string such as `james@example.com` for every operation, and each signature is
 confirmed by entering a 3-digit challenge on the buttons. Given the same
 identity and curve this port derives exactly the same public key as the
-Python agent, so existing `authorized_keys` entries keep working.
+Python agent, so existing `authorized_keys` entries keep working. Keys the
+OnlyKey app has written into one of the token's 16 ECC slots or 4 RSA slots
+("stored keys") can be used the same way.
 
 Two crates:
 
@@ -16,6 +18,8 @@ Two crates:
 - **`onlykey-agent`**: the library underneath it.
 
 Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux.
+Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
+(stored only).
 
 ## Setup
 
@@ -29,6 +33,10 @@ Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux.
 ```sh
 cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
 ```
+
+A man page lives at `okagent/okagent.1`; `man -l okagent/okagent.1` reads it
+from the checkout, or copy it to `~/.local/share/man/man1/` to get
+`man okagent`.
 
 ## okagent
 
@@ -44,10 +52,23 @@ cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the
 default is ed25519. Identities can be omitted when the config file lists them.
 
+Pass `--slot ECC3` (slots `ECC1` to `ECC16`) or `--slot RSA1` (`RSA1` to
+`RSA4`) to use the key stored in that slot instead of deriving one. The
+identity then only names the key: it appears in the prompt and the key
+comment, and `okagent ssh` still takes the destination from it. For an ECC
+slot the curve must match the key type the slot was written with; a mismatch
+is reported as such rather than producing a wrong key. An RSA slot takes no
+curve, and whether it holds a 2048- or 4096-bit key is read from the token.
+RSA keys are never derived, only stored. The token signs SHA-256 or SHA-512
+digests, so a client asking for the legacy SHA-1 `ssh-rsa` signature is
+refused; OpenSSH has asked for `rsa-sha2-*` since 7.2.
+
 ```sh
 okagent pubkey james@example.com >> authorized_keys   # copy to the server
 okagent run james@example.com -- ssh example.com
 okagent ssh james@example.com
+okagent ssh james@legacy.example.com --slot ECC3       # key stored by the OnlyKey app
+okagent ssh james@old.example.com --slot RSA1          # RSA key stored by the OnlyKey app
 eval "$(okagent serve --daemon james@example.com)"     # background agent
 ssh-add -L
 ```
@@ -79,6 +100,14 @@ name = "james@example.com"
 [[identity]]
 name = "git@github.com"
 curve = "nistp256"
+
+[[identity]]
+name = "james@legacy.example.com"
+slot = "ECC3"                           # stored key; `slot = 3` also works
+
+[[identity]]
+name = "james@old.example.com"
+slot = "RSA1"                           # RSA keys take no curve
 ```
 
 `pubkey-file` (or `--pubkey-file`) points at a file of lines from
@@ -113,15 +142,22 @@ onlykey-agent = { git = "https://github.com/rustafariandev/onlykey-rs" }
 ```
 
 ```rust
-use onlykey_agent::{Curve, Identity, OnlyKey, challenge::TtyPrompt};
+use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt, ssh_key::HashAlg};
 
-let identity: Identity = "james@example.com".parse()?;
+let key = KeySpec::derived("james@example.com".parse()?, Curve::Ed25519);
 let mut device = OnlyKey::open()?;                       // finds the token, syncs its clock
-let key = device.ssh_public_key(&identity, Curve::Ed25519)?;
-println!("{}", key.to_openssh()?);                       // authorized_keys line
+let public = device.ssh_public_key(&key)?;
+println!("{}", public.to_openssh()?);                    // authorized_keys line
 
 // Shows the challenge on the terminal, waits for the buttons, verifies the result.
-let sig = device.ssh_sign(&identity, Curve::Ed25519, &key, b"hello", None, &TtyPrompt)?;
+// The hash only matters for RSA keys.
+let sig = device.ssh_sign(&key, &public, b"hello", HashAlg::Sha512, None, &TtyPrompt)?;
+
+// Keys the OnlyKey app wrote into slots ECC3 and RSA1.
+let stored = KeySpec::stored("james@example.com".parse()?, Curve::Ed25519, "ECC3".parse()?);
+println!("{}", device.ssh_public_key(&stored)?.to_openssh()?);
+let rsa = KeySpec::rsa("james@example.com".parse()?, "RSA1".parse()?);
+println!("{}", device.ssh_public_key(&rsa)?.to_openssh()?);
 ```
 
 The crate docs (`cargo doc --open`) show how to run the agent from your own
@@ -136,7 +172,7 @@ program and describe each layer. The seams:
 - `Agent::handle` is the whole agent as a function from request body to reply
   body, for serving over something other than a unix socket.
 - `protocol`, `device` and `keys` are public for callers that need the raw
-  64-byte key or signature rather than SSH types.
+  key or signature bytes rather than SSH types.
 - The `serde` feature derives `Serialize`/`Deserialize` on `Curve`.
 - `ssh_key` is re-exported so `PublicKey` and `Signature` can be named
   without pinning the version yourself.
@@ -154,9 +190,26 @@ Examples: `cargo run --example pubkey -- james@example.com` and
   `data || hash`, split into 57-byte HID reports. The device strips the hash,
   derives the key, and signs `data`. The challenge digits are bytes 0, 15 and
   31 of `SHA-256(data || hash)`, each `% 6 + 1`.
-- Every signature is verified against the derived public key before it is
-  returned. Any device error, timeout or wrong challenge answers the SSH
-  client with `SSH_AGENT_FAILURE` and keeps the agent running.
+- Stored keys use the slot number itself, 101 to 116 for `ECC1` to `ECC16`:
+  `OKGETPUBKEY` with that slot (the same payload is sent and ignored), and
+  `OKSIGN` with that slot and `data` alone, so the challenge is over
+  `SHA-256(data)`. This is what the Python agent's `--skey ECC3` does. The
+  slot's key type is fixed when it is written, so the reply is checked
+  against the requested curve. The key comment gains a third field,
+  `<ssh://james@example.com|ed25519|ECC3>`, so a derived and a stored key for
+  the same identity never share a label.
+- RSA keys use slots 1 to 4 for `RSA1` to `RSA4`. `OKGETPUBKEY` is sent with
+  tag `0x00 || hash` and the token answers with the modulus alone, 256 or 512
+  bytes over four or eight reports (the exponent is always 65537); the agent
+  reads until the token goes quiet, so the key size need not be declared.
+  `OKSIGN` carries `SHA-256(data)` or `SHA-512(data)`, chosen by the SSH
+  client's `rsa-sha2-256` / `rsa-sha2-512` request flag; the token applies
+  the PKCS#1 v1.5 padding and returns the signature over four or eight
+  reports. The challenge digits are over `SHA-256(digest)`. The comment is
+  `<ssh://james@example.com|rsa|RSA1>`.
+- Every signature is verified against the public key before it is returned.
+  Any device error, timeout or wrong challenge answers the SSH client with
+  `SSH_AGENT_FAILURE` and keeps the agent running.
 - Only `SSH2_AGENTC_REQUEST_IDENTITIES` and `SSH2_AGENTC_SIGN_REQUEST` are
   implemented; everything else gets a failure reply, which OpenSSH treats as
   "unsupported".
@@ -187,7 +240,12 @@ okagent status
 okagent pubkey james@example.com             # must equal the Python agent's output
 okagent debug-sign james@example.com         # hidden; 114-byte payload proves 57-multiple chunking
 okagent run james@example.com -- ssh-add -L
+okagent pubkey james@example.com --slot ECC3 # same key as `onlykey-agent james@example.com -sk ECC3`
+okagent pubkey james@example.com --slot RSA1 # same key as `onlykey-agent james@example.com -sk RSA1 -e rsa2048`
 ```
+
+An empty ECC slot answers "Error no ECC Private Key set in this slot"; slots
+above 16 get no answer at all from firmware v3.0.4.
 
 ## License
 
