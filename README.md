@@ -47,6 +47,7 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK`. |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
 | `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. |
+| `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. |
 | `okagent serve [ID...]` | Long-lived agent on a unix socket. |
 
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the

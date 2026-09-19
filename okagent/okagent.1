@@ -38,6 +38,12 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .YS
 .SY okagent
 .RI [ options ]
+.B mosh
+.I identity
+.RI [ mosh-arg .\|.\|.]
+.YS
+.SY okagent
+.RI [ options ]
 .B serve
 .RB [ \-\-socket
 .IR path ]
@@ -162,6 +168,19 @@ by way of a temporary public key file.
 Any further arguments are passed to
 .B ssh
 after the destination, so they normally form a remote command.
+.TP
+.BI mosh " identity " [ mosh-arg \fR.\|.\|.]
+Like
+.BR ssh ,
+but runs
+.BR mosh (1),
+handing it the same
+.B ssh
+command line through
+.BR \-\-ssh .
+The destination is
+.RI [ user @] host
+and any further arguments follow it.
 .TP
 .BI serve " " [ identity \fR.\|.\|.]
 Run a long-lived agent on a unix socket.

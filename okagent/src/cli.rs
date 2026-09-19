@@ -66,6 +66,8 @@ pub enum Cmd {
     Shell(IdentityArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
+    /// Connect with mosh, whose ssh step uses the identity's key.
+    Mosh(SshArgs),
     /// Sign a fixed test message and verify it (hardware check).
     #[command(hide = true)]
     DebugSign(DebugSignArgs),
@@ -112,9 +114,16 @@ pub struct SshArgs {
     /// Identity as [user@]host[:port]; the host is also the ssh destination.
     pub identity: String,
 
-    /// Extra arguments passed to ssh after the destination (a remote command).
+    /// Extra arguments passed after the destination (a remote command).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+/// Which remote-shell program `SshArgs` drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remote {
+    Ssh,
+    Mosh,
 }
 
 #[derive(Debug, Args)]
@@ -321,7 +330,8 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             run(&ctx, &args, vec![shell])
         }
-        Cmd::Ssh(args) => ssh(&ctx, args),
+        Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
+        Cmd::Mosh(args) => connect(&ctx, args, Remote::Mosh),
         Cmd::DebugSign(args) => debug_sign(&ctx, args),
     }
 }
@@ -430,7 +440,10 @@ fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Resul
     })
 }
 
-fn ssh(ctx: &Context_, args: SshArgs) -> Result<ExitCode> {
+/// Run ssh or mosh against the identity's host with a temporary agent that
+/// serves only that key. ssh is told to offer nothing else; mosh gets the
+/// same ssh command line through `--ssh`.
+fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
     let id_args = IdentityArgs {
         identity: vec![args.identity.clone()],
@@ -442,7 +455,7 @@ fn ssh(ctx: &Context_, args: SshArgs) -> Result<ExitCode> {
     let dir = tempfile::tempdir()?;
     let pub_path = dir.path().join("id.pub");
     std::fs::write(&pub_path, format!("{}\n", key.to_openssh()?))?;
-    let mut command = vec![
+    let mut ssh = vec![
         "ssh".to_owned(),
         "-o".into(),
         "IdentitiesOnly=yes".into(),
@@ -450,15 +463,35 @@ fn ssh(ctx: &Context_, args: SshArgs) -> Result<ExitCode> {
         format!("IdentityFile={}", pub_path.display()),
     ];
     if let Some(port) = port {
-        command.push("-p".into());
-        command.push(port.to_string());
+        ssh.push("-p".into());
+        ssh.push(port.to_string());
     }
-    if let Some(user) = &identity.user {
-        command.push("-l".into());
-        command.push(user.clone());
-    }
-    command.push(identity.host.clone());
-    command.extend(args.args);
+    let command = match remote {
+        Remote::Ssh => {
+            let mut command = ssh;
+            if let Some(user) = &identity.user {
+                command.push("-l".into());
+                command.push(user.clone());
+            }
+            command.push(identity.host.clone());
+            command
+        }
+        Remote::Mosh => {
+            // mosh splits --ssh on whitespace, so the temporary path must
+            // not contain any.
+            let ssh_line = ssh.join(" ");
+            if ssh_line.split_whitespace().count() != ssh.len() {
+                bail!(
+                    "temporary directory path {} contains whitespace, which mosh --ssh cannot carry",
+                    dir.path().display()
+                );
+            }
+            let mut command = vec!["mosh".to_owned(), format!("--ssh={ssh_line}")];
+            command.push(identity.to_string());
+            command
+        }
+    };
+    let command = command.into_iter().chain(args.args).collect();
     run(ctx, &id_args, command)
 }
 
