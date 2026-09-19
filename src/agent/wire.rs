@@ -6,11 +6,16 @@ use ssh_key::{HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
 use thiserror::Error;
 
+/// SSH v1 request for RSA identities, which some clients still send first.
+pub const SSH_AGENTC_REQUEST_RSA_IDENTITIES: u8 = 1;
+pub const SSH_AGENT_RSA_IDENTITIES_ANSWER: u8 = 2;
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
+pub const SSH_AGENTC_EXTENSION: u8 = 27;
+pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 /// Sign request flags asking for `rsa-sha2-256` / `rsa-sha2-512`.
 pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
@@ -44,12 +49,16 @@ pub enum WireError {
 /// A decoded client request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// The SSH v1 identities request; answered with an empty list.
+    RequestRsaIdentities,
     RequestIdentities,
     Sign {
         key_blob: Vec<u8>,
         data: Vec<u8>,
         flags: u32,
     },
+    /// A protocol extension; none are implemented.
+    Extension,
     /// Any message type this agent does not implement.
     Unsupported(u8),
 }
@@ -58,7 +67,9 @@ pub enum Request {
 pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
     let (&kind, mut rest) = body.split_first().ok_or(WireError::Empty)?;
     match kind {
+        SSH_AGENTC_REQUEST_RSA_IDENTITIES => Ok(Request::RequestRsaIdentities),
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
+        SSH_AGENTC_EXTENSION => Ok(Request::Extension),
         SSH2_AGENTC_SIGN_REQUEST => {
             let key_blob = Vec::<u8>::decode(&mut rest)?;
             let data = Vec::<u8>::decode(&mut rest)?;
@@ -96,6 +107,16 @@ pub fn sign_response(sig: &Signature) -> Vec<u8> {
 
 pub fn failure() -> Vec<u8> {
     vec![SSH_AGENT_FAILURE]
+}
+
+/// `SSH_AGENT_RSA_IDENTITIES_ANSWER` with no keys: there are no SSH v1 keys.
+pub fn rsa_identities_answer() -> Vec<u8> {
+    vec![SSH_AGENT_RSA_IDENTITIES_ANSWER, 0, 0, 0, 0]
+}
+
+/// `SSH_AGENT_EXTENSION_FAILURE`, the reply to any extension request.
+pub fn extension_failure() -> Vec<u8> {
+    vec![SSH_AGENT_EXTENSION_FAILURE]
 }
 
 /// Read one length-prefixed frame. `None` at a clean EOF.
@@ -196,10 +217,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_extension_requests() {
+        assert_eq!(parse_request(&[1]).unwrap(), Request::RequestRsaIdentities);
+        assert_eq!(parse_request(&[27, 1, 2]).unwrap(), Request::Extension);
+        assert_eq!(rsa_identities_answer(), vec![2, 0, 0, 0, 0]);
+        assert_eq!(extension_failure(), vec![28]);
+    }
+
+    #[test]
     fn unknown_and_empty_requests() {
         assert_eq!(
-            parse_request(&[27, 1, 2]).unwrap(),
-            Request::Unsupported(27)
+            parse_request(&[17, 1, 2]).unwrap(),
+            Request::Unsupported(17)
         );
         assert!(matches!(parse_request(&[]), Err(WireError::Empty)));
     }

@@ -306,9 +306,19 @@ fn roundtrip(socket: &Path, body: &[u8]) -> Vec<u8> {
 #[test]
 fn unsupported_and_unknown_key_requests_get_failure_and_keep_connection() {
     let h = Harness::start(entries());
+    // Add-identity is refused; extensions and the SSH v1 listing get the
+    // replies OpenSSH's own agent gives.
     assert_eq!(
-        roundtrip(&h.socket, &[27, 0, 0, 0, 0]),
+        roundtrip(&h.socket, &[17, 0, 0, 0, 0]),
         vec![wire::SSH_AGENT_FAILURE]
+    );
+    assert_eq!(
+        roundtrip(&h.socket, &[wire::SSH_AGENTC_EXTENSION, 0, 0, 0, 0]),
+        vec![wire::SSH_AGENT_EXTENSION_FAILURE]
+    );
+    assert_eq!(
+        roundtrip(&h.socket, &[wire::SSH_AGENTC_REQUEST_RSA_IDENTITIES]),
+        vec![wire::SSH_AGENT_RSA_IDENTITIES_ANSWER, 0, 0, 0, 0]
     );
     let mut body = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
     b"not a key".as_slice().encode(&mut body).unwrap();

@@ -183,6 +183,14 @@ impl Agent {
                     }
                 }
             }
+            Ok(Request::RequestRsaIdentities) => {
+                tracing::debug!("SSH v1 identities request: answering with none");
+                wire::rsa_identities_answer()
+            }
+            Ok(Request::Extension) => {
+                tracing::debug!("extension request: none supported");
+                wire::extension_failure()
+            }
             Ok(Request::Unsupported(kind)) => {
                 tracing::debug!(kind, "unsupported request");
                 wire::failure()
@@ -491,7 +499,9 @@ mod tests {
         b"data".as_slice().encode(&mut body).unwrap();
         0u32.encode(&mut body).unwrap();
         assert_eq!(agent.handle(&body), wire::failure());
-        assert_eq!(agent.handle(&[27]), wire::failure());
+        assert_eq!(agent.handle(&[17]), wire::failure());
+        assert_eq!(agent.handle(&[27]), wire::extension_failure());
+        assert_eq!(agent.handle(&[1]), wire::rsa_identities_answer());
         assert_eq!(agent.handle(&[]), wire::failure());
     }
 
