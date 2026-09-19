@@ -60,9 +60,9 @@ pub enum Cmd {
     Pubkey(IdentityArgs),
     /// Run the agent on a unix socket.
     Serve(ServeArgs),
-    /// Run a command with SSH_AUTH_SOCK pointing at a temporary agent.
+    /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Run(RunArgs),
-    /// Start $SHELL with SSH_AUTH_SOCK pointing at a temporary agent.
+    /// Start $SHELL with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Shell(IdentityArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
@@ -94,7 +94,8 @@ pub struct ServeArgs {
     #[arg(long)]
     pub socket: Option<PathBuf>,
 
-    /// Fork into the background and print shell commands that set SSH_AUTH_SOCK.
+    /// Fork into the background and print shell commands that set
+    /// SSH_AUTH_SOCK and SSH_AGENT_PID.
     #[arg(long, short)]
     pub daemon: bool,
 }
@@ -378,7 +379,7 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     if args.daemon {
         daemonize(&path)?;
     } else {
-        eprintln!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", path.display());
+        eprint!("{}", agent_env_snippet(&path, std::process::id()));
     }
     let shutdown = shutdown_flag()?;
     agent::serve(listener, agent, shutdown)?;
@@ -386,14 +387,23 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The lines `ssh-agent -s` would print: the socket and the agent's pid,
+/// so that `ssh-agent -k` can stop it.
+fn agent_env_snippet(socket: &Path, pid: u32) -> String {
+    format!(
+        "SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID={pid}; export SSH_AGENT_PID;\n",
+        socket.display()
+    )
+}
+
 /// Fork into the background. The parent prints the shell snippet and exits;
 /// the child detaches from the terminal.
-fn daemonize(socket: &std::path::Path) -> Result<()> {
+fn daemonize(socket: &Path) -> Result<()> {
     // SAFETY: no threads have been spawned yet and the child only continues
     // with async-signal-safe setup before returning to normal execution.
     match unsafe { fork() }.context("fork")? {
-        ForkResult::Parent { .. } => {
-            println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", socket.display());
+        ForkResult::Parent { child } => {
+            print!("{}", agent_env_snippet(socket, child.as_raw() as u32));
             std::process::exit(0);
         }
         ForkResult::Child => {
@@ -410,8 +420,8 @@ fn daemonize(socket: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Start an agent on a private socket, run `command` with `SSH_AUTH_SOCK` set,
-/// and stop the agent when it exits.
+/// Start an agent on a private socket, run `command` with `SSH_AUTH_SOCK`
+/// and `SSH_AGENT_PID` set, and stop the agent when it exits.
 fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Result<ExitCode> {
     let agent = ctx.agent(identities)?;
     let path = agent::ephemeral_socket_path();
@@ -428,6 +438,7 @@ fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Resul
     let status = Command::new(program)
         .args(args)
         .env("SSH_AUTH_SOCK", guard.path())
+        .env("SSH_AGENT_PID", std::process::id().to_string())
         .status()
         .with_context(|| format!("running {program}"));
     shutdown.store(true, Ordering::SeqCst);
@@ -547,6 +558,14 @@ mod tests {
             ]
         );
         assert!(entries_from_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn env_snippet_matches_ssh_agent_output() {
+        assert_eq!(
+            agent_env_snippet(Path::new("/run/a.sock"), 42),
+            "SSH_AUTH_SOCK=/run/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=42; export SSH_AGENT_PID;\n"
+        );
     }
 
     #[test]

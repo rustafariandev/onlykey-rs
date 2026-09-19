@@ -138,7 +138,11 @@ Start a temporary agent on a private socket, run
 .I command
 with
 .B SSH_AUTH_SOCK
-pointing at it, and stop the agent when the command exits.
+pointing at it and
+.B SSH_AGENT_PID
+naming the
+.B okagent
+process, and stop the agent when the command exits.
 .B okagent
 exits with the command's exit status.
 .TP
@@ -186,17 +190,22 @@ and any further arguments follow it.
 Run a long-lived agent on a unix socket.
 Without
 .BR \-\-daemon ,
-the agent stays in the foreground and prints a line of the form
+the agent stays in the foreground and prints lines of the form
 .PP
 .RS
 .RS
 .EX
 SSH_AUTH_SOCK=\fIpath\fR; export SSH_AUTH_SOCK;
+SSH_AGENT_PID=\fIpid\fR; export SSH_AGENT_PID;
 .EE
 .RE
 .PP
-on standard error.
-The agent stops on SIGINT, SIGTERM or SIGHUP and removes its socket.
+on standard error, as
+.BR ssh-agent (1)
+does.
+The agent stops on SIGINT, SIGTERM or SIGHUP and removes its socket, so
+.B ssh-agent \-k
+stops it once those variables are exported.
 An existing live socket at the path is never replaced.
 .RE
 .SH OPTIONS
@@ -318,6 +327,8 @@ instead of the default socket.
 Fork into the background.
 The parent prints the
 .B SSH_AUTH_SOCK
+and
+.B SSH_AGENT_PID
 shell snippet on standard output, suitable for
 .BR eval ,
 and exits.
@@ -490,9 +501,9 @@ Base directory for sockets.
 Shell started by
 .BR "okagent shell" .
 .TP
-.B SSH_AUTH_SOCK
+.BR SSH_AUTH_SOCK ", " SSH_AGENT_PID
 Set for the child of
-.BR run ", " shell " and " ssh .
+.BR run ", " shell ", " ssh " and " mosh .
 Printed by
 .B serve
 for the user to export.

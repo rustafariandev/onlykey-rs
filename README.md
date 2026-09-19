@@ -44,7 +44,7 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | --- | --- |
 | `okagent status` | Firmware version and lock state of the attached token. |
 | `okagent pubkey ID...` | Public keys in `authorized_keys` format. |
-| `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK`. |
+| `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK` (and `SSH_AGENT_PID`). |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
 | `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. |
 | `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. |
@@ -72,6 +72,7 @@ okagent ssh ferris@example.com
 okagent ssh ferris@legacy.example.com --slot ECC3       # key stored by the OnlyKey app
 okagent ssh ferris@old.example.com --slot RSA1          # RSA key stored by the OnlyKey app
 eval "$(okagent serve --daemon ferris@example.com)"     # background agent
+ssh-agent -k                                             # ...and stop it again
 ssh-add -L
 ```
 
