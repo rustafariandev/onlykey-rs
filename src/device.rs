@@ -45,10 +45,6 @@ pub enum DeviceError {
     },
     #[error("RSA reply of {0} bytes is neither a 2048- nor a 4096-bit value")]
     RsaLength(usize),
-    #[error(
-        "nistp256 cannot sign a {0}-byte message: the firmware would treat it as a precomputed hash"
-    )]
-    AmbiguousBlobLength(usize),
 }
 
 /// How long to wait at each stage. Defaults follow the Python agent; tests
@@ -247,9 +243,6 @@ impl<T: HidTransport> OnlyKey<T> {
                 len: blob.len(),
                 max,
             });
-        }
-        if key.curve() == Some(Curve::NistP256) && (blob.len() == 32 || blob.len() == 64) {
-            return Err(DeviceError::AmbiguousBlobLength(blob.len()));
         }
         let message = key.sign_message(blob, hash)?;
         let reports = protocol::chunk_large_message(Opcode::Sign, key.sign_slot(), &message)?;
@@ -796,32 +789,22 @@ mod tests {
         assert!(matches!(
             ok.sign(
                 &derived(Curve::Ed25519),
-                &[0; 737],
+                &[0; 710],
                 HashAlg::Sha256,
                 None,
                 &sink
             ),
-            Err(DeviceError::BlobTooLong { len: 737, max: 736 })
+            Err(DeviceError::BlobTooLong { len: 710, max: 709 })
         ));
         assert!(matches!(
             ok.sign(
                 &stored(Curve::Ed25519, 3),
-                &[0; 769],
+                &[0; 742],
                 HashAlg::Sha256,
                 None,
                 &sink
             ),
-            Err(DeviceError::BlobTooLong { len: 769, max: 768 })
-        ));
-        assert!(matches!(
-            ok.sign(
-                &derived(Curve::NistP256),
-                &[0; 64],
-                HashAlg::Sha256,
-                None,
-                &sink
-            ),
-            Err(DeviceError::AmbiguousBlobLength(64))
+            Err(DeviceError::BlobTooLong { len: 742, max: 741 })
         ));
         assert!(sink.0.lock().unwrap().is_empty());
     }

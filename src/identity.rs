@@ -451,32 +451,57 @@ impl KeySpec {
     }
 
     /// The `OKSIGN` payload for `blob`, which the challenge digits are
-    /// computed over. A derived key gets `blob || identity hash`, a stored
-    /// ECC key `blob` alone, and an RSA key the `hash` of `blob`: the token
-    /// only applies the PKCS#1 v1.5 padding and the private key.
+    /// computed over.
+    ///
+    /// What the token signs depends on the key type. Ed25519 signs the
+    /// message itself, so `blob` goes over as is. For nistp256 the token
+    /// signs `SHA-256(blob)`, and it takes a 32-byte payload as that digest
+    /// ready-made, so the digest is sent instead of the blob: the signature
+    /// is the same (RFC 6979 makes it deterministic) and the blob can be any
+    /// length. An RSA key likewise gets the `hash` of `blob` and only applies
+    /// the PKCS#1 v1.5 padding and the private key. A derived key has the
+    /// identity hash appended so the token can derive the key.
     pub fn sign_message(&self, blob: &[u8], hash: HashAlg) -> Result<Vec<u8>, IdentityError> {
-        Ok(match self.kind {
-            KeyKind::Derived(_) => {
-                let mut message = blob.to_vec();
-                message.extend_from_slice(&self.identity.derivation_hash());
-                message
-            }
-            KeyKind::StoredEcc { .. } => blob.to_vec(),
+        let mut message = match self.kind {
+            KeyKind::Derived(Curve::Ed25519)
+            | KeyKind::StoredEcc {
+                curve: Curve::Ed25519,
+                ..
+            } => blob.to_vec(),
+            KeyKind::Derived(Curve::NistP256)
+            | KeyKind::StoredEcc {
+                curve: Curve::NistP256,
+                ..
+            } => Sha256::digest(blob).to_vec(),
             KeyKind::StoredRsa(_) => match hash {
                 HashAlg::Sha256 => Sha256::digest(blob).to_vec(),
                 HashAlg::Sha512 => sha2::Sha512::digest(blob).to_vec(),
                 other => return Err(IdentityError::UnsupportedHash(other)),
             },
-        })
+        };
+        if let KeyKind::Derived(_) = self.kind {
+            message.extend_from_slice(&self.identity.derivation_hash());
+        }
+        Ok(message)
     }
 
     /// Longest `blob` that [`Self::sign_message`] keeps within the device
     /// buffer; `None` when the blob is hashed first and any length works.
+    /// Only ed25519 is limited: 741 bytes for a stored key, 32 fewer for a
+    /// derived one.
     pub fn max_blob_len(&self) -> Option<usize> {
         match self.kind {
-            KeyKind::Derived(_) => Some(crate::protocol::MAX_LARGE_PAYLOAD - 32),
-            KeyKind::StoredEcc { .. } => Some(crate::protocol::MAX_LARGE_PAYLOAD),
-            KeyKind::StoredRsa(_) => None,
+            KeyKind::Derived(Curve::Ed25519) => Some(crate::protocol::MAX_LARGE_PAYLOAD - 32),
+            KeyKind::StoredEcc {
+                curve: Curve::Ed25519,
+                ..
+            } => Some(crate::protocol::MAX_LARGE_PAYLOAD),
+            KeyKind::Derived(Curve::NistP256)
+            | KeyKind::StoredEcc {
+                curve: Curve::NistP256,
+                ..
+            }
+            | KeyKind::StoredRsa(_) => None,
         }
     }
 
@@ -721,10 +746,18 @@ mod tests {
         assert_eq!(derived.pubkey_tag(), 0x02);
         assert_eq!(derived.sign_slot(), 202);
         assert_eq!(derived.slot(), None);
-        let mut want = b"abc".to_vec();
+        let mut want = Sha256::digest(b"abc").to_vec();
         want.extend_from_slice(&id.derivation_hash());
         assert_eq!(derived.sign_message(b"abc", HashAlg::Sha512).unwrap(), want);
-        assert_eq!(derived.max_blob_len(), Some(736));
+        assert_eq!(derived.max_blob_len(), None);
+        let derived_ed = KeySpec::derived(id.clone(), Curve::Ed25519);
+        let mut want = b"abc".to_vec();
+        want.extend_from_slice(&id.derivation_hash());
+        assert_eq!(
+            derived_ed.sign_message(b"abc", HashAlg::Sha512).unwrap(),
+            want
+        );
+        assert_eq!(derived_ed.max_blob_len(), Some(709));
         assert_eq!(derived.label(), "<ssh://james@example.com|nist256p1>");
         assert_eq!(derived.kind.to_string(), "derived nistp256");
         assert_eq!(
@@ -743,7 +776,13 @@ mod tests {
             stored.sign_message(b"abc", HashAlg::Sha256).unwrap(),
             b"abc"
         );
-        assert_eq!(stored.max_blob_len(), Some(768));
+        assert_eq!(stored.max_blob_len(), Some(741));
+        let stored_p256 = KeySpec::stored(id.clone(), Curve::NistP256, EccSlot::new(4).unwrap());
+        assert_eq!(
+            stored_p256.sign_message(b"abc", HashAlg::Sha256).unwrap(),
+            Sha256::digest(b"abc").to_vec()
+        );
+        assert_eq!(stored_p256.max_blob_len(), None);
         assert_eq!(stored.label(), "<ssh://james@example.com|ed25519|ECC3>");
         assert_eq!(stored.source().to_string(), "ECC3");
         assert_eq!(stored.kind.to_string(), "ed25519 in ECC3");

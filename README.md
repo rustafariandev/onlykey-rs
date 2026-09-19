@@ -204,6 +204,16 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   `data || hash`, split into 57-byte HID reports. The device strips the hash,
   derives the key, and signs `data`. The challenge digits are bytes 0, 15 and
   31 of `SHA-256(data || hash)`, each `% 6 + 1`.
+- The firmware reassembles at most 13 reports, 741 bytes, and answers a 14th
+  with "packets received exceeded size limit". Ed25519 signs the message
+  itself, so an ed25519 blob is limited to 709 bytes (derived) or 741 bytes
+  (stored); SSH authentication requests are far smaller. For nistp256 the
+  token signs `SHA-256(data)` and takes a 32-byte payload as that digest
+  ready-made, so the agent sends the digest instead of the data (the same
+  deterministic signature results, verified on hardware) and a nistp256 blob
+  can be any length, as can RSA. After a size error the firmware keeps the
+  half-assembled request for about five seconds and rejects anything sent in
+  that window.
 - Stored keys use the slot number itself, 101 to 116 for `ECC1` to `ECC16`:
   `OKGETPUBKEY` with that slot (the same payload is sent and ignored), and
   `OKSIGN` with that slot and `data` alone, so the challenge is over

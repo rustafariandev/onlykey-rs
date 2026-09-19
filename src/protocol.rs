@@ -14,8 +14,12 @@ pub const REPORT_SIZE: usize = 64;
 pub const HEADER: [u8; 4] = [0xFF; 4];
 /// Payload bytes per report when a message is split across several reports.
 pub const CHUNK_SIZE: usize = 57;
-/// Largest message the firmware will reassemble (`PACKET_BUFFER_SIZE`).
-pub const MAX_LARGE_PAYLOAD: usize = 768;
+/// Largest message the firmware will reassemble. Its buffer is 768 bytes,
+/// but it accepts a report only while the bytes already received fit
+/// another full chunk, so at most 13 reports (741 bytes) get through and a
+/// 14th is answered with "packets received exceeded size limit". Measured
+/// on firmware v3.0.4-prodc and confirmed in `okcore.cpp`.
+pub const MAX_LARGE_PAYLOAD: usize = 13 * CHUNK_SIZE;
 /// Slot number meaning "derive the key from the payload hash".
 pub const DERIVED_KEY_SLOT: u8 = 132;
 
@@ -332,7 +336,7 @@ mod tests {
 
     #[test]
     fn chunking_final_size_byte_is_never_ff_or_zero() {
-        for n in [1usize, 56, 57, 58, 114, 115, 767, 768] {
+        for n in [1usize, 56, 57, 58, 114, 115, 740, 741] {
             let message = vec![0xAB; n];
             let reports = chunk_large_message(Opcode::Sign, 202, &message).unwrap();
             assert_eq!(reports.len(), n.div_ceil(CHUNK_SIZE), "length {n}");
@@ -369,8 +373,8 @@ mod tests {
             Err(ProtocolError::EmptyMessage)
         );
         assert_eq!(
-            chunk_large_message(Opcode::Sign, 201, &[0; 769]),
-            Err(ProtocolError::MessageTooLong(769))
+            chunk_large_message(Opcode::Sign, 201, &[0; 742]),
+            Err(ProtocolError::MessageTooLong(742))
         );
     }
 

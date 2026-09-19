@@ -11,6 +11,7 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use sha2::{Digest, Sha256};
 use signature::Signer;
+use signature::hazmat::PrehashSigner;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -48,6 +49,17 @@ fn ed25519_key(hash: &[u8]) -> ed25519_dalek::SigningKey {
 
 fn p256_key(hash: &[u8]) -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::from_slice(&seed(2, hash)).expect("seed is a valid scalar")
+}
+
+/// Like the firmware: a 32-byte payload is a ready-made digest, anything
+/// else is hashed with SHA-256 first.
+fn p256_sign(key: &p256::ecdsa::SigningKey, payload: &[u8]) -> [u8; 64] {
+    let sig: p256::ecdsa::Signature = if payload.len() == 32 {
+        key.sign_prehash(payload).expect("prehash sign")
+    } else {
+        key.sign(payload)
+    };
+    sig.to_bytes().into()
 }
 
 pub const STORED_ED25519_SLOT: u8 = 103;
@@ -96,15 +108,11 @@ impl SigningFake {
             }
             (202, _) => {
                 let (blob, hash) = message.split_at(message.len() - 32);
-                let sig: p256::ecdsa::Signature = p256_key(hash).sign(blob);
-                sig.to_bytes().into()
+                p256_sign(&p256_key(hash), blob)
             }
             // A stored key signs the message as sent: no identity hash.
             (_, Some(Curve::Ed25519)) => ed25519_key(&[slot]).sign(&message).to_bytes(),
-            (_, Some(Curve::NistP256)) => {
-                let sig: p256::ecdsa::Signature = p256_key(&[slot]).sign(&message);
-                sig.to_bytes().into()
-            }
+            (_, Some(Curve::NistP256)) => p256_sign(&p256_key(&[slot]), &message),
             (101..=116, None) => {
                 self.reply(b"Error no ECC Private Key set in this slot");
                 return;
