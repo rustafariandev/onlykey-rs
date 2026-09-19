@@ -387,7 +387,10 @@ fn await_response<T: HidTransport>(
         };
         match protocol::classify_response(&report) {
             Response::Filler => continue,
-            response => return Ok(response),
+            response => {
+                tracing::trace!(report = %hex::encode(report), "report received");
+                return Ok(response);
+            }
         }
     }
 }
