@@ -5,7 +5,7 @@ SSH keys on an [OnlyKey](https://onlykey.io) hardware token, from Rust.
 A clean-room port of the SSH half of the Python
 [`onlykey-agent`](https://github.com/trustcrypto/onlykey-agent). The private
 key never leaves the token: it is re-derived on the device from an identity
-string such as `james@example.com` for every operation, and each signature is
+string such as `ferris@example.com` for every operation, and each signature is
 confirmed by entering a 3-digit challenge on the buttons. Given the same
 identity and curve this port derives exactly the same public key as the
 Python agent, so existing `authorized_keys` entries keep working. Keys the
@@ -46,7 +46,7 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | `okagent pubkey ID...` | Public keys in `authorized_keys` format. |
 | `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK`. |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
-| `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination. |
+| `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. |
 | `okagent serve [ID...]` | Long-lived agent on a unix socket. |
 
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the
@@ -65,19 +65,19 @@ digests, so a client asking for the legacy SHA-1 `ssh-rsa` signature is
 refused; OpenSSH has asked for `rsa-sha2-*` since 7.2.
 
 ```sh
-okagent pubkey james@example.com >> authorized_keys   # copy to the server
-okagent run james@example.com -- ssh example.com
-okagent ssh james@example.com
-okagent ssh james@legacy.example.com --slot ECC3       # key stored by the OnlyKey app
-okagent ssh james@old.example.com --slot RSA1          # RSA key stored by the OnlyKey app
-eval "$(okagent serve --daemon james@example.com)"     # background agent
+okagent pubkey ferris@example.com >> authorized_keys   # copy to the server
+okagent run ferris@example.com -- ssh example.com
+okagent ssh ferris@example.com
+okagent ssh ferris@legacy.example.com --slot ECC3       # key stored by the OnlyKey app
+okagent ssh ferris@old.example.com --slot RSA1          # RSA key stored by the OnlyKey app
+eval "$(okagent serve --daemon ferris@example.com)"     # background agent
 ssh-add -L
 ```
 
 When a signature is requested, `okagent` prints something like
 
 ```
-OnlyKey: enter 3 1 5 to sign as james@example.com (ssh-connection login as "james"), or press any button if challenge mode is off
+OnlyKey: enter 3 1 5 to sign as ferris@example.com (ssh-connection login as "ferris"), or press any button if challenge mode is off
 ```
 
 on the controlling terminal, or on stderr when there is none. For a background
@@ -93,22 +93,22 @@ or `--config`) supplies defaults so identities need not be repeated:
 curve = "ed25519"                       # default for identities without a curve
 notify-command = "notify-send OnlyKey"  # optional
 # socket = "/run/user/1000/okagent/agent.sock"
-# pubkey-file = "/home/james/.ssh/onlykey.pub"
-# log-file = "/home/james/.local/state/okagent.log"
+# pubkey-file = "/home/ferris/.ssh/onlykey.pub"
+# log-file = "/home/ferris/.local/state/okagent.log"
 
 [[identity]]
-name = "james@example.com"
+name = "ferris@example.com"
 
 [[identity]]
 name = "git@github.com"
 curve = "nistp256"
 
 [[identity]]
-name = "james@legacy.example.com"
+name = "ferris@legacy.example.com"
 slot = "ECC3"                           # stored key; `slot = 3` also works
 
 [[identity]]
-name = "james@old.example.com"
+name = "ferris@old.example.com"
 slot = "RSA1"                           # RSA keys take no curve
 ```
 
@@ -119,7 +119,7 @@ neither the command line nor the config file gives any identities, the file's
 comments name them, so an exported file is all a background agent needs:
 
 ```sh
-okagent pubkey james@example.com git@github.com > ~/.ssh/onlykey.pub
+okagent pubkey ferris@example.com git@github.com > ~/.ssh/onlykey.pub
 okagent serve --daemon --pubkey-file ~/.ssh/onlykey.pub
 ```
 
@@ -156,7 +156,7 @@ onlykey-agent = { git = "https://github.com/rustafariandev/onlykey-rs" }
 ```rust
 use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt, ssh_key::HashAlg};
 
-let key = KeySpec::derived("james@example.com".parse()?, Curve::Ed25519);
+let key = KeySpec::derived("ferris@example.com".parse()?, Curve::Ed25519);
 let mut device = OnlyKey::open()?;                       // finds the token, syncs its clock
 let public = device.ssh_public_key(&key)?;
 println!("{}", public.to_openssh()?);                    // authorized_keys line
@@ -166,9 +166,9 @@ println!("{}", public.to_openssh()?);                    // authorized_keys line
 let sig = device.ssh_sign(&key, &public, b"hello", HashAlg::Sha512, None, &TtyPrompt)?;
 
 // Keys the OnlyKey app wrote into slots ECC3 and RSA1.
-let stored = KeySpec::stored("james@example.com".parse()?, Curve::Ed25519, "ECC3".parse()?);
+let stored = KeySpec::stored("ferris@example.com".parse()?, Curve::Ed25519, "ECC3".parse()?);
 println!("{}", device.ssh_public_key(&stored)?.to_openssh()?);
-let rsa = KeySpec::rsa("james@example.com".parse()?, "RSA1".parse()?);
+let rsa = KeySpec::rsa("ferris@example.com".parse()?, "RSA1".parse()?);
 println!("{}", device.ssh_public_key(&rsa)?.to_openssh()?);
 ```
 
@@ -189,8 +189,8 @@ program and describe each layer. The seams:
 - `ssh_key` is re-exported so `PublicKey` and `Signature` can be named
   without pinning the version yourself.
 
-Examples: `cargo run --example pubkey -- james@example.com` and
-`echo -n hi | cargo run --example sign -- james@example.com`.
+Examples: `cargo run --example pubkey -- ferris@example.com` and
+`echo -n hi | cargo run --example sign -- ferris@example.com`.
 
 ## How it works
 
@@ -208,7 +208,7 @@ Examples: `cargo run --example pubkey -- james@example.com` and
   `SHA-256(data)`. This is what the Python agent's `--skey ECC3` does. The
   slot's key type is fixed when it is written, so the reply is checked
   against the requested curve. The key comment gains a third field,
-  `<ssh://james@example.com|ed25519|ECC3>`, so a derived and a stored key for
+  `<ssh://ferris@example.com|ed25519|ECC3>`, so a derived and a stored key for
   the same identity never share a label.
 - RSA keys use slots 1 to 4 for `RSA1` to `RSA4`. `OKGETPUBKEY` is sent with
   tag `0x00 || hash` and the token answers with the modulus alone, 256 or 512
@@ -218,7 +218,7 @@ Examples: `cargo run --example pubkey -- james@example.com` and
   client's `rsa-sha2-256` / `rsa-sha2-512` request flag; the token applies
   the PKCS#1 v1.5 padding and returns the signature over four or eight
   reports. The challenge digits are over `SHA-256(digest)`. The comment is
-  `<ssh://james@example.com|rsa|RSA1>`.
+  `<ssh://ferris@example.com|rsa|RSA1>`.
 - Every signature is verified against the public key before it is returned.
   Any device error, timeout or wrong challenge answers the SSH client with
   `SSH_AGENT_FAILURE` and keeps the agent running.
@@ -249,11 +249,11 @@ With hardware attached:
 
 ```sh
 okagent status
-okagent pubkey james@example.com             # must equal the Python agent's output
-okagent debug-sign james@example.com         # hidden; 114-byte payload proves 57-multiple chunking
-okagent run james@example.com -- ssh-add -L
-okagent pubkey james@example.com --slot ECC3 # same key as `onlykey-agent james@example.com -sk ECC3`
-okagent pubkey james@example.com --slot RSA1 # same key as `onlykey-agent james@example.com -sk RSA1 -e rsa2048`
+okagent pubkey ferris@example.com             # must equal the Python agent's output
+okagent debug-sign ferris@example.com         # hidden; 114-byte payload proves 57-multiple chunking
+okagent run ferris@example.com -- ssh-add -L
+okagent pubkey ferris@example.com --slot ECC3 # same key as `onlykey-agent ferris@example.com -sk ECC3`
+okagent pubkey ferris@example.com --slot RSA1 # same key as `onlykey-agent ferris@example.com -sk RSA1 -e rsa2048`
 ```
 
 An empty ECC slot answers "Error no ECC Private Key set in this slot" and an

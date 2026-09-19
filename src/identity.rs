@@ -92,6 +92,8 @@ pub enum IdentityError {
     UnsupportedHash(HashAlg),
     #[error("bad key label {0:?}; expected <ssh://[user@]host|curve[|slot]>")]
     BadLabel(String),
+    #[error("identity {0:?} has a port that is not a number from 1 to 65535")]
+    BadPort(String),
 }
 
 /// One of the token's ECC key slots, `ECC1` to `ECC16`, holding a key written
@@ -573,34 +575,65 @@ impl fmt::Display for Identity {
     }
 }
 
+/// Split `[scheme://][user@]host[:port][/path]` into user, host and the raw
+/// port text. As in the Python agent, any alphanumeric `:suffix` counts as a
+/// port, so `git@github.com:user/repo` still yields host `github.com`.
+fn split_identity(s: &str) -> Result<(Option<&str>, &str, Option<&str>), IdentityError> {
+    let rest = match s.find("://") {
+        Some(i) => &s[i + 3..],
+        None => s,
+    };
+    let rest = rest.split('/').next().unwrap_or("");
+    let (user, host_port) = match rest.rfind('@') {
+        Some(i) => (Some(&rest[..i]), &rest[i + 1..]),
+        None => (None, rest),
+    };
+    let (host, port) = match host_port.rfind(':') {
+        Some(i)
+            if host_port[i + 1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (
+                &host_port[..i],
+                Some(&host_port[i + 1..]).filter(|p| !p.is_empty()),
+            )
+        }
+        _ => (host_port, None),
+    };
+    if host.is_empty() {
+        return Err(IdentityError::MissingHost(s.to_owned()));
+    }
+    Ok((user.filter(|u| !u.is_empty()), host, port))
+}
+
 impl FromStr for Identity {
     type Err = IdentityError;
 
-    /// Parse `[scheme://][user@]host[:port][/path]`, keeping only user and host.
+    /// Parse `[scheme://][user@]host[:port][/path]`, keeping only user and
+    /// host. See [`Identity::parse_with_port`] to keep the port as well.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let rest = match s.find("://") {
-            Some(i) => &s[i + 3..],
-            None => s,
-        };
-        let rest = rest.split('/').next().unwrap_or("");
-        let (user, host_port) = match rest.rfind('@') {
-            Some(i) => (Some(&rest[..i]), &rest[i + 1..]),
-            None => (None, rest),
-        };
-        let host = match host_port.rfind(':') {
-            Some(i)
-                if host_port[i + 1..]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric()) =>
-            {
-                &host_port[..i]
-            }
-            _ => host_port,
-        };
-        if host.is_empty() {
-            return Err(IdentityError::MissingHost(s.to_owned()));
-        }
-        Ok(Identity::new(user.filter(|u| !u.is_empty()), host))
+        let (user, host, _) = split_identity(s)?;
+        Ok(Identity::new(user, host))
+    }
+}
+
+impl Identity {
+    /// Parse like [`FromStr`], also returning the `:port` suffix, which does
+    /// not take part in key derivation but tells `ssh` where to connect. A
+    /// port that is not a number from 1 to 65535 is an error here, whereas
+    /// [`FromStr`] ignores it.
+    pub fn parse_with_port(s: &str) -> Result<(Self, Option<u16>), IdentityError> {
+        let (user, host, port) = split_identity(s)?;
+        let port = port
+            .map(|p| {
+                p.parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| IdentityError::BadPort(s.to_owned()))
+            })
+            .transpose()?;
+        Ok((Identity::new(user, host), port))
     }
 }
 
@@ -738,6 +771,37 @@ mod tests {
                 hash: Some(HashAlg::Sha512)
             }
         );
+    }
+
+    #[test]
+    fn port_is_kept_apart_from_the_identity() {
+        let (id, port) = Identity::parse_with_port("ssh://james@example.com:2222/x").unwrap();
+        assert_eq!(id.to_string(), "james@example.com");
+        assert_eq!(port, Some(2222));
+        assert_eq!(
+            Identity::parse_with_port("example.com").unwrap(),
+            ("example.com".parse().unwrap(), None)
+        );
+        assert_eq!(Identity::parse_with_port("example.com:").unwrap().1, None);
+        // The port never changes the derived key.
+        assert_eq!(
+            "james@example.com:2222".parse::<Identity>().unwrap(),
+            "james@example.com".parse::<Identity>().unwrap()
+        );
+        for bad in [
+            "example.com:abc",
+            "example.com:0",
+            "example.com:65536",
+            "a@b:2c",
+        ] {
+            assert!(
+                matches!(
+                    Identity::parse_with_port(bad),
+                    Err(IdentityError::BadPort(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -149,8 +149,12 @@ if unset).
 Derive the identity's key and run
 .BR ssh (1)
 against it.
-The host part of the identity is the destination and the user part, if
-any, becomes the login name.
+The host part of the identity is the destination, the user part, if any,
+becomes the login name, and a
+.BI : port
+suffix is passed as
+.BR \-p .
+The port never affects the key.
 .B ssh
 is told to use only this key
 .RB ( "IdentitiesOnly=yes" )

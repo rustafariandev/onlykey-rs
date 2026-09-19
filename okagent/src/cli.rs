@@ -109,7 +109,7 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct SshArgs {
-    /// Identity as [user@]host; the host is also the ssh destination.
+    /// Identity as [user@]host[:port]; the host is also the ssh destination.
     pub identity: String,
 
     /// Extra arguments passed to ssh after the destination (a remote command).
@@ -431,7 +431,7 @@ fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Resul
 }
 
 fn ssh(ctx: &Context_, args: SshArgs) -> Result<ExitCode> {
-    let identity: Identity = args.identity.parse()?;
+    let (identity, port) = Identity::parse_with_port(&args.identity)?;
     let id_args = IdentityArgs {
         identity: vec![args.identity.clone()],
         pubkey_file: None,
@@ -449,6 +449,10 @@ fn ssh(ctx: &Context_, args: SshArgs) -> Result<ExitCode> {
         "-o".into(),
         format!("IdentityFile={}", pub_path.display()),
     ];
+    if let Some(port) = port {
+        command.push("-p".into());
+        command.push(port.to_string());
+    }
     if let Some(user) = &identity.user {
         command.push("-l".into());
         command.push(user.clone());
