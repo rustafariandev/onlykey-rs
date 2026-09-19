@@ -133,6 +133,9 @@ pub struct DebugSignArgs {
     /// Length of the test message; 82 makes the device payload exactly 114 bytes.
     #[arg(long, default_value_t = 82)]
     pub len: usize,
+    /// Digest for an RSA key: sha256 or sha512.
+    #[arg(long, default_value = "sha512")]
+    pub hash: String,
 }
 
 /// Everything resolved from flags plus config.
@@ -512,7 +515,11 @@ fn debug_sign(ctx: &Context_, args: DebugSignArgs) -> Result<ExitCode> {
     let mut device = OnlyKey::open_with_timeouts(ctx.timeouts)?;
     let key = device.ssh_public_key(&spec)?;
     println!("{}", key.to_openssh()?);
-    let hash = HashAlg::Sha512;
+    let hash = match args.hash.to_ascii_lowercase().as_str() {
+        "sha256" => HashAlg::Sha256,
+        "sha512" => HashAlg::Sha512,
+        other => bail!("unknown hash {other:?}; use sha256 or sha512"),
+    };
     let sig = device.ssh_sign(
         &spec,
         &key,
