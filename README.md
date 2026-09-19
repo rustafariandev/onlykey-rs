@@ -50,7 +50,8 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | `okagent serve [ID...]` | Long-lived agent on a unix socket. |
 
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the
-default is ed25519. Identities can be omitted when the config file lists them.
+default is ed25519. Identities can be omitted when the config file lists them,
+or when `--pubkey-file` names them (see below).
 
 Pass `--slot ECC3` (slots `ECC1` to `ECC16`) or `--slot RSA1` (`RSA1` to
 `RSA4`) to use the key stored in that slot instead of deriving one. The
@@ -93,6 +94,7 @@ curve = "ed25519"                       # default for identities without a curve
 notify-command = "notify-send OnlyKey"  # optional
 # socket = "/run/user/1000/okagent/agent.sock"
 # pubkey-file = "/home/james/.ssh/onlykey.pub"
+# log-file = "/home/james/.local/state/okagent.log"
 
 [[identity]]
 name = "james@example.com"
@@ -112,7 +114,17 @@ slot = "RSA1"                           # RSA keys take no curve
 
 `pubkey-file` (or `--pubkey-file`) points at a file of lines from
 `okagent pubkey`. Matching keys are listed even while the OnlyKey is unplugged
-or locked, so `ssh` can pick the right key before you unlock the device.
+or locked, so `ssh` can pick the right key before you unlock the device. When
+neither the command line nor the config file gives any identities, the file's
+comments name them, so an exported file is all a background agent needs:
+
+```sh
+okagent pubkey james@example.com git@github.com > ~/.ssh/onlykey.pub
+okagent serve --daemon --pubkey-file ~/.ssh/onlykey.pub
+```
+
+`log-file` (or `--log-file`) appends log output to a file instead of stderr,
+which is where a background agent's messages would otherwise be lost.
 
 ### systemd user unit
 

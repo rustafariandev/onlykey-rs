@@ -90,6 +90,8 @@ pub enum IdentityError {
     BadSlot(String),
     #[error("the token cannot sign a {0} digest; use sha256 or sha512")]
     UnsupportedHash(HashAlg),
+    #[error("bad key label {0:?}; expected <ssh://[user@]host|curve[|slot]>")]
+    BadLabel(String),
 }
 
 /// One of the token's ECC key slots, `ECC1` to `ECC16`, holding a key written
@@ -490,6 +492,34 @@ impl KeySpec {
             ),
         }
     }
+
+    /// The inverse of [`Self::label`]: recover the key from a public key
+    /// comment, so that a file of exported keys can name the identities to
+    /// serve. Surrounding whitespace is ignored.
+    pub fn from_label(label: &str) -> Result<Self, IdentityError> {
+        let bad = || IdentityError::BadLabel(label.to_owned());
+        let inner = label
+            .trim()
+            .strip_prefix('<')
+            .and_then(|s| s.strip_suffix('>'))
+            .ok_or_else(bad)?;
+        let mut fields = inner.split('|');
+        let identity: Identity = fields.next().ok_or_else(bad)?.parse()?;
+        let curve = fields.next().ok_or_else(bad)?;
+        let slot = fields.next();
+        if fields.next().is_some() {
+            return Err(bad());
+        }
+        let kind = match (curve.parse::<Curve>(), slot.map(str::parse::<Slot>)) {
+            (Ok(curve), None) => KeyKind::Derived(curve),
+            (Ok(curve), Some(Ok(Slot::Ecc(slot)))) => KeyKind::StoredEcc { slot, curve },
+            (Err(_), Some(Ok(Slot::Rsa(slot)))) if curve.eq_ignore_ascii_case("rsa") => {
+                KeyKind::StoredRsa(slot)
+            }
+            _ => return Err(bad()),
+        };
+        Ok(KeySpec { identity, kind })
+    }
 }
 
 /// The `[user@]host` pair that names a derived key.
@@ -715,6 +745,42 @@ mod tests {
         assert!("".parse::<Identity>().is_err());
         assert!("user@".parse::<Identity>().is_err());
         assert!("ssh://".parse::<Identity>().is_err());
+    }
+
+    #[test]
+    fn label_round_trips_through_from_label() {
+        let id: Identity = "james@example.com".parse().unwrap();
+        let specs = [
+            KeySpec::derived(id.clone(), Curve::Ed25519),
+            KeySpec::derived(id.clone(), Curve::NistP256),
+            KeySpec::stored(id.clone(), Curve::NistP256, EccSlot::new(3).unwrap()),
+            KeySpec::rsa(id.clone(), RsaSlot::new(1).unwrap()),
+            KeySpec::derived("example.com".parse().unwrap(), Curve::Ed25519),
+        ];
+        for spec in &specs {
+            assert_eq!(
+                KeySpec::from_label(&spec.label()).unwrap(),
+                *spec,
+                "{spec:?}"
+            );
+        }
+        assert_eq!(
+            KeySpec::from_label(" <ssh://james@example.com|ed25519> ").unwrap(),
+            specs[0]
+        );
+        for bad in [
+            "",
+            "james@example.com",
+            "<ssh://james@example.com>",
+            "<ssh://james@example.com|secp256k1>",
+            "<ssh://james@example.com|ed25519|RSA1>",
+            "<ssh://james@example.com|rsa>",
+            "<ssh://james@example.com|rsa|ECC3>",
+            "<ssh://james@example.com|ed25519|ECC3|x>",
+            "<ssh://|ed25519>",
+        ] {
+            assert!(KeySpec::from_label(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -11,19 +11,24 @@ use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use onlykey_agent::protocol::DeviceStatus;
 use onlykey_agent::ssh_key::HashAlg;
 use onlykey_agent::ssh_key::PublicKey;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::EnvFilter;
 
 /// SSH agent backed by an OnlyKey hardware token.
 #[derive(Debug, Parser)]
 #[command(name = "okagent", version, about)]
 pub struct Cli {
-    /// More log output on stderr (repeat for more).
+    /// More log output (repeat for more).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+
+    /// Append log output to this file instead of stderr.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub log_file: Option<PathBuf>,
 
     /// Config file (default: $XDG_CONFIG_HOME/okagent/config.toml).
     #[arg(long, global = true, env = "OKAGENT_CONFIG")]
@@ -68,10 +73,12 @@ pub enum Cmd {
 
 #[derive(Debug, Args, Default)]
 pub struct IdentityArgs {
-    /// Identities as [user@]host; defaults to the config file's list.
+    /// Identities as [user@]host; defaults to the config file's list, then
+    /// to the comments in the public key file.
     pub identity: Vec<String>,
 
-    /// Exported public keys to serve while the device is absent or locked.
+    /// Exported public keys to serve while the device is absent or locked;
+    /// also names the identities when no other source gives any.
     #[arg(long)]
     pub pubkey_file: Option<PathBuf>,
 }
@@ -151,23 +158,30 @@ impl Context_ {
         })
     }
 
-    fn entries(&self, args: &IdentityArgs) -> Result<Vec<KeySpec>> {
-        let entries = if args.identity.is_empty() {
+    /// Identities in order of preference: the command line, then the config
+    /// file, then the comments of `preloaded` public keys.
+    fn entries(&self, args: &IdentityArgs, preloaded: &[PublicKey]) -> Result<Vec<KeySpec>> {
+        let entries = if !args.identity.is_empty() {
+            args.identity
+                .iter()
+                .map(|s| self.key(s))
+                .collect::<Result<Vec<_>>>()?
+        } else {
             if self.slot.is_some() {
                 bail!(
                     "--slot applies to identities given on the command line; use `slot` in [[identity]] for config entries"
                 );
             }
-            self.config.entries(self.curve)?
-        } else {
-            args.identity
-                .iter()
-                .map(|s| self.key(s))
-                .collect::<Result<Vec<_>>>()?
+            let from_config = self.config.entries(self.curve)?;
+            if from_config.is_empty() {
+                entries_from_keys(preloaded)
+            } else {
+                from_config
+            }
         };
         if entries.is_empty() {
             bail!(
-                "no identities given; pass [user@]host or add [[identity]] entries to the config file"
+                "no identities given; pass [user@]host, add [[identity]] entries to the config file, or point --pubkey-file at exported keys"
             );
         }
         for e in &entries {
@@ -179,25 +193,19 @@ impl Context_ {
     }
 
     fn agent(&self, args: &IdentityArgs) -> Result<Arc<Agent>> {
-        let entries = self.entries(args)?;
-        let timeouts = self.timeouts;
-        let opener: Opener = Arc::new(move || Ok(OnlyKey::open_with_timeouts(timeouts)?.boxed()));
-        let agent = Agent::new(entries, opener, Arc::clone(&self.sink));
         let pubkey_file = args
             .pubkey_file
             .clone()
             .or_else(|| self.config.pubkey_file.clone());
+        let keys = match &pubkey_file {
+            Some(path) => read_pubkey_file(path)?,
+            None => Vec::new(),
+        };
+        let entries = self.entries(args, &keys)?;
+        let timeouts = self.timeouts;
+        let opener: Opener = Arc::new(move || Ok(OnlyKey::open_with_timeouts(timeouts)?.boxed()));
+        let agent = Agent::new(entries, opener, Arc::clone(&self.sink));
         if let Some(path) = pubkey_file {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            let keys: Vec<PublicKey> = text
-                .lines()
-                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-                .map(|l| {
-                    PublicKey::from_openssh(l)
-                        .with_context(|| format!("parsing key in {}", path.display()))
-                })
-                .collect::<Result<_>>()?;
             let matched = agent.preload(keys);
             tracing::info!(matched, path = %path.display(), "preloaded public keys");
         }
@@ -205,9 +213,85 @@ impl Context_ {
     }
 }
 
+/// Parse a file of `authorized_keys` lines as written by `okagent pubkey`.
+/// Blank lines and `#` comments are skipped.
+fn read_pubkey_file(path: &Path) -> Result<Vec<PublicKey>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            PublicKey::from_openssh(l).with_context(|| format!("parsing key in {}", path.display()))
+        })
+        .collect()
+}
+
+/// Identities named by the comments of exported keys, in file order without
+/// duplicates. A comment that is not an `okagent` label is skipped with a
+/// warning, as is a key whose type contradicts its label.
+fn entries_from_keys(keys: &[PublicKey]) -> Vec<KeySpec> {
+    let mut entries: Vec<KeySpec> = Vec::new();
+    for key in keys {
+        let spec = match KeySpec::from_label(key.comment()) {
+            Ok(spec) => spec,
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping public key: comment does not name an identity");
+                continue;
+            }
+        };
+        if key.algorithm() != spec.kind.public_algorithm() {
+            tracing::warn!(label = %spec.label(), algorithm = %key.algorithm(), "skipping public key: type does not match its comment");
+            continue;
+        }
+        if !entries.contains(&spec) {
+            entries.push(spec);
+        }
+    }
+    entries
+}
+
+/// Send log output to `log_file` (appended, owner-readable) or to stderr.
+/// `OKAGENT_LOG` overrides the level chosen by `verbose`.
+pub fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
+    let level = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::try_from_env("OKAGENT_LOG").unwrap_or_else(|_| EnvFilter::new(level));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false);
+    match log_file {
+        Some(path) => {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("opening log file {}", path.display()))?;
+            builder
+                .with_writer(Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        None => builder
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init(),
+    }
+    Ok(())
+}
+
 /// Run the CLI; returns the process exit code.
 pub fn main(cli: Cli) -> Result<ExitCode> {
     let config = Config::load(cli.config.as_deref())?;
+    init_logging(
+        cli.verbose,
+        cli.log_file.as_deref().or(config.log_file.as_deref()),
+    )?;
     let curve = cli.curve.or(config.curve).unwrap_or_default();
     let mut sinks: Vec<Box<dyn ChallengeSink>> = vec![Box::new(TtyPrompt)];
     if let Some(cmd) = cli
@@ -396,4 +480,51 @@ fn debug_sign(ctx: &Context_, args: DebugSignArgs) -> Result<ExitCode> {
         spec.sign_message(&message, hash)?.len()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onlykey_agent::ssh_key::public::{Ed25519PublicKey, KeyData};
+
+    fn key(comment: &str) -> PublicKey {
+        PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([7; 32])), comment)
+    }
+
+    #[test]
+    fn entries_come_from_labels_in_order_without_duplicates() {
+        let keys = [
+            key("<ssh://james@example.com|ed25519>"),
+            key("james@laptop"),
+            key("<ssh://james@example.com|nist256p1>"),
+            key("<ssh://git@github.com|ed25519|ECC3>"),
+            key("<ssh://james@example.com|ed25519>"),
+        ];
+        let entries = entries_from_keys(&keys);
+        let labels: Vec<String> = entries.iter().map(KeySpec::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "<ssh://james@example.com|ed25519>",
+                "<ssh://git@github.com|ed25519|ECC3>"
+            ]
+        );
+        assert!(entries_from_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn pubkey_file_skips_blanks_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.pub");
+        let line = key("<ssh://james@example.com|ed25519>")
+            .to_openssh()
+            .unwrap();
+        std::fs::write(&path, format!("# exported\n\n{line}\n")).unwrap();
+        let keys = read_pubkey_file(&path).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].comment(), "<ssh://james@example.com|ed25519>");
+        std::fs::write(&path, "not a key\n").unwrap();
+        assert!(read_pubkey_file(&path).is_err());
+        assert!(read_pubkey_file(&dir.path().join("missing")).is_err());
+    }
 }

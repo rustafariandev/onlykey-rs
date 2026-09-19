@@ -92,7 +92,9 @@ Non-ASCII characters are transliterated to ASCII before the identity is
 hashed; a warning is logged when this happens.
 Identities may be omitted from the command line when the configuration file
 lists them (see
-.BR "CONFIGURATION FILE" ).
+.BR "CONFIGURATION FILE" ),
+or when a public key file names them (see
+.BR \-\-pubkey\-file ).
 .PP
 The agent implements only the
 .I request identities
@@ -237,9 +239,19 @@ See
 .BR "CHALLENGE PROMPT" .
 .TP
 .BR \-v ", " \-\-verbose
-Log more on standard error.
+Log more.
 Once for informational messages, twice for debug output, three times for
 trace output.
+Log output goes to standard error unless
+.B \-\-log\-file
+is given.
+.TP
+.BI \-\-log\-file " file"
+Append log output to
+.I file
+instead of standard error.
+The file is created readable by the owner only.
+Useful for a background agent, whose standard error is usually lost.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
@@ -261,6 +273,14 @@ can choose the right key before the device is unlocked.
 Blank lines and lines starting with
 .B #
 are ignored.
+When no identities are given on the command line or in the configuration
+file, the file also names them: each comment of the form written by
+.B okagent pubkey
+becomes one identity, in file order, so
+.B okagent serve \-\-pubkey\-file
+.I file
+needs nothing else.
+Keys with any other comment are skipped with a warning.
 .PP
 The
 .B serve
@@ -365,9 +385,15 @@ see
 See
 .BR \-\-pubkey\-file .
 .TP
+.BI log-file " = \(dq" file \(dq
+See
+.BR \-\-log\-file .
+.TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
 line.
+When there are none here either, the identities come from
+.BR pubkey-file .
 Each has a required
 .B name
 key holding the
@@ -396,6 +422,7 @@ curve = "ed25519"
 notify-command = "notify-send OnlyKey"
 # socket = "/run/user/1000/okagent/agent.sock"
 # pubkey-file = "/home/james/.ssh/onlykey.pub"
+# log-file = "/home/james/.local/state/okagent.log"
 
 [[identity]]
 name = "james@example.com"

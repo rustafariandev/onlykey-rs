@@ -4,6 +4,7 @@
 //! curve = "ed25519"            # default curve for identities below and on the command line
 //! notify-command = "notify-send OnlyKey"
 //! socket = "/run/user/1000/okagent/agent.sock"
+//! log-file = "/home/james/.local/state/okagent.log"
 //!
 //! [[identity]]
 //! name = "james@example.com"
@@ -35,6 +36,7 @@ pub struct Config {
     pub socket: Option<PathBuf>,
     pub notify_command: Option<String>,
     pub pubkey_file: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +137,7 @@ mod tests {
             curve = "nistp256"
             notify-command = "notify-send OnlyKey"
             socket = "/tmp/x.sock"
+            log-file = "/tmp/okagent.log"
             [[identity]]
             name = "james@example.com"
             [[identity]]
@@ -155,6 +158,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.curve, Some(Curve::NistP256));
         assert_eq!(cfg.notify_command.as_deref(), Some("notify-send OnlyKey"));
+        assert_eq!(cfg.log_file.as_deref(), Some(Path::new("/tmp/okagent.log")));
         let entries = cfg.entries(cfg.curve.unwrap_or_default()).unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].kind, KeyKind::Derived(Curve::NistP256));
