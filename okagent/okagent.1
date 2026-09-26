@@ -506,6 +506,11 @@ Base directory for the default configuration file.
 .B XDG_RUNTIME_DIR
 Base directory for sockets.
 .TP
+.B TMPDIR
+Base directory for sockets on macOS when
+.B XDG_RUNTIME_DIR
+is unset.
+.TP
 .B SHELL
 Shell started by
 .BR "okagent shell" .
@@ -527,8 +532,10 @@ Default socket for
 If
 .B XDG_RUNTIME_DIR
 is unset,
+.I $TMPDIR/okagent/agent.sock
+is used on macOS and
 .IR /tmp/okagent\- uid /agent.sock
-is used instead.
+elsewhere.
 The socket and its directory are created with owner-only permissions.
 .TP
 .IR $XDG_RUNTIME_DIR/okagent/run\- pid .sock
@@ -537,8 +544,9 @@ Temporary socket used by
 removed on exit.
 .TP
 .I /dev/hidraw*
-The token is opened directly through the Linux hidraw interface.
-A udev rule is needed to open it without root; see the OnlyKey
+On Linux the token is opened directly through the hidraw interface
+(on macOS, through IOKit, with no setup needed).
+On Linux, a udev rule is needed to open it without root; see the OnlyKey
 documentation for
 .IR 49\-onlykey.rules .
 "Permission denied" from
@@ -623,6 +631,10 @@ Then
 .B systemctl \-\-user enable \-\-now okagent
 and
 .BR "export SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/okagent/agent.sock" .
+.PP
+On macOS, run it from launchd instead; see the README for a
+.I ~/Library/LaunchAgents
+property list.
 .SH NOTES
 Only the original OnlyKey is supported, not the OnlyKey DUO.
 The agent covers SSH only; GPG and age keys are out of scope.

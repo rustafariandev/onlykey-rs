@@ -17,18 +17,20 @@ Two crates:
 - **`okagent`**: a command-line SSH agent.
 - **`onlykey-agent`**: the library underneath it.
 
-Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux.
+Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macOS.
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
 (stored only).
 
 ## Setup
 
-- A Rust toolchain (edition 2024). No C libraries: the HID backend is pure
-  Rust and reads `/dev/hidraw*` directly.
-- A udev rule so the device can be opened without root. Copy
-  `49-onlykey.rules` from the [OnlyKey docs](https://docs.crp.to/linux.html)
-  to `/etc/udev/rules.d/` and replug the device. "Permission denied" means
-  the rule is missing.
+- A Rust toolchain (edition 2024).
+- Linux: no C libraries, the HID backend is pure Rust and reads
+  `/dev/hidraw*` directly. A udev rule is needed so the device can be opened
+  without root: copy `49-onlykey.rules` from the
+  [OnlyKey docs](https://docs.crp.to/linux.html) to `/etc/udev/rules.d/` and
+  replug the device. "Permission denied" means the rule is missing.
+- macOS: the Xcode Command Line Tools (`xcode-select --install`), which
+  build hidapi's IOKit backend. No driver or permission setup is needed.
 
 ```sh
 cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
@@ -147,6 +149,37 @@ WantedBy=default.target
 
 Then `systemctl --user enable --now okagent` and
 `export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/okagent/agent.sock"`.
+
+### launchd agent (macOS)
+
+macOS has no `$XDG_RUNTIME_DIR`, so the default socket is
+`$TMPDIR/okagent/agent.sock`. launchd does not expand `~` or `$TMPDIR`, so
+give the service a fixed socket and absolute paths (replace `you`):
+
+```xml
+<!-- ~/Library/LaunchAgents/local.okagent.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.okagent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.cargo/bin/okagent</string>
+    <string>serve</string>
+    <string>--socket</string><string>/Users/you/.okagent/agent.sock</string>
+    <string>--notify-command</string>
+    <string>/opt/homebrew/bin/terminal-notifier -title OnlyKey -message</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+Then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.okagent.plist`
+and `export SSH_AUTH_SOCK="$HOME/.okagent/agent.sock"`. The notifier is
+`brew install terminal-notifier`; the prompt is appended as the message.
 
 ## The onlykey-agent library
 

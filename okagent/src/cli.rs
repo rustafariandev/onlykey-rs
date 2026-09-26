@@ -90,7 +90,8 @@ pub struct ServeArgs {
     #[command(flatten)]
     pub identities: IdentityArgs,
 
-    /// Socket path (default: $XDG_RUNTIME_DIR/okagent/agent.sock).
+    /// Socket path (default: $XDG_RUNTIME_DIR/okagent/agent.sock, or
+    /// $TMPDIR/okagent/agent.sock on macOS).
     #[arg(long)]
     pub socket: Option<PathBuf>,
 

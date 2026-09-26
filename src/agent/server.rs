@@ -435,7 +435,8 @@ pub fn bind_socket(path: &Path) -> Result<(UnixListener, SocketGuard), SocketErr
 }
 
 /// Where the agent listens by default: `$XDG_RUNTIME_DIR/okagent/agent.sock`,
-/// else `/tmp/okagent-<uid>/agent.sock`.
+/// else `$TMPDIR/okagent/agent.sock` on macOS, else
+/// `/tmp/okagent-<uid>/agent.sock`.
 pub fn default_socket_path() -> PathBuf {
     runtime_dir().join("agent.sock")
 }
@@ -446,10 +447,17 @@ pub fn ephemeral_socket_path() -> PathBuf {
 }
 
 fn runtime_dir() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("okagent"),
-        _ => PathBuf::from(format!("/tmp/okagent-{}", nix::unistd::getuid())),
+    let var = |name| std::env::var_os(name).filter(|dir| !dir.is_empty());
+    if let Some(dir) = var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("okagent");
     }
+    // macOS gives each user a private $TMPDIR, while /tmp is shared.
+    if cfg!(target_os = "macos")
+        && let Some(dir) = var("TMPDIR")
+    {
+        return PathBuf::from(dir).join("okagent");
+    }
+    PathBuf::from(format!("/tmp/okagent-{}", nix::unistd::getuid()))
 }
 
 #[cfg(test)]

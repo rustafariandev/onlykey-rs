@@ -20,13 +20,17 @@ pub const COMMAND_USAGE_PAGE: u16 = 0xFFAB;
 /// used when the usage page is not reported.
 pub const COMMAND_INTERFACE: i32 = 2;
 
+#[cfg(target_os = "linux")]
+const PERMISSION_HINT: &str =
+    "install the OnlyKey udev rule (49-onlykey.rules) and replug the device";
+#[cfg(not(target_os = "linux"))]
+const PERMISSION_HINT: &str = "check that no other program has the OnlyKey open";
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("no OnlyKey found; is it plugged in?")]
     NotFound,
-    #[error(
-        "permission denied opening {path}; install the OnlyKey udev rule (49-onlykey.rules) and replug the device"
-    )]
+    #[error("permission denied opening {path}; {PERMISSION_HINT}")]
     PermissionDenied { path: String },
     #[error("USB HID error: {0}")]
     Hid(#[from] HidError),
@@ -88,6 +92,8 @@ impl HidapiTransport {
             .filter(|d| is_command_interface(d))
             .collect();
         candidates.sort_by_key(|d| d.path().to_bytes().to_vec());
+        // macOS lists a device once per top-level usage, all with one path.
+        candidates.dedup_by_key(|d| d.path().to_bytes().to_vec());
         let Some(info) = candidates.first() else {
             return Err(TransportError::NotFound);
         };
