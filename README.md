@@ -145,6 +145,13 @@ okagent pubkey ferris@example.com git@github.com > ~/.ssh/onlykey.pub
 okagent serve --daemon --pubkey-file ~/.ssh/onlykey.pub
 ```
 
+`pubkey`, `run`, `shell`, `serve`, `ssh`, `mosh` and `ssh-copy-id` all accept
+the flag. The remote commands take a required identity, so for them the file
+only preloads the matching key: `okagent ssh --pubkey-file ~/.ssh/onlykey.pub
+ferris@example.com` hands `ssh` the right key before the device is unlocked.
+The flag must come before the identity, since anything after it is passed
+through to the remote command.
+
 `log-file` (or `--log-file`) appends log output to a file instead of stderr,
 which is where a background agent's messages would otherwise be lost.
 

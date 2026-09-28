@@ -38,18 +38,24 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .SY okagent
 .RI [ options ]
 .B ssh
+.RB [ \-\-pubkey\-file
+.IR file ]
 .I identity
 .RI [ ssh-arg .\|.\|.]
 .YS
 .SY okagent
 .RI [ options ]
 .B mosh
+.RB [ \-\-pubkey\-file
+.IR file ]
 .I identity
 .RI [ mosh-arg .\|.\|.]
 .YS
 .SY okagent
 .RI [ options ]
 .B ssh-copy-id
+.RB [ \-\-pubkey\-file
+.IR file ]
 .I identity
 .RI [ ssh-copy-id-arg .\|.\|.]
 .YS
@@ -345,7 +351,7 @@ Print usage and exit.
 Print the version and exit.
 .PP
 The
-.BR pubkey ", " run ", " shell " and " serve
+.BR pubkey ", " run ", " shell ", " serve ", " ssh ", " mosh " and " ssh-copy-id
 commands also accept:
 .TP
 .BI \-\-pubkey\-file " file"
@@ -366,6 +372,9 @@ becomes one identity, in file order, so
 .I file
 needs nothing else.
 Keys with any other comment are skipped with a warning.
+The
+.BR ssh ", " mosh " and " ssh-copy-id
+commands take a required identity, so they use the file only to preload keys.
 .PP
 The
 .B serve

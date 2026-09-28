@@ -120,6 +120,10 @@ pub struct SshArgs {
     /// Identity as [user@]host[:port]; the host is also the ssh destination.
     pub identity: String,
 
+    /// Exported public keys to serve while the device is absent or locked.
+    #[arg(long)]
+    pub pubkey_file: Option<PathBuf>,
+
     /// Extra arguments passed after the destination (a remote command).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
@@ -130,6 +134,10 @@ pub struct SshCopyIdArgs {
     /// Identity as [user@]host[:port]; the host is also the ssh-copy-id
     /// destination.
     pub identity: String,
+
+    /// Exported public keys to serve while the device is absent or locked.
+    #[arg(long)]
+    pub pubkey_file: Option<PathBuf>,
 
     /// Extra arguments for ssh-copy-id (for example -f or -n), passed before
     /// the destination.
@@ -505,7 +513,7 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
     let id_args = IdentityArgs {
         identity: vec![args.identity.clone()],
-        pubkey_file: None,
+        pubkey_file: args.pubkey_file.clone(),
     };
     let agent = ctx.agent(&id_args)?;
     let keys = agent.derive_all()?;
@@ -561,7 +569,7 @@ fn ssh_copy_id(ctx: &Context_, args: SshCopyIdArgs) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
     let id_args = IdentityArgs {
         identity: vec![args.identity.clone()],
-        pubkey_file: None,
+        pubkey_file: args.pubkey_file.clone(),
     };
     let command = ssh_copy_id_command(&identity, port, args.args);
     run(ctx, &id_args, command)
@@ -658,6 +666,46 @@ mod tests {
             agent_env_snippet(Path::new("/run/a.sock"), 42),
             "SSH_AUTH_SOCK=/run/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=42; export SSH_AGENT_PID;\n"
         );
+    }
+
+    #[test]
+    fn remote_commands_accept_pubkey_file() {
+        for cmd in ["ssh", "mosh"] {
+            let cli = Cli::try_parse_from([
+                "okagent",
+                cmd,
+                "--pubkey-file",
+                "keys.pub",
+                "user@example.com",
+                "-o",
+                "BatchMode=yes",
+            ])
+            .unwrap();
+            match cli.command {
+                Cmd::Ssh(args) | Cmd::Mosh(args) => {
+                    assert_eq!(args.pubkey_file.as_deref(), Some(Path::new("keys.pub")));
+                    assert_eq!(args.identity, "user@example.com");
+                    assert_eq!(args.args, vec!["-o".to_owned(), "BatchMode=yes".to_owned()]);
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
+
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "ssh-copy-id",
+            "--pubkey-file",
+            "keys.pub",
+            "example.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::SshCopyId(args) => {
+                assert_eq!(args.pubkey_file.as_deref(), Some(Path::new("keys.pub")));
+                assert_eq!(args.identity, "example.com");
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
     }
 
     #[test]
