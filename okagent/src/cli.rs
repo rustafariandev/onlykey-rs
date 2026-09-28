@@ -117,8 +117,15 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct SshArgs {
-    /// Identity as [user@]host[:port]; the host is also the ssh destination.
+    /// Identity as [user@]host[:port] naming the key.
     pub identity: String,
+
+    /// Server to connect to as [user@]host[:port]; defaults to the identity's
+    /// host. Use it to connect to a different server than the identity names.
+    /// Without a user the identity's user is kept; without a port the default
+    /// port is used (the identity's :port is not carried over).
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
 
     /// Exported public keys to serve while the device is absent or locked.
     #[arg(long)]
@@ -131,9 +138,15 @@ pub struct SshArgs {
 
 #[derive(Debug, Args)]
 pub struct SshCopyIdArgs {
-    /// Identity as [user@]host[:port]; the host is also the ssh-copy-id
-    /// destination.
+    /// Identity as [user@]host[:port] naming the key.
     pub identity: String,
+
+    /// Server to connect to as [user@]host[:port]; defaults to the identity's
+    /// host. Use it to install the key on a different server than the identity
+    /// names. Without a user the identity's user is kept; without a port the
+    /// default port is used (the identity's :port is not carried over).
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
 
     /// Exported public keys to serve while the device is absent or locked.
     #[arg(long)]
@@ -511,6 +524,7 @@ fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Resul
 /// same ssh command line through `--ssh`.
 fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
+    let (destination, port) = destination(&identity, port, args.host.as_deref())?;
     let id_args = IdentityArgs {
         identity: vec![args.identity.clone()],
         pubkey_file: args.pubkey_file.clone(),
@@ -535,11 +549,11 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     let command = match remote {
         Remote::Ssh => {
             let mut command = ssh;
-            if let Some(user) = &identity.user {
+            if let Some(user) = &destination.user {
                 command.push("-l".into());
                 command.push(user.clone());
             }
-            command.push(identity.host.clone());
+            command.push(destination.host.clone());
             command
         }
         Remote::Mosh => {
@@ -553,12 +567,30 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
                 );
             }
             let mut command = vec!["mosh".to_owned(), format!("--ssh={ssh_line}")];
-            command.push(identity.to_string());
+            command.push(destination.to_string());
             command
         }
     };
     let command = command.into_iter().chain(args.args).collect();
     run(ctx, &id_args, command)
+}
+
+/// The ssh destination: `--host` when given, else the identity itself. A
+/// `--host` without a user keeps the identity's user, so the key's identity
+/// and the login name stay independent of the server's address. A `--host`
+/// without a port uses the default port; the identity's `:port` belongs to
+/// the identity's host and is not carried over.
+fn destination(
+    identity: &Identity,
+    port: Option<u16>,
+    host: Option<&str>,
+) -> Result<(Identity, Option<u16>)> {
+    let Some(host) = host else {
+        return Ok((identity.clone(), port));
+    };
+    let (dest, dest_port) = Identity::parse_with_port(host)?;
+    let user = dest.user.or_else(|| identity.user.clone());
+    Ok((Identity::new(user.as_deref(), &dest.host), dest_port))
 }
 
 /// Install the identity's public key on the remote host by running
@@ -567,11 +599,12 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
 /// login and for the install, so no public key file is needed.
 fn ssh_copy_id(ctx: &Context_, args: SshCopyIdArgs) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
+    let (destination, port) = destination(&identity, port, args.host.as_deref())?;
     let id_args = IdentityArgs {
         identity: vec![args.identity.clone()],
         pubkey_file: args.pubkey_file.clone(),
     };
-    let command = ssh_copy_id_command(&identity, port, args.args);
+    let command = ssh_copy_id_command(&destination, port, args.args);
     run(ctx, &id_args, command)
 }
 
@@ -706,6 +739,63 @@ mod tests {
             }
             other => panic!("unexpected command {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_option_separates_destination_from_identity() {
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "ssh",
+            "key@identity.example",
+            "--host",
+            "james@server.example:2222",
+            "-o",
+            "BatchMode=yes",
+        ])
+        .unwrap();
+        let Cmd::Ssh(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert_eq!(args.identity, "key@identity.example");
+        assert_eq!(args.host.as_deref(), Some("james@server.example:2222"));
+        assert_eq!(args.args, vec!["-o".to_owned(), "BatchMode=yes".to_owned()]);
+
+        let identity: Identity = "key@identity.example".parse().unwrap();
+        let (dest, port) = destination(&identity, None, args.host.as_deref()).unwrap();
+        assert_eq!(dest.to_string(), "james@server.example");
+        assert_eq!(port, Some(2222));
+
+        // A --host without a user keeps the identity's user, but a --host
+        // without a port uses the default port: the identity's :port is not
+        // carried over.
+        let (dest, port) = destination(&identity, None, Some("server.example")).unwrap();
+        assert_eq!(dest.to_string(), "key@server.example");
+        assert_eq!(port, None);
+        let (dest, port) = destination(&identity, Some(2222), Some("server.example")).unwrap();
+        assert_eq!(dest.to_string(), "key@server.example");
+        assert_eq!(port, None);
+
+        // Without --host the identity is the destination, port and all.
+        let (dest, port) = destination(&identity, Some(2222), None).unwrap();
+        assert_eq!(dest, identity);
+        assert_eq!(port, Some(2222));
+
+        // A bad port in --host is reported against the override.
+        assert!(destination(&identity, None, Some("server.example:0")).is_err());
+
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "ssh-copy-id",
+            "key@identity.example",
+            "--host",
+            "server.example",
+        ])
+        .unwrap();
+        let Cmd::SshCopyId(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert_eq!(args.identity, "key@identity.example");
+        assert_eq!(args.host.as_deref(), Some("server.example"));
     }
 
     #[test]

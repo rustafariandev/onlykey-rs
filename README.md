@@ -57,14 +57,22 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | `okagent pubkey ID...` | Public keys in `authorized_keys` format. |
 | `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK` (and `SSH_AGENT_PID`). |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
-| `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. |
-| `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. |
-| `okagent ssh-copy-id ID [ARGS]` | Install the identity's public key on the host with ssh-copy-id. |
+| `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. `--host` overrides the destination. |
+| `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. `--host` overrides the destination. |
+| `okagent ssh-copy-id ID [ARGS]` | Install the identity's public key on the host with ssh-copy-id. `--host` overrides the destination. |
 | `okagent serve [ID...]` | Long-lived agent on a unix socket. |
 
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the
 default is ed25519. Identities can be omitted when the config file lists them,
 or when `--pubkey-file` names them (see below).
+
+By default the identity's host is also the ssh destination. Pass
+`--host [user@]server[:port]` to `ssh`, `mosh` or `ssh-copy-id` to connect
+somewhere else while the identity still names the key. So
+`okagent ssh ferris@example.com --host admin@server.example.com` signs as
+`ferris@example.com` but logs in as `admin` on `server.example.com`. A
+`--host` without a user keeps the identity's user; a `--host` without a port
+uses the default port (the identity's `:port` is not carried over).
 
 Pass `--slot ECC3` (slots `ECC1` to `ECC16`) or `--slot RSA1` (`RSA1` to
 `RSA4`) to use the key stored in that slot instead of deriving one. The
@@ -89,6 +97,7 @@ okagent pubkey ferris@example.com >> authorized_keys   # copy to the server
 okagent ssh-copy-id ferris@example.com                 # ...or let ssh-copy-id do it
 okagent run ferris@example.com -- ssh example.com
 okagent ssh ferris@example.com
+okagent ssh ferris@example.com --host admin@server.example.com   # key ferris, login admin@server
 okagent ssh ferris@legacy.example.com --slot ECC3       # key stored by the OnlyKey app
 okagent ssh ferris@old.example.com --slot RSA1          # RSA key stored by the OnlyKey app
 eval "$(okagent serve --daemon ferris@example.com)"     # background agent

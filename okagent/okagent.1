@@ -40,6 +40,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B ssh
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-\-host
+.IR host ]
 .I identity
 .RI [ ssh-arg .\|.\|.]
 .YS
@@ -48,6 +50,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B mosh
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-\-host
+.IR host ]
 .I identity
 .RI [ mosh-arg .\|.\|.]
 .YS
@@ -56,6 +60,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B ssh-copy-id
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-\-host
+.IR host ]
 .I identity
 .RI [ ssh-copy-id-arg .\|.\|.]
 .YS
@@ -204,6 +210,10 @@ becomes the login name, and a
 suffix is passed as
 .BR \-p .
 The port never affects the key.
+.B \-\-host
+names a different destination while the identity still names the key; see
+.BR \-\-host
+below.
 .B ssh
 is told to use only this key
 .RB ( "IdentitiesOnly=yes" )
@@ -224,6 +234,8 @@ command line through
 The destination is
 .RI [ user @] host
 and any further arguments follow it.
+.B \-\-host
+overrides the destination.
 .TP
 .BI ssh-copy-id " identity " [ ssh-copy-id-arg \fR.\|.\|.]
 Install the identity's public key in the remote
@@ -236,6 +248,8 @@ The host part of the identity is the destination and a
 .BI : port
 suffix is passed as
 .BR \-p .
+.B \-\-host
+overrides the destination.
 Any further arguments are passed to
 .B ssh-copy-id
 before the destination.
@@ -375,6 +389,31 @@ Keys with any other comment are skipped with a warning.
 The
 .BR ssh ", " mosh " and " ssh-copy-id
 commands take a required identity, so they use the file only to preload keys.
+.PP
+The
+.BR ssh ", " mosh " and " ssh-copy-id
+commands also accept:
+.TP
+.BI \-\-host " host"
+Connect to
+.I host
+instead of the host part of the identity, which then only names the key.
+.I host
+has the form
+.RI [ user @] host [: port ]:
+a user overrides the login name and a port is passed as
+.BR \-p .
+A
+.I host
+without a user keeps the identity's user, so the key's identity and the
+login name stay independent.
+A
+.I host
+without a port uses the default port; the identity's
+.RI : port
+suffix belongs to the identity's host and is not carried over.
+This lets one key identity reach several servers, for example
+.BI "okagent ssh " key@example.com " \-\-host " admin@server.example.com .
 .PP
 The
 .B serve
@@ -628,6 +667,14 @@ okagent pubkey james@example.com >> ~/.ssh/authorized_keys.example.com
 okagent ssh-copy-id james@example.com
 okagent ssh james@example.com
 okagent run james@example.com \-\- ssh example.com
+.EE
+.RE
+.PP
+Sign as one identity but connect to another server:
+.PP
+.RS
+.EX
+okagent ssh james@example.com \-\-host admin@server.example.com
 .EE
 .RE
 .PP
