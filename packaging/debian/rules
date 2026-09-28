@@ -1,0 +1,42 @@
+#!/usr/bin/make -f
+
+# Native Debian/Ubuntu build. Cargo is expected on PATH; the release build
+# installs a pinned rustup toolchain because edition 2024 needs rustc >= 1.85
+# while the toolchains shipped by Debian 12 and Ubuntu 22.04 are older.
+export CARGO_NET_OFFLINE ?= false
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# cargo has no configure step.
+
+override_dh_auto_build:
+	cargo build --release --locked -p okagent
+	mkdir -p completions
+	target/release/okagent completions bash > completions/okagent
+	target/release/okagent completions zsh  > completions/_okagent
+	target/release/okagent completions fish > completions/okagent.fish
+
+override_dh_auto_test:
+	# Package builds do not run the test suite: the end-to-end tests need
+	# OpenSSH and a fake token. CI runs `cargo test --workspace`.
+
+override_dh_auto_install:
+	# Handled by debian/okagent.install and debian/okagent.manpages.
+
+override_dh_auto_clean:
+	cargo clean -p okagent || true
+	rm -rf completions
+
+override_dh_installsystemduser:
+	# User units are shipped, not enabled by the package. See README.md.
+
+override_dh_installudev:
+	# The rule is shipped under /usr/lib/udev/rules.d; the user reloads udev.
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+override_dh_missing:
+	dh_missing --fail-missing

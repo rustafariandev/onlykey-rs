@@ -1,0 +1,14 @@
+[Unit]
+Description=OnlyKey SSH agent
+Documentation=man:okagent(1)
+Documentation=https://github.com/rustafariandev/onlykey-rs
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/okagent serve --notify-command "notify-send --app-name=OnlyKey OnlyKey"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

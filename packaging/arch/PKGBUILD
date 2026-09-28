@@ -1,0 +1,57 @@
+# Maintainer: Rustafarian Dev <rustafarian.dev@gmail.com>
+pkgname=okagent
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="SSH agent backed by an OnlyKey hardware token"
+arch=('x86_64')
+url="https://github.com/rustafariandev/onlykey-rs"
+license=('MIT')
+depends=('glibc')
+makedepends=('cargo' 'rustup')
+options=('!debug' 'strip')
+optdepends=('libnotify: desktop notification for the challenge prompt'
+            'openssh: ssh, ssh-add and ssh-keygen'
+            'mosh: the mosh subcommand')
+provides=('onlykey-agent')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+install="$pkgname.install"
+
+prepare() {
+  cd "$srcdir/onlykey-rs-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked
+}
+
+build() {
+  cd "$srcdir/onlykey-rs-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --frozen --release -p okagent
+  ./target/release/okagent completions bash > okagent.bash
+  ./target/release/okagent completions zsh  > _okagent
+  ./target/release/okagent completions fish > okagent.fish
+}
+
+check() {
+  cd "$srcdir/onlykey-rs-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --workspace
+}
+
+package() {
+  cd "$srcdir/onlykey-rs-$pkgver"
+  install -Dpm 0755 target/release/okagent "$pkgdir/usr/bin/okagent"
+  install -Dpm 0644 okagent/okagent.1 "$pkgdir/usr/share/man/man1/okagent.1"
+  install -Dpm 0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dpm 0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dpm 0644 packaging/common/okagent.service \
+    "$pkgdir/usr/lib/systemd/user/okagent.service"
+  install -Dpm 0644 packaging/common/49-onlykey.rules \
+    "$pkgdir/usr/lib/udev/rules.d/49-onlykey.rules"
+  install -Dpm 0644 okagent.bash \
+    "$pkgdir/usr/share/bash-completion/completions/okagent"
+  install -Dpm 0644 _okagent \
+    "$pkgdir/usr/share/zsh/site-functions/_okagent"
+  install -Dpm 0644 okagent.fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/okagent.fish"
+}

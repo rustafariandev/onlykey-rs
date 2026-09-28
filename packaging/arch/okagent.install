@@ -1,0 +1,18 @@
+post_install() {
+  if [ -x /usr/bin/udevadm ]; then
+    /usr/bin/udevadm control --reload-rules
+    /usr/bin/udevadm trigger
+  fi
+  echo "Replug the OnlyKey, then: systemctl --user enable --now okagent"
+  echo "and: export SSH_AUTH_SOCK=\"\$XDG_RUNTIME_DIR/okagent/agent.sock\""
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  if [ -x /usr/bin/udevadm ]; then
+    /usr/bin/udevadm control --reload-rules
+  fi
+}

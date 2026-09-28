@@ -15,6 +15,11 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .YS
 .SY okagent
 .RI [ options ]
+.B completions
+.I shell
+.YS
+.SY okagent
+.RI [ options ]
 .B run
 .RB [ \-\-pubkey\-file
 .IR file ]
@@ -141,6 +146,19 @@ A stored key's comment has the slot as a third field,
 or
 .BI <ssh:// identity |rsa|RSA n >,
 so that a derived and a stored key for the same identity can be told apart.
+.TP
+.BI completions " " shell
+Print a completion script for
+.I shell
+(one of
+.BR bash ,
+.BR zsh ,
+.BR fish ,
+.BR elvish ,
+.BR powershell )
+on standard output, for example
+.BI "okagent completions bash > " /etc/bash_completion.d/okagent .
+The packaged builds install scripts for bash, zsh and fish already.
 .TP
 .BI run " " [ identity \fR.\|.\|.] " \-\- " command " " [ arg \fR.\|.\|.]
 Start a temporary agent on a private socket, run

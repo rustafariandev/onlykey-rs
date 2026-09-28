@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
 use onlykey_agent::agent::{self, Agent, Opener};
 use onlykey_agent::challenge::{ChallengeSink, CommandNotifier, MultiSink, TtyPrompt};
@@ -71,6 +71,8 @@ pub enum Cmd {
     /// Sign a fixed test message and verify it (hardware check).
     #[command(hide = true)]
     DebugSign(DebugSignArgs),
+    /// Print a shell completion script for the given shell.
+    Completions(CompletionsArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -137,6 +139,13 @@ pub struct DebugSignArgs {
     /// Digest for an RSA key: sha256 or sha512.
     #[arg(long, default_value = "sha512")]
     pub hash: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 /// Everything resolved from flags plus config.
@@ -301,6 +310,9 @@ pub fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
 
 /// Run the CLI; returns the process exit code.
 pub fn main(cli: Cli) -> Result<ExitCode> {
+    if let Cmd::Completions(args) = &cli.command {
+        return completions(args);
+    }
     let config = Config::load(cli.config.as_deref())?;
     init_logging(
         cli.verbose,
@@ -338,6 +350,22 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
         Cmd::Mosh(args) => connect(&ctx, args, Remote::Mosh),
         Cmd::DebugSign(args) => debug_sign(&ctx, args),
+        Cmd::Completions(args) => completions(&args),
+    }
+}
+
+fn completions(args: &CompletionsArgs) -> Result<ExitCode> {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    // Buffer first: `generate` writes into a `Vec`, so a closed stdout (for
+    // example `okagent completions bash | head`) is an ordinary I/O error
+    // rather than a panic inside clap_complete.
+    let mut buf = Vec::new();
+    clap_complete::generate(args.shell, &mut cmd, name, &mut buf);
+    match std::io::stdout().write_all(&buf) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        Err(e) => Err(e.into()),
     }
 }
 

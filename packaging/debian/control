@@ -1,0 +1,31 @@
+Source: okagent
+Section: utils
+Priority: optional
+Maintainer: Rustafarian Dev <rustafarian.dev@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               gcc,
+               libc6-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/rustafariandev/onlykey-rs
+Vcs-Git: https://github.com/rustafariandev/onlykey-rs.git
+Vcs-Browser: https://github.com/rustafariandev/onlykey-rs
+
+Package: okagent
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Recommends: libnotify-bin,
+            openssh-client
+Description: SSH agent backed by an OnlyKey hardware token
+ okagent derives SSH keys on an OnlyKey hardware token from an identity
+ string, so the private key never leaves the device, and signs with them
+ after a challenge is entered on the token's buttons. The derivation
+ matches the Python onlykey-agent, so existing authorized_keys entries
+ keep working. It supports ed25519 and nistp256 (derived, or stored in
+ an ECC slot) and RSA 2048/4096 (stored in an RSA slot), and can run as
+ an SSH agent, wrap ssh and mosh, or serve on a unix socket.
+ .
+ Note: the build needs Rust 1.85 or newer for edition 2024. Distribution
+ toolchains on older releases are too old, so the release build installs
+ a pinned rustup toolchain inside the build environment.

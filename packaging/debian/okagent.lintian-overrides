@@ -1,0 +1,4 @@
+okagent binary: hardening-no-pie
+okagent binary: hardening-no-bindnow
+okagent binary: hardening-no-fortify-functions
+okagent: embedded-library usr/bin/okagent

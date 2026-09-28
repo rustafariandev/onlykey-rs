@@ -1,0 +1,6 @@
+target/release/okagent usr/bin/
+packaging/common/okagent.service usr/lib/systemd/user/
+packaging/common/49-onlykey.rules usr/lib/udev/rules.d/
+completions/okagent usr/share/bash-completion/completions/
+completions/_okagent usr/share/zsh/vendor-completions/
+completions/okagent.fish usr/share/fish/vendor_completions.d/

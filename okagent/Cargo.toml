@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 onlykey-agent = { path = "..", version = "0.1.0", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 signal-hook = "0.3"
@@ -29,3 +30,65 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+# Metadata for `cargo deb` (packaging/deb.sh). Native Debian builds use
+# packaging/debian/ instead; both install the same files.
+[package.metadata.deb]
+maintainer = "Rustafarian Dev <rustafarian.dev@gmail.com>"
+copyright = "2026 James Rouzier, MIT licensed"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+okagent derives SSH keys on an OnlyKey hardware token from an identity
+string, so the private key never leaves the device, and signs with them
+after a challenge is entered on the token's buttons. The derivation
+matches the Python onlykey-agent, so existing authorized_keys entries
+keep working."""
+section = "utils"
+priority = "optional"
+depends = "$auto"
+recommends = "libnotify-bin, openssh-client"
+assets = [
+    ["target/release/okagent", "usr/bin/", "755"],
+    ["../okagent/okagent.1", "usr/share/man/man1/okagent.1", "644"],
+    ["../README.md", "usr/share/doc/okagent/README.md", "644"],
+    ["../packaging/common/okagent.service", "usr/lib/systemd/user/okagent.service", "644"],
+    ["../packaging/common/49-onlykey.rules", "usr/lib/udev/rules.d/49-onlykey.rules", "644"],
+]
+conf-files = []
+
+# Metadata for `cargo generate-rpm` (packaging/rpm.sh). Native RPM builds use
+# packaging/rpm/okagent.spec instead; both install the same files.
+[package.metadata.generate-rpm]
+name = "okagent"
+license = "MIT"
+vendor = "Rustafarian Dev"
+summary = "SSH agent backed by an OnlyKey hardware token"
+url = "https://github.com/rustafariandev/onlykey-rs"
+auto-req = "no"
+assets = [
+    { source = "target/release/okagent", dest = "/usr/bin/okagent", mode = "755" },
+    { source = "../okagent/okagent.1", dest = "/usr/share/man/man1/okagent.1", mode = "644", doc = true },
+    { source = "../README.md", dest = "/usr/share/doc/okagent/README.md", mode = "644", doc = true },
+    { source = "../packaging/common/okagent.service", dest = "/usr/lib/systemd/user/okagent.service", mode = "644" },
+    { source = "../packaging/common/49-onlykey.rules", dest = "/usr/lib/udev/rules.d/49-onlykey.rules", mode = "644" },
+    { source = "target/completions/okagent.bash", dest = "/usr/share/bash-completion/completions/okagent", mode = "644" },
+    { source = "target/completions/_okagent", dest = "/usr/share/zsh/site-functions/_okagent", mode = "644" },
+    { source = "target/completions/okagent.fish", dest = "/usr/share/fish/vendor_completions.d/okagent.fish", mode = "644" },
+]
+post_install_script = """
+if [ -x /usr/bin/udevadm ]; then
+  /usr/bin/udevadm control --reload-rules >/dev/null 2>&1 || :
+  /usr/bin/udevadm trigger >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+if [ -x /usr/bin/udevadm ] && [ "$1" -eq 0 ]; then
+  /usr/bin/udevadm control --reload-rules >/dev/null 2>&1 || :
+fi
+"""
+
+[package.metadata.generate-rpm.requires]
+glibc = "*"
+
+[package.metadata.generate-rpm.recommends]
+libnotify = "*"

@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (defaults to the tag)"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  universal:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build static binary
+        run: bash packaging/universal/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: universal
+          path: dist/*
+
+  deb:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            name: debian12
+          - image: ubuntu:22.04
+            name: ubuntu2204
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .deb in ${{ matrix.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD:/work" -w /work ${{ matrix.image }} \
+            /bin/sh -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                build-essential curl ca-certificates pkg-config \
+                debhelper devscripts dpkg-dev fakeroot
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              cp -r packaging/debian debian
+              dpkg-buildpackage -us -uc -b
+              mv ../okagent_*.deb dist/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.name }}
+          path: dist/*.deb
+
+  rpm:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:8
+            name: el8
+          - image: rockylinux:9
+            name: el9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .rpm in ${{ matrix.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD:/work" -w /work ${{ matrix.image }} \
+            /bin/sh -euxc '
+              dnf install -y -q rpm-build gcc make ca-certificates tar git || \
+                dnf install -y -q --allowerasing rpm-build gcc make ca-certificates tar git
+              command -v curl >/dev/null 2>&1 || dnf install -y -q curl-minimal
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              version="$(cargo metadata --no-deps --format-version 1 \
+                | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)"
+              mkdir -p "$HOME/rpmbuild/SOURCES"
+              tar --transform "s,^,onlykey-rs-$version/," \
+                --exclude=.git --exclude=target --exclude=dist \
+                -czf "$HOME/rpmbuild/SOURCES/okagent-$version.tar.gz" .
+              rpmbuild -bb packaging/rpm/okagent.spec \
+                --define "_topdir $HOME/rpmbuild" \
+                --define "_sourcedir $HOME/rpmbuild/SOURCES"
+              find "$HOME/rpmbuild/RPMS" -name "*.rpm" -exec cp {} dist/ \;
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.name }}
+          path: dist/*.rpm
+
+  arch:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Arch package
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD:/work:ro" -v "$PWD/dist:/dist" -w /work archlinux:latest \
+            /bin/sh -euxc '
+              pacman -Sy --noconfirm --needed base-devel rustup git
+              rustup default stable
+              useradd -m builder
+              machinedir=/home/builder/pkg
+              cp /work/packaging/arch/PKGBUILD /work/packaging/arch/okagent.install "$machinedir/"
+              chown -R builder:builder "$machinedir"
+              su builder -c "cd $machinedir && makepkg -f --noconfirm"
+              mv "$machinedir"/okagent-*.pkg.tar.zst /dist/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*.pkg.tar.zst
+
+  release:
+    needs: [universal, deb, rpm, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

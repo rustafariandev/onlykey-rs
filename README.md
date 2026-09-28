@@ -36,6 +36,15 @@ Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
 cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
 ```
 
+Prebuilt packages and a static binary are published on the
+[releases page](https://github.com/rustafariandev/onlykey-rs/releases): a
+universal `x86_64` musl tarball, a `.deb` for Debian 12+ and Ubuntu 22.04+,
+an `.rpm` for RHEL 8+, and a `.pkg.tar.zst` for Arch. Each installs the
+binary, man page, a systemd user unit, the udev rule, and shell completions;
+see [`packaging/README.md`](packaging/README.md). `okagent completions SHELL`
+prints a completion script, and `make package-all` builds every package
+locally with podman.
+
 A man page lives at `okagent/okagent.1`; `man -l okagent/okagent.1` reads it
 from the checkout, or copy it to `~/.local/share/man/man1/` to get
 `man okagent`.
