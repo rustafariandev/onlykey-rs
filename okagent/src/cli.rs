@@ -68,6 +68,8 @@ pub enum Cmd {
     Ssh(SshArgs),
     /// Connect with mosh, whose ssh step uses the identity's key.
     Mosh(SshArgs),
+    /// Install the identity's public key on the remote host with ssh-copy-id.
+    SshCopyId(SshCopyIdArgs),
     /// Sign a fixed test message and verify it (hardware check).
     #[command(hide = true)]
     DebugSign(DebugSignArgs),
@@ -119,6 +121,18 @@ pub struct SshArgs {
     pub identity: String,
 
     /// Extra arguments passed after the destination (a remote command).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SshCopyIdArgs {
+    /// Identity as [user@]host[:port]; the host is also the ssh-copy-id
+    /// destination.
+    pub identity: String,
+
+    /// Extra arguments for ssh-copy-id (for example -f or -n), passed before
+    /// the destination.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
@@ -349,6 +363,7 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
         Cmd::Mosh(args) => connect(&ctx, args, Remote::Mosh),
+        Cmd::SshCopyId(args) => ssh_copy_id(&ctx, args),
         Cmd::DebugSign(args) => debug_sign(&ctx, args),
         Cmd::Completions(args) => completions(&args),
     }
@@ -538,6 +553,33 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     run(ctx, &id_args, command)
 }
 
+/// Install the identity's public key on the remote host by running
+/// `ssh-copy-id` with a temporary agent that serves only that key.
+/// ssh-copy-id reads the key from `ssh-add -L` and uses it both for its trial
+/// login and for the install, so no public key file is needed.
+fn ssh_copy_id(ctx: &Context_, args: SshCopyIdArgs) -> Result<ExitCode> {
+    let (identity, port) = Identity::parse_with_port(&args.identity)?;
+    let id_args = IdentityArgs {
+        identity: vec![args.identity.clone()],
+        pubkey_file: None,
+    };
+    let command = ssh_copy_id_command(&identity, port, args.args);
+    run(ctx, &id_args, command)
+}
+
+/// The ssh-copy-id command line: options first, the destination last. The
+/// identity's port becomes `-p`, and `extra` is passed through unchanged.
+fn ssh_copy_id_command(identity: &Identity, port: Option<u16>, extra: Vec<String>) -> Vec<String> {
+    let mut command = vec!["ssh-copy-id".to_owned()];
+    if let Some(port) = port {
+        command.push("-p".into());
+        command.push(port.to_string());
+    }
+    command.extend(extra);
+    command.push(identity.to_string());
+    command
+}
+
 fn debug_sign(ctx: &Context_, args: DebugSignArgs) -> Result<ExitCode> {
     let spec = ctx.key(&args.identity)?;
     let message: Vec<u8> = (0..args.len).map(|i| i as u8).collect();
@@ -594,6 +636,20 @@ mod tests {
             ]
         );
         assert!(entries_from_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn ssh_copy_id_command_puts_options_before_destination() {
+        let id: Identity = "user@example.com".parse().unwrap();
+        assert_eq!(
+            ssh_copy_id_command(&id, Some(2222), vec!["-f".to_owned()]),
+            vec!["ssh-copy-id", "-p", "2222", "-f", "user@example.com"]
+        );
+        let id: Identity = "example.com".parse().unwrap();
+        assert_eq!(
+            ssh_copy_id_command(&id, None, Vec::new()),
+            vec!["ssh-copy-id", "example.com"]
+        );
     }
 
     #[test]

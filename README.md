@@ -59,6 +59,7 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
 | `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. |
 | `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. |
+| `okagent ssh-copy-id ID [ARGS]` | Install the identity's public key on the host with ssh-copy-id. |
 | `okagent serve [ID...]` | Long-lived agent on a unix socket. |
 
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the
@@ -76,8 +77,16 @@ RSA keys are never derived, only stored. The token signs SHA-256 or SHA-512
 digests, so a client asking for the legacy SHA-1 `ssh-rsa` signature is
 refused; OpenSSH has asked for `rsa-sha2-*` since 7.2.
 
+`okagent ssh-copy-id` installs the identity's public key on the host by
+running `ssh-copy-id` against a temporary agent that serves only that key, so
+its trial login and the install both sign with the token. The host part is the
+destination, a `:port` suffix becomes `-p`, and any further arguments are
+passed to `ssh-copy-id`. It needs an `ssh-copy-id` that takes keys from
+`ssh-add -L`; the one shipped by current OpenSSH does.
+
 ```sh
 okagent pubkey ferris@example.com >> authorized_keys   # copy to the server
+okagent ssh-copy-id ferris@example.com                 # ...or let ssh-copy-id do it
 okagent run ferris@example.com -- ssh example.com
 okagent ssh ferris@example.com
 okagent ssh ferris@legacy.example.com --slot ECC3       # key stored by the OnlyKey app

@@ -49,6 +49,12 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .YS
 .SY okagent
 .RI [ options ]
+.B ssh-copy-id
+.I identity
+.RI [ ssh-copy-id-arg .\|.\|.]
+.YS
+.SY okagent
+.RI [ options ]
 .B serve
 .RB [ \-\-socket
 .IR path ]
@@ -212,6 +218,26 @@ command line through
 The destination is
 .RI [ user @] host
 and any further arguments follow it.
+.TP
+.BI ssh-copy-id " identity " [ ssh-copy-id-arg \fR.\|.\|.]
+Install the identity's public key in the remote
+.I authorized_keys
+by running
+.BR ssh-copy-id (1)
+against a temporary agent that serves only that key, so both its trial login
+and the install sign with the token.
+The host part of the identity is the destination and a
+.BI : port
+suffix is passed as
+.BR \-p .
+Any further arguments are passed to
+.B ssh-copy-id
+before the destination.
+The public key comes from
+.BR "ssh-add \-L" ,
+so no key file is needed and
+.B \-i
+must not be given.
 .TP
 .BI serve " " [ identity \fR.\|.\|.]
 Run a long-lived agent on a unix socket.
@@ -535,7 +561,7 @@ Shell started by
 .TP
 .BR SSH_AUTH_SOCK ", " SSH_AGENT_PID
 Set for the child of
-.BR run ", " shell ", " ssh " and " mosh .
+.BR run ", " shell ", " ssh ", " mosh " and " ssh-copy-id .
 Printed by
 .B serve
 for the user to export.
@@ -558,7 +584,7 @@ The socket and its directory are created with owner-only permissions.
 .TP
 .IR $XDG_RUNTIME_DIR/okagent/run\- pid .sock
 Temporary socket used by
-.BR run ", " shell " and " ssh ;
+.BR run ", " shell ", " ssh ", " mosh " and " ssh-copy-id ;
 removed on exit.
 .TP
 .I /dev/hidraw*
@@ -580,13 +606,17 @@ exit with the status of the command they ran, or 128 if it was killed by a
 signal;
 .B ssh
 exits with the status of
-.BR ssh (1).
+.BR ssh (1);
+.B ssh-copy-id
+exits with the status of
+.BR ssh-copy-id (1).
 .SH EXAMPLES
 Publish a key and log in with it:
 .PP
 .RS
 .EX
 okagent pubkey james@example.com >> ~/.ssh/authorized_keys.example.com
+okagent ssh-copy-id james@example.com
 okagent ssh james@example.com
 okagent run james@example.com \-\- ssh example.com
 .EE
@@ -660,6 +690,7 @@ The agent covers SSH only; GPG and age keys are out of scope.
 .BR ssh (1),
 .BR ssh\-add (1),
 .BR ssh\-agent (1),
+.BR ssh\-copy\-id (1),
 .BR notify\-send (1)
 .PP
 .UR https://github.com/rustafariandev/onlykey\-rs
