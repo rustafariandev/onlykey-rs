@@ -177,36 +177,14 @@ impl Agent {
     /// Add `spec` to the served identities. If its public key is already
     /// known (from [`Self::preload`] or an earlier fetch) it is served from
     /// the cache and the device is not touched; otherwise the key is fetched
-    /// and verified against the device. A key already listed is left in
-    /// place. `lifetime` is the `ssh-add -t` constraint in seconds, if any.
+    /// and verified against the device. Re-adding a listed key moves it to
+    /// the end and restarts its lifetime. `lifetime` is the `ssh-add -t`
+    /// constraint in seconds, if any.
     pub fn add(&self, spec: KeySpec, lifetime: Option<u32>) -> Result<PublicKey, AgentError> {
         self.purge_expired();
-        let cached = self
-            .cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&spec)
-            .cloned();
-        let key = match cached {
-            Some(key) => key,
-            None => self.fetch(&spec)?,
-        };
+        let key = self.derive_one(&spec)?;
         self.remember(spec.clone(), lifetime);
         tracing::info!(identity = %spec.identity, key = %spec.kind, "serving key");
-        Ok(key)
-    }
-
-    /// Fetch `spec`'s public key from the device and cache it. Fails if the
-    /// device is absent or locked, the slot is empty, or the curve is wrong.
-    fn fetch(&self, spec: &KeySpec) -> Result<PublicKey, AgentError> {
-        let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut device = (self.opener)()?;
-        let key = self.derive(&mut device, spec)?;
-        drop(device);
-        self.cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(spec.clone(), key.clone());
         Ok(key)
     }
 
@@ -447,6 +425,10 @@ impl Agent {
                     wire::failure()
                 }
             },
+            Ok(Request::RemoveSmartcardKey { .. }) if self.is_locked() => {
+                tracing::warn!("remove key refused: agent is locked");
+                wire::failure()
+            }
             Ok(Request::RemoveSmartcardKey { provider }) => match self.provider_spec(&provider) {
                 Ok(spec) if self.remove(&spec) => {
                     tracing::info!(identity = %spec.identity, key = %spec.kind, "removed key");
@@ -1024,6 +1006,31 @@ mod tests {
         b"ferris@example.com".as_slice().encode(&mut add).unwrap();
         b"".as_slice().encode(&mut add).unwrap();
         assert_eq!(agent.handle(&add), wire::failure());
+        assert!(agent.entries().is_empty());
+    }
+
+    #[test]
+    fn remove_smartcard_key_is_refused_while_locked() {
+        let e = entry();
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
+        let mut lock = vec![wire::SSH_AGENTC_LOCK];
+        b"hunter2".as_slice().encode(&mut lock).unwrap();
+        assert_eq!(agent.handle(&lock), wire::success());
+
+        let mut remove = vec![wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY];
+        b"ferris@example.com"
+            .as_slice()
+            .encode(&mut remove)
+            .unwrap();
+        b"".as_slice().encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::failure());
+        assert_eq!(agent.entries(), vec![e]);
+
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        assert_eq!(agent.handle(&unlock), wire::success());
+        assert_eq!(agent.handle(&remove), wire::success());
         assert!(agent.entries().is_empty());
     }
 

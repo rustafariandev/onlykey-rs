@@ -346,8 +346,8 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
 - `SSH2_AGENTC_REQUEST_IDENTITIES`, `SSH2_AGENTC_SIGN_REQUEST`,
   `SSH_AGENTC_LOCK` and `SSH_AGENTC_UNLOCK` are implemented. `ssh-add -x`
   locks the agent with a passphrase (kept only as a salted hash) and until
-  `ssh-add -X` unlocks it the agent lists no keys and refuses to sign; this
-  is separate from the OnlyKey's PIN. `SSH_AGENTC_ADD_SMARTCARD_KEY` (and its
+  `ssh-add -X` unlocks it the agent lists no keys and refuses to sign, add
+  or remove keys; this is separate from the OnlyKey's PIN. `SSH_AGENTC_ADD_SMARTCARD_KEY` (and its
   constrained form) backs `ssh-add -s`, which adds the identity named by the
   provider string to a running agent; `SSH_AGENTC_REMOVE_SMARTCARD_KEY`
   backs `ssh-add -e`. The key is derived and verified against the token when
