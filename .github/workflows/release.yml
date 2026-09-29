@@ -49,7 +49,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - name: Build static binary
-        run: bash packaging/universal/build.sh
+        run: bash packaging/build-packages.sh universal
       - uses: actions/upload-artifact@v4
         with:
           name: universal
@@ -62,29 +62,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: debian:12
+          - base: debian
             name: debian12
-          - image: ubuntu:22.04
+          - base: ubuntu
             name: ubuntu2204
+    env:
+      CONTAINER_ENGINE: docker
     steps:
       - uses: actions/checkout@v4
-      - name: Build .deb in ${{ matrix.image }}
-        run: |
-          mkdir -p dist
-          docker run --rm -v "$PWD:/work" -w /work ${{ matrix.image }} \
-            /bin/sh -euxc '
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends \
-                build-essential curl ca-certificates pkg-config \
-                debhelper devscripts dpkg-dev fakeroot
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain stable
-              export PATH="$HOME/.cargo/bin:$PATH"
-              cp -r packaging/debian debian
-              dpkg-buildpackage -us -uc -b
-              mv ../okagent_*.deb dist/
-            '
+      - name: Build .deb (${{ matrix.base }})
+        run: bash packaging/build-packages.sh deb ${{ matrix.base }}
       - uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.name }}
@@ -97,34 +84,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:8
+          - base: rocky
             name: el8
-          - image: rockylinux:9
+          - base: rocky9
             name: el9
+    env:
+      CONTAINER_ENGINE: docker
     steps:
       - uses: actions/checkout@v4
-      - name: Build .rpm in ${{ matrix.image }}
-        run: |
-          mkdir -p dist
-          docker run --rm -v "$PWD:/work" -w /work ${{ matrix.image }} \
-            /bin/sh -euxc '
-              dnf install -y -q rpm-build gcc make ca-certificates tar git || \
-                dnf install -y -q --allowerasing rpm-build gcc make ca-certificates tar git
-              command -v curl >/dev/null 2>&1 || dnf install -y -q curl-minimal
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain stable
-              export PATH="$HOME/.cargo/bin:$PATH"
-              version="$(cargo metadata --no-deps --format-version 1 \
-                | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)"
-              mkdir -p "$HOME/rpmbuild/SOURCES"
-              tar --transform "s,^,onlykey-rs-$version/," \
-                --exclude=.git --exclude=target --exclude=dist \
-                -czf "$HOME/rpmbuild/SOURCES/okagent-$version.tar.gz" .
-              rpmbuild -bb packaging/rpm/okagent.spec \
-                --define "_topdir $HOME/rpmbuild" \
-                --define "_sourcedir $HOME/rpmbuild/SOURCES"
-              find "$HOME/rpmbuild/RPMS" -name "*.rpm" -exec cp {} dist/ \;
-            '
+      - name: Build .rpm (${{ matrix.base }})
+        run: bash packaging/build-packages.sh rpm ${{ matrix.base }}
       - uses: actions/upload-artifact@v4
         with:
           name: rpm-${{ matrix.name }}
@@ -133,22 +102,12 @@ jobs:
   arch:
     needs: test
     runs-on: ubuntu-latest
+    env:
+      CONTAINER_ENGINE: docker
     steps:
       - uses: actions/checkout@v4
       - name: Build Arch package
-        run: |
-          mkdir -p dist
-          docker run --rm -v "$PWD:/work:ro" -v "$PWD/dist:/dist" -w /work archlinux:latest \
-            /bin/sh -euxc '
-              pacman -Sy --noconfirm --needed base-devel rustup git
-              rustup default stable
-              useradd -m builder
-              machinedir=/home/builder/pkg
-              cp /work/packaging/arch/PKGBUILD /work/packaging/arch/okagent.install "$machinedir/"
-              chown -R builder:builder "$machinedir"
-              su builder -c "cd $machinedir && makepkg -f --noconfirm"
-              mv "$machinedir"/okagent-*.pkg.tar.zst /dist/
-            '
+        run: bash packaging/build-packages.sh arch
       - uses: actions/upload-artifact@v4
         with:
           name: arch
