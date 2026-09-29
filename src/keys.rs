@@ -99,11 +99,10 @@ mod tests {
     fn ed25519_pub_line_matches_python() {
         let g = goldens();
         let raw = RawPublicKey::Ed25519(hex32(g["pubkeys"]["ed25519_raw"].as_str().unwrap()));
-        let key = public_key(&raw, "<ssh://james@example.com|ed25519>").unwrap();
-        assert_eq!(
-            key.to_openssh().unwrap(),
-            g["pubkeys"]["ed25519_line"].as_str().unwrap()
-        );
+        let line = g["pubkeys"]["ed25519_line"].as_str().unwrap();
+        let comment = line.rsplit_once(' ').unwrap().1;
+        let key = public_key(&raw, comment).unwrap();
+        assert_eq!(key.to_openssh().unwrap(), line);
         assert_eq!(key.algorithm(), Algorithm::Ed25519);
     }
 
@@ -111,11 +110,10 @@ mod tests {
     fn p256_pub_line_matches_python() {
         let g = goldens();
         let raw = RawPublicKey::NistP256(hex64(g["pubkeys"]["p256_raw_xy"].as_str().unwrap()));
-        let key = public_key(&raw, "<ssh://james@example.com|nist256p1>").unwrap();
-        assert_eq!(
-            key.to_openssh().unwrap(),
-            g["pubkeys"]["p256_line"].as_str().unwrap()
-        );
+        let line = g["pubkeys"]["p256_line"].as_str().unwrap();
+        let comment = line.rsplit_once(' ').unwrap().1;
+        let key = public_key(&raw, comment).unwrap();
+        assert_eq!(key.to_openssh().unwrap(), line);
         assert_eq!(
             key.algorithm(),
             Algorithm::Ecdsa {

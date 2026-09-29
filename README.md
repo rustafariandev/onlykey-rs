@@ -99,6 +99,34 @@ agent forwarding (`-A`), so `okagent ssh -i git@github.com ferris@example.com
 -A` can run `git` on the remote host. Give `-i` before the identity, since a
 literal `-i` for ssh must be passed after `--`.
 
+A running agent can also be given keys on the fly. `ssh-add -s PROVIDER`
+adds one and `ssh-add -e PROVIDER` removes it again, where `PROVIDER` is
+either a bare `[user@]host` for a derived ed25519 key or a full key label as
+printed by `okagent pubkey`: `<ssh://[user@]host|curve[|slot]>`. The key is
+read from the OnlyKey when it is added, so `ssh-add -s` fails if the device
+is unavailable or the slot is empty. Answer the PIN prompt with an empty
+passphrase (or set `SSH_ASKPASS`). This is handy for long-lived agents and
+for adding a key while another one is already being served:
+
+```sh
+okagent serve ferris@example.com &
+ssh-add -s git@github.com                       # derived ed25519
+ssh-add -s '<ssh://old@example.com|rsa|RSA1>'   # stored RSA key
+ssh-add -L
+ssh-add -e git@github.com
+```
+
+If the key's public key is already known there is no need to read it from
+the device: start the agent with `--pubkey-file` and an add for one of those
+identities is served from the file, so `ssh-add -s` works with the OnlyKey
+unplugged. The provider string must match a label in the file exactly:
+
+```sh
+okagent pubkey git@github.com > ~/.ssh/onlykey.pub
+okagent serve --pubkey-file ~/.ssh/onlykey.pub ferris@example.com &
+ssh-add -s git@github.com                       # no device needed
+```
+
 ```sh
 okagent pubkey ferris@example.com >> authorized_keys   # copy to the server
 okagent ssh-copy-id ferris@example.com                 # ...or let ssh-copy-id do it
@@ -319,11 +347,18 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   `SSH_AGENTC_LOCK` and `SSH_AGENTC_UNLOCK` are implemented. `ssh-add -x`
   locks the agent with a passphrase (kept only as a salted hash) and until
   `ssh-add -X` unlocks it the agent lists no keys and refuses to sign; this
-  is separate from the OnlyKey's PIN. Extension requests get
-  `SSH_AGENT_EXTENSION_FAILURE` and the SSH protocol 1 listing an empty
-  `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's agent replies; everything
-  else, such as adding keys, gets a failure reply, which OpenSSH treats as
-  "unsupported".
+  is separate from the OnlyKey's PIN. `SSH_AGENTC_ADD_SMARTCARD_KEY` (and its
+  constrained form) backs `ssh-add -s`, which adds the identity named by the
+  provider string to a running agent; `SSH_AGENTC_REMOVE_SMARTCARD_KEY`
+  backs `ssh-add -e`. The key is derived and verified against the token when
+  it is added, so an absent device, an empty slot or a bad provider is
+  reported as `SSH_AGENT_FAILURE`. Only the lifetime constraint of
+  `ssh-add -s -t` is honoured; the provider's PIN and the confirm constraint
+  are ignored, and destination or certificate constraints are refused.
+  Extension requests get `SSH_AGENT_EXTENSION_FAILURE` and the SSH protocol
+  1 listing an empty `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's agent
+  replies; everything else, such as adding a private key directly, gets a
+  failure reply, which OpenSSH treats as "unsupported".
 
 Differences from the Python agent:
 

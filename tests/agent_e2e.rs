@@ -71,7 +71,7 @@ impl Drop for Harness {
 
 fn entries() -> Vec<KeySpec> {
     vec![
-        KeySpec::derived("james@example.com".parse().unwrap(), Curve::Ed25519),
+        KeySpec::derived("ferris@example.com".parse().unwrap(), Curve::Ed25519),
         KeySpec::derived("git@github.com".parse().unwrap(), Curve::NistP256),
     ]
 }
@@ -93,18 +93,18 @@ fn rsa(identity: &str, slot: u8) -> KeySpec {
 fn stored_entries() -> Vec<KeySpec> {
     vec![
         stored(
-            "james@example.com",
+            "ferris@example.com",
             Curve::Ed25519,
             common::STORED_ED25519_SLOT,
         ),
         stored("git@github.com", Curve::NistP256, common::STORED_P256_SLOT),
         stored("nobody@example.com", Curve::Ed25519, 110),
         stored(
-            "james@example.com",
+            "ferris@example.com",
             Curve::NistP256,
             common::STORED_ED25519_SLOT,
         ),
-        rsa("james@old.example.com", common::STORED_RSA_SLOT),
+        rsa("ferris@old.example.com", common::STORED_RSA_SLOT),
         rsa("nobody@example.com", 3),
     ]
 }
@@ -158,6 +158,103 @@ fn ssh_add_locks_and_unlocks_the_agent() {
     assert_eq!(h.challenges(), 0);
 }
 
+/// Run `ssh-add -s`/`-e` with `provider`, answering the PKCS#11 PIN prompt
+/// with an empty passphrase so no terminal is needed. Also works on OpenSSH
+/// versions without `-P`.
+fn ssh_add_card(h: &Harness, dir: &Path, flag: &str, provider: &str) -> bool {
+    let askpass = dir.join("askpass.sh");
+    std::fs::write(&askpass, "#!/bin/sh\necho\n").unwrap();
+    std::fs::set_permissions(
+        &askpass,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    h.cmd("ssh-add")
+        .arg(flag)
+        .arg(provider)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn ssh_add_smartcard_adds_removes_and_signs() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(listed_keys(&h), 0);
+
+    // A bare identity means a derived ed25519 key.
+    assert!(ssh_add_card(&h, dir.path(), "-s", "ferris@example.com"));
+    assert_eq!(listed_keys(&h), 1);
+    // Adding the same key again is a no-op that still succeeds.
+    assert!(ssh_add_card(&h, dir.path(), "-s", "ferris@example.com"));
+    assert_eq!(listed_keys(&h), 1);
+
+    // A full label selects the curve and a stored slot (ECC4 holds P-256).
+    assert!(ssh_add_card(
+        &h,
+        dir.path(),
+        "-s",
+        "<ssh://git@github.com|nist256p1|ECC4>"
+    ));
+    assert_eq!(listed_keys(&h), 2);
+
+    // The added key really signs.
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with("<ssh://ferris@example.com|ed25519>"))
+        .expect("added key is listed");
+    sign_and_check(&h, dir.path(), line, "added-ed25519");
+
+    // `ssh-add -e` takes the keys away again.
+    assert!(ssh_add_card(&h, dir.path(), "-e", "ferris@example.com"));
+    assert_eq!(listed_keys(&h), 1);
+    assert!(ssh_add_card(
+        &h,
+        dir.path(),
+        "-e",
+        "<ssh://git@github.com|nist256p1|ECC4>"
+    ));
+    assert_eq!(listed_keys(&h), 0);
+    assert!(!ssh_add_card(&h, dir.path(), "-e", "ferris@example.com"));
+}
+
+#[test]
+fn ssh_add_smartcard_honours_a_lifetime() {
+    if !have("ssh-add") {
+        eprintln!("ssh-add not installed; skipping");
+        return;
+    }
+    let h = Harness::start(Vec::new());
+    // The constrained request (ssh-add -t) is accepted and the key is served.
+    assert!(
+        h.cmd("ssh-add")
+            .args(["-t", "60", "-s", "ferris@example.com"])
+            .env("SSH_ASKPASS", "/bin/true")
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", ":0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(listed_keys(&h), 1);
+}
+
 fn have(tool: &str) -> bool {
     Command::new(tool)
         .arg("-V")
@@ -181,7 +278,7 @@ fn ssh_add_lists_both_keys() {
     assert_eq!(lines.len(), 2, "{text}");
     assert!(
         lines[0].starts_with("ssh-ed25519 ")
-            && lines[0].ends_with("<ssh://james@example.com|ed25519>")
+            && lines[0].ends_with("<ssh://ferris@example.com|ed25519>")
     );
     assert!(
         lines[1].starts_with("ecdsa-sha2-nistp256 ")
@@ -246,7 +343,7 @@ fn ssh_keygen_signs_with_both_curves() {
     sign_and_check(&h, dir.path(), lines[1], "p256");
     let shown = h.sink.0.lock().unwrap();
     assert_eq!(shown.len(), 2);
-    assert_eq!(shown[0].identity, "james@example.com");
+    assert_eq!(shown[0].identity, "ferris@example.com");
     assert_eq!(
         shown[0].subject.as_deref(),
         Some("signature in namespace \"okagent-test\"")
@@ -269,7 +366,7 @@ fn stored_keys_are_listed_and_sign_without_identity_hash() {
     assert_eq!(lines.len(), 3, "unusable slots must be skipped: {text}");
     assert!(
         lines[0].starts_with("ssh-ed25519 ")
-            && lines[0].ends_with("<ssh://james@example.com|ed25519|ECC3>"),
+            && lines[0].ends_with("<ssh://ferris@example.com|ed25519|ECC3>"),
         "{}",
         lines[0]
     );
@@ -281,7 +378,7 @@ fn stored_keys_are_listed_and_sign_without_identity_hash() {
     );
     assert!(
         lines[2].starts_with("ssh-rsa ")
-            && lines[2].ends_with("<ssh://james@old.example.com|rsa|RSA1>"),
+            && lines[2].ends_with("<ssh://ferris@old.example.com|rsa|RSA1>"),
         "{}",
         lines[2]
     );
@@ -304,7 +401,7 @@ fn stored_keys_are_listed_and_sign_without_identity_hash() {
     sign_and_check(&h, dir.path(), lines[2], "stored-rsa");
     let shown = h.sink.0.lock().unwrap();
     assert_eq!(shown.len(), 3);
-    assert_eq!(shown[0].identity, "james@example.com");
+    assert_eq!(shown[0].identity, "ferris@example.com");
     assert_eq!(
         shown[0].source,
         KeySource::Stored(Slot::Ecc(EccSlot::new(3).unwrap()))
@@ -325,7 +422,7 @@ fn stored_keys_are_listed_and_sign_without_identity_hash() {
 /// token only signs SHA-2 digests.
 #[test]
 fn rsa_key_refuses_sha1_signature_requests() {
-    let h = Harness::start(vec![rsa("james@old.example.com", common::STORED_RSA_SLOT)]);
+    let h = Harness::start(vec![rsa("ferris@old.example.com", common::STORED_RSA_SLOT)]);
     let reply = roundtrip(&h.socket, &[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
     let mut r = &reply[5..];
     let blob = Vec::<u8>::decode(&mut r).unwrap();

@@ -547,6 +547,33 @@ impl KeySpec {
         };
         Ok(KeySpec { identity, kind })
     }
+
+    /// Parse a key named by a single string: a full label as written by
+    /// [`Self::label`] (`<ssh://[user@]host|curve[|slot]>`), or a bare
+    /// `[user@]host`, which stands for a derived ed25519 key. Surrounding
+    /// whitespace is ignored. This is how `ssh-add -s` names a key.
+    ///
+    /// A bare form must be a plausible host: no whitespace or angle brackets,
+    /// so that a mistyped or non-okagent provider string is rejected rather
+    /// than silently turned into an identity the token cannot serve.
+    pub fn parse_arg(s: &str) -> Result<Self, IdentityError> {
+        let trimmed = s.trim();
+        if trimmed.starts_with('<') {
+            return Self::from_label(trimmed);
+        }
+        let bad = || IdentityError::BadLabel(s.to_owned());
+        if trimmed.is_empty()
+            || trimmed
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '<' | '>'))
+        {
+            return Err(bad());
+        }
+        Ok(KeySpec::derived(
+            trimmed.parse::<Identity>().map_err(|_| bad())?,
+            Curve::Ed25519,
+        ))
+    }
 }
 
 /// The `[user@]host` pair that names a derived key.
@@ -740,7 +767,7 @@ mod tests {
 
     #[test]
     fn key_spec_slots_and_messages() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let derived = KeySpec::derived(id.clone(), Curve::NistP256);
         assert_eq!(derived.pubkey_slot(), 132);
         assert_eq!(derived.pubkey_tag(), 0x02);
@@ -758,7 +785,7 @@ mod tests {
             want
         );
         assert_eq!(derived_ed.max_blob_len(), Some(709));
-        assert_eq!(derived.label(), "<ssh://james@example.com|nist256p1>");
+        assert_eq!(derived.label(), "<ssh://ferris@example.com|nist256p1>");
         assert_eq!(derived.kind.to_string(), "derived nistp256");
         assert_eq!(
             derived.kind.signature_algorithm(HashAlg::Sha512),
@@ -783,7 +810,7 @@ mod tests {
             Sha256::digest(b"abc").to_vec()
         );
         assert_eq!(stored_p256.max_blob_len(), None);
-        assert_eq!(stored.label(), "<ssh://james@example.com|ed25519|ECC3>");
+        assert_eq!(stored.label(), "<ssh://ferris@example.com|ed25519|ECC3>");
         assert_eq!(stored.source().to_string(), "ECC3");
         assert_eq!(stored.kind.to_string(), "ed25519 in ECC3");
         assert_eq!(KeySource::Derived.to_string(), "derived");
@@ -800,7 +827,7 @@ mod tests {
         );
         assert_eq!(rsa.sign_message(b"abc", HashAlg::Sha512).unwrap().len(), 64);
         assert_eq!(rsa.max_blob_len(), None);
-        assert_eq!(rsa.label(), "<ssh://james@example.com|rsa|RSA2>");
+        assert_eq!(rsa.label(), "<ssh://ferris@example.com|rsa|RSA2>");
         assert_eq!(rsa.source().to_string(), "RSA2");
         assert_eq!(rsa.kind.to_string(), "rsa in RSA2");
         assert_eq!(rsa.kind.public_algorithm(), Algorithm::Rsa { hash: None });
@@ -814,8 +841,8 @@ mod tests {
 
     #[test]
     fn port_is_kept_apart_from_the_identity() {
-        let (id, port) = Identity::parse_with_port("ssh://james@example.com:2222/x").unwrap();
-        assert_eq!(id.to_string(), "james@example.com");
+        let (id, port) = Identity::parse_with_port("ssh://ferris@example.com:2222/x").unwrap();
+        assert_eq!(id.to_string(), "ferris@example.com");
         assert_eq!(port, Some(2222));
         assert_eq!(
             Identity::parse_with_port("example.com").unwrap(),
@@ -824,8 +851,8 @@ mod tests {
         assert_eq!(Identity::parse_with_port("example.com:").unwrap().1, None);
         // The port never changes the derived key.
         assert_eq!(
-            "james@example.com:2222".parse::<Identity>().unwrap(),
-            "james@example.com".parse::<Identity>().unwrap()
+            "ferris@example.com:2222".parse::<Identity>().unwrap(),
+            "ferris@example.com".parse::<Identity>().unwrap()
         );
         for bad in [
             "example.com:abc",
@@ -852,7 +879,7 @@ mod tests {
 
     #[test]
     fn label_round_trips_through_from_label() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let specs = [
             KeySpec::derived(id.clone(), Curve::Ed25519),
             KeySpec::derived(id.clone(), Curve::NistP256),
@@ -868,18 +895,18 @@ mod tests {
             );
         }
         assert_eq!(
-            KeySpec::from_label(" <ssh://james@example.com|ed25519> ").unwrap(),
+            KeySpec::from_label(" <ssh://ferris@example.com|ed25519> ").unwrap(),
             specs[0]
         );
         for bad in [
             "",
-            "james@example.com",
-            "<ssh://james@example.com>",
-            "<ssh://james@example.com|secp256k1>",
-            "<ssh://james@example.com|ed25519|RSA1>",
-            "<ssh://james@example.com|rsa>",
-            "<ssh://james@example.com|rsa|ECC3>",
-            "<ssh://james@example.com|ed25519|ECC3|x>",
+            "ferris@example.com",
+            "<ssh://ferris@example.com>",
+            "<ssh://ferris@example.com|secp256k1>",
+            "<ssh://ferris@example.com|ed25519|RSA1>",
+            "<ssh://ferris@example.com|rsa>",
+            "<ssh://ferris@example.com|rsa|ECC3>",
+            "<ssh://ferris@example.com|ed25519|ECC3|x>",
             "<ssh://|ed25519>",
         ] {
             assert!(KeySpec::from_label(bad).is_err(), "{bad}");
@@ -887,15 +914,60 @@ mod tests {
     }
 
     #[test]
+    fn parse_arg_accepts_labels_and_bare_identities() {
+        let bare: Identity = "ferris@example.com".parse().unwrap();
+        assert_eq!(
+            KeySpec::parse_arg("ferris@example.com").unwrap(),
+            KeySpec::derived(bare.clone(), Curve::Ed25519)
+        );
+        assert_eq!(
+            KeySpec::parse_arg(" example.com ").unwrap(),
+            KeySpec::derived("example.com".parse().unwrap(), Curve::Ed25519)
+        );
+        assert_eq!(
+            KeySpec::parse_arg("<ssh://ferris@example.com|ed25519|ECC3>").unwrap(),
+            KeySpec::stored(bare, Curve::Ed25519, EccSlot::new(3).unwrap())
+        );
+        assert_eq!(
+            KeySpec::parse_arg("<ssh://ferris@example.com|rsa|RSA1>").unwrap(),
+            KeySpec::rsa(
+                "ferris@example.com".parse().unwrap(),
+                RsaSlot::new(1).unwrap()
+            )
+        );
+        for bad in ["", "<ssh://ferris@example.com>", "<ssh://|ed25519>"] {
+            assert!(KeySpec::parse_arg(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_arg_rejects_junk_providers() {
+        for bad in [
+            "",
+            "   ",
+            "not a valid <label>",
+            "has space",
+            "a<b",
+            "a>b",
+            "user@",
+            "ssh://",
+        ] {
+            assert!(KeySpec::parse_arg(bad).is_err(), "{bad:?}");
+        }
+        // A colon-port form is still a plausible identity, even if odd.
+        assert!(KeySpec::parse_arg("host:22").is_ok());
+    }
+
+    #[test]
     fn label_matches_python_comment() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         assert_eq!(
             id.label(Curve::Ed25519),
-            "<ssh://james@example.com|ed25519>"
+            "<ssh://ferris@example.com|ed25519>"
         );
         assert_eq!(
             id.label(Curve::NistP256),
-            "<ssh://james@example.com|nist256p1>"
+            "<ssh://ferris@example.com|nist256p1>"
         );
         assert!(!id.is_transliterated());
         let id: Identity = "jämes@example.com".parse().unwrap();

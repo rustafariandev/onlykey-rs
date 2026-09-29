@@ -4,21 +4,21 @@
 //! curve = "ed25519"            # default curve for identities below and on the command line
 //! notify-command = "notify-send OnlyKey"
 //! socket = "/run/user/1000/okagent/agent.sock"
-//! log-file = "/home/james/.local/state/okagent.log"
+//! log-file = "/home/ferris/.local/state/okagent.log"
 //!
 //! [[identity]]
-//! name = "james@example.com"
+//! name = "ferris@example.com"
 //!
 //! [[identity]]
 //! name = "git@github.com"
 //! curve = "nistp256"
 //!
 //! [[identity]]
-//! name = "james@legacy.example.com"
+//! name = "ferris@legacy.example.com"
 //! slot = "ECC3"                # key stored in the token by the OnlyKey app
 //!
 //! [[identity]]
-//! name = "james@old.example.com"
+//! name = "ferris@old.example.com"
 //! slot = "RSA1"                # RSA keys take no curve
 //! ```
 
@@ -139,19 +139,19 @@ mod tests {
             socket = "/tmp/x.sock"
             log-file = "/tmp/okagent.log"
             [[identity]]
-            name = "james@example.com"
+            name = "ferris@example.com"
             [[identity]]
             name = "git@github.com"
             curve = "ed25519"
             [[identity]]
-            name = "james@legacy.example.com"
+            name = "ferris@legacy.example.com"
             slot = "ECC3"
             [[identity]]
-            name = "james@other.example.com"
+            name = "ferris@other.example.com"
             curve = "ed25519"
             slot = 4
             [[identity]]
-            name = "james@old.example.com"
+            name = "ferris@old.example.com"
             slot = "RSA1"
             "#,
         )
@@ -179,7 +179,10 @@ mod tests {
             }
         );
         assert_eq!(entries[4].kind, KeyKind::StoredRsa("RSA1".parse().unwrap()));
-        assert_eq!(entries[4].label(), "<ssh://james@old.example.com|rsa|RSA1>");
+        assert_eq!(
+            entries[4].label(),
+            "<ssh://ferris@old.example.com|rsa|RSA1>"
+        );
 
         let cfg =
             Config::parse("[[identity]]\nname = \"a@b\"\nslot = \"RSA2\"\ncurve = \"ed25519\"")

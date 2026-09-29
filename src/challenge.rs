@@ -12,7 +12,7 @@ use std::process::Command;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Challenge {
     pub digits: [u8; 3],
-    /// Identity whose key is being used, e.g. `james@example.com`.
+    /// Identity whose key is being used, e.g. `ferris@example.com`.
     pub identity: String,
     /// Whether the key is derived from the identity or stored in a slot.
     pub source: KeySource,
@@ -138,13 +138,13 @@ mod tests {
     fn message_mentions_digits_identity_and_subject() {
         let c = Challenge {
             digits: [3, 1, 5],
-            identity: "james@example.com".into(),
+            identity: "ferris@example.com".into(),
             source: KeySource::Derived,
             subject: Some("ssh login to host".into()),
         };
         let m = c.message();
         assert!(m.contains("3 1 5"));
-        assert!(m.contains("james@example.com"));
+        assert!(m.contains("ferris@example.com"));
         assert!(m.contains("(ssh login to host)"));
         assert!(!m.contains("stored key"));
         let stored = Challenge {
@@ -154,7 +154,7 @@ mod tests {
         assert!(
             stored
                 .message()
-                .contains("sign as james@example.com with stored key ECC3 (ssh login to host)")
+                .contains("sign as ferris@example.com with stored key ECC3 (ssh login to host)")
         );
     }
 

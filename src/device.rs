@@ -397,18 +397,18 @@ mod tests {
 
     fn rsa(slot: u8) -> KeySpec {
         KeySpec::rsa(
-            "james@example.com".parse().unwrap(),
+            "ferris@example.com".parse().unwrap(),
             RsaSlot::new(slot).unwrap(),
         )
     }
 
     fn derived(curve: Curve) -> KeySpec {
-        KeySpec::derived("james@example.com".parse().unwrap(), curve)
+        KeySpec::derived("ferris@example.com".parse().unwrap(), curve)
     }
 
     fn stored(curve: Curve, slot: u8) -> KeySpec {
         KeySpec::stored(
-            "james@example.com".parse().unwrap(),
+            "ferris@example.com".parse().unwrap(),
             curve,
             EccSlot::new(slot).unwrap(),
         )
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn derive_public_key_round_trip() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let mut key_report = [0u8; 64];
         key_report[..32].copy_from_slice(&[0x42; 32]);
         let t = ScriptedTransport::new(vec![
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn stored_public_key_uses_slot_and_checks_curve() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let mut ed_report = [0u8; 64];
         ed_report[..32].copy_from_slice(&[0x42; 32]);
         let p256_report: Report = std::array::from_fn(|i| 0x37 ^ i as u8);
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn sign_sends_chunks_and_presents_challenge() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let blob = vec![7u8; 100];
         let mut message = blob.clone();
         message.extend_from_slice(&id.derivation_hash());
@@ -597,7 +597,7 @@ mod tests {
         let shown = sink.0.lock().unwrap();
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].digits, challenge_digits(&message, "v3.0.4-prodc"));
-        assert_eq!(shown[0].identity, "james@example.com");
+        assert_eq!(shown[0].identity, "ferris@example.com");
         assert_eq!(shown[0].source, KeySource::Derived);
         ok.into_transport().assert_done();
     }
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn rsa_public_key_collects_reports_until_silence() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let hash = id.derivation_hash();
         let four = numbered_reports(4, 0x30);
         let eight = numbered_reports(8, 0x90);
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn firmware_errors_are_translated() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         type Check = fn(&DeviceError) -> bool;
         let cases: [(&str, Check); 3] = [
             ("Error incorrect challenge was entered", |e| {
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn silence_times_out() {
-        let id: Identity = "james@example.com".parse().unwrap();
+        let id: Identity = "ferris@example.com".parse().unwrap();
         let t = ScriptedTransport::new(vec![
             Step::ExpectWrite(protocol::settime_report(1)),
             Step::Reply(text("UNLOCKEDv3.0.4-prodc")),

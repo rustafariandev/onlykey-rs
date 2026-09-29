@@ -15,10 +15,22 @@ pub const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
+/// `ssh-add -s`: add a key named by a provider string.
+pub const SSH_AGENTC_ADD_SMARTCARD_KEY: u8 = 20;
+/// `ssh-add -e`: remove a key named by a provider string.
+pub const SSH_AGENTC_REMOVE_SMARTCARD_KEY: u8 = 21;
 pub const SSH_AGENTC_LOCK: u8 = 22;
 pub const SSH_AGENTC_UNLOCK: u8 = 23;
+/// `ssh-add -s` with `-t`/`-c`/certificates: an add carrying constraints.
+pub const SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
 pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
+/// Constraint on `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED`: a lifetime.
+pub const SSH_AGENT_CONSTRAIN_LIFETIME: u8 = 1;
+/// Constraint on `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED`: confirm each use.
+pub const SSH_AGENT_CONSTRAIN_CONFIRM: u8 = 2;
+/// Constraint carrying a named extension (destination constraints, certs).
+pub const SSH_AGENT_CONSTRAIN_EXTENSION: u8 = 255;
 /// Sign request flags asking for `rsa-sha2-256` / `rsa-sha2-512`.
 pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
@@ -45,6 +57,10 @@ pub enum WireError {
     Empty,
     #[error("malformed request: {0}")]
     Malformed(#[from] ssh_encoding::Error),
+    #[error("unsupported key constraint {0:#04x}")]
+    UnsupportedConstraint(u8),
+    #[error("unsupported key constraint extension {0:?}")]
+    UnsupportedExtension(String),
     #[error("frame of {0} bytes exceeds the {MAX_FRAME}-byte limit")]
     FrameTooLarge(usize),
 }
@@ -64,6 +80,19 @@ pub enum Request {
     Lock(Vec<u8>),
     /// `ssh-add -X`: unlock it again.
     Unlock(Vec<u8>),
+    /// `ssh-add -s`: add the key named by `provider`. `lifetime` is the
+    /// constraint from `ssh-add -t` (seconds), if any; `pin` and `confirm`
+    /// are accepted but unused.
+    AddSmartcardKey {
+        provider: Vec<u8>,
+        pin: Vec<u8>,
+        lifetime: Option<u32>,
+        confirm: bool,
+    },
+    /// `ssh-add -e`: remove the key named by `provider`.
+    RemoveSmartcardKey {
+        provider: Vec<u8>,
+    },
     /// A protocol extension; none are implemented.
     Extension,
     /// Any message type this agent does not implement.
@@ -76,6 +105,36 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
     match kind {
         SSH_AGENTC_REQUEST_RSA_IDENTITIES => Ok(Request::RequestRsaIdentities),
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
+        SSH_AGENTC_ADD_SMARTCARD_KEY => {
+            let provider = Vec::<u8>::decode(&mut rest)?;
+            let pin = Vec::<u8>::decode(&mut rest)?;
+            Ok(Request::AddSmartcardKey {
+                provider,
+                pin,
+                lifetime: None,
+                confirm: false,
+            })
+        }
+        SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => {
+            let provider = Vec::<u8>::decode(&mut rest)?;
+            let pin = Vec::<u8>::decode(&mut rest)?;
+            let (lifetime, confirm) = parse_constraints(&mut rest)?;
+            Ok(Request::AddSmartcardKey {
+                provider,
+                pin,
+                lifetime,
+                confirm,
+            })
+        }
+        SSH_AGENTC_REMOVE_SMARTCARD_KEY => {
+            let provider = Vec::<u8>::decode(&mut rest)?;
+            // OpenSSH's client also sends the (empty) PIN; older clients did
+            // not, so tolerate a missing trailing string.
+            if !rest.is_empty() {
+                let _pin = Vec::<u8>::decode(&mut rest)?;
+            }
+            Ok(Request::RemoveSmartcardKey { provider })
+        }
         SSH_AGENTC_LOCK => Ok(Request::Lock(Vec::<u8>::decode(&mut rest)?)),
         SSH_AGENTC_UNLOCK => Ok(Request::Unlock(Vec::<u8>::decode(&mut rest)?)),
         SSH_AGENTC_EXTENSION => Ok(Request::Extension),
@@ -91,6 +150,28 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
         }
         other => Ok(Request::Unsupported(other)),
     }
+}
+
+/// Decode the constraint list that follows the provider and PIN of a
+/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` request. Only the lifetime and
+/// confirm constraints are understood; anything else (destination
+/// constraints, associated certificates) is rejected so it is not silently
+/// dropped.
+fn parse_constraints(rest: &mut &[u8]) -> Result<(Option<u32>, bool), WireError> {
+    let mut lifetime = None;
+    let mut confirm = false;
+    while !rest.is_empty() {
+        let kind = u8::decode(rest)?;
+        match kind {
+            SSH_AGENT_CONSTRAIN_LIFETIME => lifetime = Some(u32::decode(rest)?),
+            SSH_AGENT_CONSTRAIN_CONFIRM => confirm = true,
+            SSH_AGENT_CONSTRAIN_EXTENSION => {
+                return Err(WireError::UnsupportedExtension(String::decode(rest)?));
+            }
+            other => return Err(WireError::UnsupportedConstraint(other)),
+        }
+    }
+    Ok((lifetime, confirm))
 }
 
 /// `SSH2_AGENT_IDENTITIES_ANSWER` listing `keys` with their comments.
@@ -258,6 +339,76 @@ mod tests {
     }
 
     #[test]
+    fn smartcard_add_and_remove_requests() {
+        let mut body = vec![SSH_AGENTC_ADD_SMARTCARD_KEY];
+        b"ferris@example.com".as_slice().encode(&mut body).unwrap();
+        b"pin".as_slice().encode(&mut body).unwrap();
+        assert_eq!(
+            parse_request(&body).unwrap(),
+            Request::AddSmartcardKey {
+                provider: b"ferris@example.com".to_vec(),
+                pin: b"pin".to_vec(),
+                lifetime: None,
+                confirm: false,
+            }
+        );
+
+        let mut constrained = body.clone();
+        constrained[0] = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED;
+        SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut constrained)
+            .unwrap();
+        60u32.encode(&mut constrained).unwrap();
+        SSH_AGENT_CONSTRAIN_CONFIRM
+            .encode(&mut constrained)
+            .unwrap();
+        assert_eq!(
+            parse_request(&constrained).unwrap(),
+            Request::AddSmartcardKey {
+                provider: b"ferris@example.com".to_vec(),
+                pin: b"pin".to_vec(),
+                lifetime: Some(60),
+                confirm: true,
+            }
+        );
+
+        let mut extension = body.clone();
+        extension[0] = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED;
+        SSH_AGENT_CONSTRAIN_EXTENSION
+            .encode(&mut extension)
+            .unwrap();
+        "restrict-destination-v00@openssh.com"
+            .encode(&mut extension)
+            .unwrap();
+        assert!(matches!(
+            parse_request(&extension),
+            Err(WireError::UnsupportedExtension(_))
+        ));
+
+        let mut unknown = body.clone();
+        unknown[0] = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED;
+        9u8.encode(&mut unknown).unwrap();
+        assert!(matches!(
+            parse_request(&unknown),
+            Err(WireError::UnsupportedConstraint(9))
+        ));
+
+        let mut remove = vec![SSH_AGENTC_REMOVE_SMARTCARD_KEY];
+        b"ferris@example.com"
+            .as_slice()
+            .encode(&mut remove)
+            .unwrap();
+        b"".as_slice().encode(&mut remove).unwrap();
+        let want = Request::RemoveSmartcardKey {
+            provider: b"ferris@example.com".to_vec(),
+        };
+        assert_eq!(parse_request(&remove).unwrap(), want);
+        // A missing trailing PIN is tolerated for older clients.
+        remove.truncate(remove.len() - 4);
+        assert_eq!(parse_request(&remove).unwrap(), want);
+    }
+
+    #[test]
     fn unknown_and_empty_requests() {
         assert_eq!(
             parse_request(&[17, 1, 2]).unwrap(),
@@ -318,12 +469,12 @@ mod tests {
         let mut blob = Vec::new();
         [1u8; 32].as_slice().encode(&mut blob).unwrap();
         50u8.encode(&mut blob).unwrap();
-        "james".encode(&mut blob).unwrap();
+        "ferris".encode(&mut blob).unwrap();
         "ssh-connection".encode(&mut blob).unwrap();
         "publickey".encode(&mut blob).unwrap();
         assert_eq!(
             describe_data(&blob).unwrap(),
-            "ssh-connection login as \"james\""
+            "ssh-connection login as \"ferris\""
         );
 
         let mut sshsig = b"SSHSIG".to_vec();

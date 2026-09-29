@@ -2,7 +2,7 @@
 //! slot.
 //!
 //! ```sh
-//! cargo run --example pubkey -- james@example.com [ed25519|nistp256] [ECC3|RSA1]
+//! cargo run --example pubkey -- ferris@example.com [ed25519|nistp256] [ECC3|RSA1]
 //! ```
 
 use onlykey_agent::{Curve, KeyKind, KeySpec, OnlyKey, Slot};

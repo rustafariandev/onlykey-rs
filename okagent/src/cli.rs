@@ -564,9 +564,9 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     let agent = ctx.agent(&id_args.base, &id_args.additional)?;
     let primary = agent
         .entries()
-        .first()
-        .ok_or_else(|| anyhow!("no identities given"))?
-        .clone();
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no identities given"))?;
     let key = agent.derive_one(&primary)?;
     let dir = tempfile::tempdir()?;
     let pub_path = dir.path().join("id.pub");
@@ -700,18 +700,18 @@ mod tests {
     #[test]
     fn entries_come_from_labels_in_order_without_duplicates() {
         let keys = [
-            key("<ssh://james@example.com|ed25519>"),
-            key("james@laptop"),
-            key("<ssh://james@example.com|nist256p1>"),
+            key("<ssh://ferris@example.com|ed25519>"),
+            key("ferris@laptop"),
+            key("<ssh://ferris@example.com|nist256p1>"),
             key("<ssh://git@github.com|ed25519|ECC3>"),
-            key("<ssh://james@example.com|ed25519>"),
+            key("<ssh://ferris@example.com|ed25519>"),
         ];
         let entries = entries_from_keys(&keys);
         let labels: Vec<String> = entries.iter().map(KeySpec::label).collect();
         assert_eq!(
             labels,
             [
-                "<ssh://james@example.com|ed25519>",
+                "<ssh://ferris@example.com|ed25519>",
                 "<ssh://git@github.com|ed25519|ECC3>"
             ]
         );
@@ -787,7 +787,7 @@ mod tests {
             "ssh",
             "key@identity.example",
             "--host",
-            "james@server.example:2222",
+            "ferris@server.example:2222",
             "-o",
             "BatchMode=yes",
         ])
@@ -796,12 +796,12 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.identity, "key@identity.example");
-        assert_eq!(args.host.as_deref(), Some("james@server.example:2222"));
+        assert_eq!(args.host.as_deref(), Some("ferris@server.example:2222"));
         assert_eq!(args.args, vec!["-o".to_owned(), "BatchMode=yes".to_owned()]);
 
         let identity: Identity = "key@identity.example".parse().unwrap();
         let (dest, port) = destination(&identity, None, args.host.as_deref()).unwrap();
-        assert_eq!(dest.to_string(), "james@server.example");
+        assert_eq!(dest.to_string(), "ferris@server.example");
         assert_eq!(port, Some(2222));
 
         // A --host without a user keeps the identity's user, but a --host
@@ -841,13 +841,13 @@ mod tests {
     fn pubkey_file_skips_blanks_and_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.pub");
-        let line = key("<ssh://james@example.com|ed25519>")
+        let line = key("<ssh://ferris@example.com|ed25519>")
             .to_openssh()
             .unwrap();
         std::fs::write(&path, format!("# exported\n\n{line}\n")).unwrap();
         let keys = read_pubkey_file(&path).unwrap();
         assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].comment(), "<ssh://james@example.com|ed25519>");
+        assert_eq!(keys[0].comment(), "<ssh://ferris@example.com|ed25519>");
         std::fs::write(&path, "not a key\n").unwrap();
         assert!(read_pubkey_file(&path).is_err());
         assert!(read_pubkey_file(&dir.path().join("missing")).is_err());

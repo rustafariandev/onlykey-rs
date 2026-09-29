@@ -2,7 +2,7 @@
 //! after the user confirms the challenge on the device.
 //!
 //! ```sh
-//! echo -n hello | cargo run --example sign -- james@example.com
+//! echo -n hello | cargo run --example sign -- ferris@example.com
 //! ```
 
 use onlykey_agent::challenge::TtyPrompt;

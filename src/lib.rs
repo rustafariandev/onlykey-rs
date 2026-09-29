@@ -2,7 +2,7 @@
 //! and sign with them, and run an SSH agent on top of that.
 //!
 //! The OnlyKey derives a key pair on the device from an identity string such
-//! as `james@example.com`; the private key never leaves the token, and every
+//! as `ferris@example.com`; the private key never leaves the token, and every
 //! signature must be confirmed by entering a 3-digit challenge on its buttons.
 //! Given the same identity and curve this crate derives exactly the same
 //! public key as the Python `onlykey-agent`. Keys written into one of the
@@ -16,7 +16,7 @@
 //! use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let key = KeySpec::derived("james@example.com".parse()?, Curve::Ed25519);
+//! let key = KeySpec::derived("ferris@example.com".parse()?, Curve::Ed25519);
 //! let mut device = OnlyKey::open()?;           // finds the token, syncs its clock
 //! let public = device.ssh_public_key(&key)?;
 //! println!("{}", public.to_openssh()?);       // authorized_keys line
@@ -27,9 +27,9 @@
 //! assert_eq!(sig.algorithm(), onlykey_agent::ssh_key::Algorithm::Ed25519);
 //!
 //! // Keys the OnlyKey app wrote into slots ECC3 and RSA1, named after the same identity.
-//! let stored = KeySpec::stored("james@example.com".parse()?, Curve::Ed25519, "ECC3".parse()?);
+//! let stored = KeySpec::stored("ferris@example.com".parse()?, Curve::Ed25519, "ECC3".parse()?);
 //! println!("{}", device.ssh_public_key(&stored)?.to_openssh()?);
-//! let rsa = KeySpec::rsa("james@example.com".parse()?, "RSA1".parse()?);
+//! let rsa = KeySpec::rsa("ferris@example.com".parse()?, "RSA1".parse()?);
 //! println!("{}", device.ssh_public_key(&rsa)?.to_openssh()?);
 //! # Ok(()) }
 //! ```
@@ -42,7 +42,7 @@
 //! use std::sync::{Arc, atomic::AtomicBool};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let entries = vec![KeySpec::derived("james@example.com".parse()?, Curve::Ed25519)];
+//! let entries = vec![KeySpec::derived("ferris@example.com".parse()?, Curve::Ed25519)];
 //! let opener: Opener = Arc::new(|| Ok(OnlyKey::open()?.boxed()));
 //! let agent = Arc::new(Agent::new(entries, opener, Arc::new(TtyPrompt)));
 //!

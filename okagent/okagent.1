@@ -96,7 +96,7 @@ No key material is stored on the host: for every operation the token
 re-derives the key from an
 .I identity
 string such as
-.BR james@example.com ,
+.BR ferris@example.com ,
 and every signature must be confirmed on the device by entering a
 three-digit challenge on its buttons.
 .PP
@@ -135,13 +135,43 @@ lists them (see
 or when a public key file names them (see
 .BR \-\-pubkey\-file ).
 .PP
-The agent implements only the
-.I request identities
+The agent implements the
+.IR "request identities" ,
+.IR "sign request" ,
+.I add
 and
-.I sign request
+.I remove
 operations of the SSH agent protocol.
-Adding or removing keys is refused, which OpenSSH reports as
-unsupported.
+.BR "ssh-add \-s " provider
+adds one key to a running agent, and
+.BR "ssh-add \-e " provider
+removes it again, without restarting the agent.
+The
+.I provider
+is either a bare
+.RI [ user @] host
+for a derived ed25519 key, or a full key label as printed by
+.BR "pubkey" :
+.BI <ssh:// identity | curve [| slot ]>.
+The key is read from the OnlyKey when it is added, so an absent or locked
+device, an empty slot or an unparsable
+.I provider
+is reported as
+.BR SSH_AGENT_FAILURE .
+If the key's public key is already known, though, the device is not touched:
+start the agent with
+.B \-\-pubkey\-file
+and adding one of those identities is served from the file, so
+.B ssh-add \-s
+succeeds even while the OnlyKey is unplugged.
+Answer the PKCS#11 PIN prompt with an empty passphrase.
+The lifetime constraint of
+.B ssh-add \-s \-t
+is honoured; the PIN and the confirm constraint are ignored, and destination
+or certificate constraints are refused.
+Adding a private key directly
+.RB ( SSH2_AGENTC_ADD_IDENTITY )
+is still refused, as is anything else not listed here.
 .B ssh-add \-x
 locks the agent with a passphrase: until
 .B ssh-add \-X
@@ -498,7 +528,7 @@ writes a line such as
 .PP
 .RS
 .EX
-OnlyKey: enter 3 1 5 to sign as james@example.com (ssh-connection login as "james"), or press any button if challenge mode is off
+OnlyKey: enter 3 1 5 to sign as ferris@example.com (ssh-connection login as "ferris"), or press any button if challenge mode is off
 .EE
 .RE
 .PP
@@ -610,22 +640,22 @@ Example:
 curve = "ed25519"
 notify-command = "notify-send OnlyKey"
 # socket = "/run/user/1000/okagent/agent.sock"
-# pubkey-file = "/home/james/.ssh/onlykey.pub"
-# log-file = "/home/james/.local/state/okagent.log"
+# pubkey-file = "/home/ferris/.ssh/onlykey.pub"
+# log-file = "/home/ferris/.local/state/okagent.log"
 
 [[identity]]
-name = "james@example.com"
+name = "ferris@example.com"
 
 [[identity]]
 name = "git@github.com"
 curve = "nistp256"
 
 [[identity]]
-name = "james@legacy.example.com"
+name = "ferris@legacy.example.com"
 slot = "ECC3"
 
 [[identity]]
-name = "james@old.example.com"
+name = "ferris@old.example.com"
 slot = "RSA1"
 .EE
 .RE
@@ -717,10 +747,10 @@ Publish a key and log in with it:
 .PP
 .RS
 .EX
-okagent pubkey james@example.com >> ~/.ssh/authorized_keys.example.com
-okagent ssh-copy-id james@example.com
-okagent ssh james@example.com
-okagent run james@example.com \-\- ssh example.com
+okagent pubkey ferris@example.com >> ~/.ssh/authorized_keys.example.com
+okagent ssh-copy-id ferris@example.com
+okagent ssh ferris@example.com
+okagent run ferris@example.com \-\- ssh example.com
 .EE
 .RE
 .PP
@@ -728,7 +758,7 @@ Sign as one identity but connect to another server:
 .PP
 .RS
 .EX
-okagent ssh james@example.com \-\-host admin@server.example.com
+okagent ssh ferris@example.com \-\-host admin@server.example.com
 .EE
 .RE
 .PP
@@ -745,8 +775,8 @@ Use an ed25519 key that the OnlyKey app stored in slot 3:
 .PP
 .RS
 .EX
-okagent \-\-slot ECC3 pubkey james@legacy.example.com
-okagent \-\-slot ECC3 ssh james@legacy.example.com
+okagent \-\-slot ECC3 pubkey ferris@legacy.example.com
+okagent \-\-slot ECC3 ssh ferris@legacy.example.com
 .EE
 .RE
 .PP
@@ -754,8 +784,8 @@ Use the RSA key the OnlyKey app stored in slot 1:
 .PP
 .RS
 .EX
-okagent \-\-slot RSA1 pubkey james@old.example.com
-okagent \-\-slot RSA1 ssh james@old.example.com
+okagent \-\-slot RSA1 pubkey ferris@old.example.com
+okagent \-\-slot RSA1 ssh ferris@old.example.com
 .EE
 .RE
 .PP
@@ -763,7 +793,7 @@ Start a background agent for the current shell session:
 .PP
 .RS
 .EX
-eval "$(okagent serve \-\-daemon james@example.com)"
+eval "$(okagent serve \-\-daemon ferris@example.com)"
 ssh\-add \-L
 .EE
 .RE
