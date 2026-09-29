@@ -57,8 +57,8 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | `okagent pubkey ID...` | Public keys in `authorized_keys` format. |
 | `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK` (and `SSH_AGENT_PID`). |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
-| `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. `--host` overrides the destination. |
-| `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. `--host` overrides the destination. |
+| `okagent ssh ID [ARGS]` | Connect with ssh; the host part of the identity is the destination, and a `:port` suffix is passed as `-p`. `--host` overrides the destination; `-i ID` serves extra keys for forwarding. |
+| `okagent mosh ID [ARGS]` | The same with mosh; its ssh step uses the identity's key. `--host` overrides the destination, and `-i` serves extra keys. |
 | `okagent ssh-copy-id ID [ARGS]` | Install the identity's public key on the host with ssh-copy-id. `--host` overrides the destination. |
 | `okagent serve [ID...]` | Long-lived agent on a unix socket. |
 
@@ -92,12 +92,20 @@ destination, a `:port` suffix becomes `-p`, and any further arguments are
 passed to `ssh-copy-id`. It needs an `ssh-copy-id` that takes keys from
 `ssh-add -L`; the one shipped by current OpenSSH does.
 
+Pass `-i [user@]host` (repeatable) to `ssh` or `mosh` to serve extra
+identities from the temporary agent alongside the primary one. Only the
+primary identity's key is used to log in, but the extra keys travel with
+agent forwarding (`-A`), so `okagent ssh -i git@github.com ferris@example.com
+-A` can run `git` on the remote host. Give `-i` before the identity, since a
+literal `-i` for ssh must be passed after `--`.
+
 ```sh
 okagent pubkey ferris@example.com >> authorized_keys   # copy to the server
 okagent ssh-copy-id ferris@example.com                 # ...or let ssh-copy-id do it
 okagent run ferris@example.com -- ssh example.com
 okagent ssh ferris@example.com
 okagent ssh ferris@example.com --host admin@server.example.com   # key ferris, login admin@server
+okagent ssh -i git@github.com ferris@example.com -A     # forward the git key too
 okagent ssh ferris@legacy.example.com --slot ECC3       # key stored by the OnlyKey app
 okagent ssh ferris@old.example.com --slot RSA1          # RSA key stored by the OnlyKey app
 eval "$(okagent serve --daemon ferris@example.com)"     # background agent
@@ -160,6 +168,12 @@ only preloads the matching key: `okagent ssh --pubkey-file ~/.ssh/onlykey.pub
 ferris@example.com` hands `ssh` the right key before the device is unlocked.
 The flag must come before the identity, since anything after it is passed
 through to the remote command.
+
+`run`, `shell` and `serve` also accept `-i`/`--identity ID` (repeatable) to
+add identities on top of the positional, config-file or `--pubkey-file` list
+instead of replacing it. So `okagent serve --pubkey-file keys.pub -i
+extra@example.com` serves the keys named by the file plus `extra@example.com`.
+`--slot` and `--curve` apply to these `-i` identities too.
 
 `log-file` (or `--log-file`) appends log output to a file instead of stderr,
 which is where a background agent's messages would otherwise be lost.

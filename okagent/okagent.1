@@ -1,4 +1,4 @@
-.TH OKAGENT 1 "2026-09-18" "okagent 0.1.0" "User Commands"
+.TH OKAGENT 1 "2026-09-28" "okagent 0.1.0" "User Commands"
 .SH NAME
 okagent \- SSH agent backed by an OnlyKey hardware token
 .SH SYNOPSIS
@@ -23,6 +23,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B run
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-i
+.IR identity .\|.\|.]
 .RI [ identity .\|.\|.]
 .B \-\-
 .I command
@@ -33,6 +35,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B shell
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-i
+.IR identity .\|.\|.]
 .RI [ identity .\|.\|.]
 .YS
 .SY okagent
@@ -40,6 +44,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B ssh
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-i
+.IR identity .\|.\|.]
 .RB [ \-\-host
 .IR host ]
 .I identity
@@ -50,6 +56,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .B mosh
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-i
+.IR identity .\|.\|.]
 .RB [ \-\-host
 .IR host ]
 .I identity
@@ -73,6 +81,8 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .RB [ \-\-daemon ]
 .RB [ \-\-pubkey\-file
 .IR file ]
+.RB [ \-i
+.IR identity .\|.\|.]
 .RI [ identity .\|.\|.]
 .YS
 .SH DESCRIPTION
@@ -218,6 +228,13 @@ below.
 is told to use only this key
 .RB ( "IdentitiesOnly=yes" )
 by way of a temporary public key file.
+With
+.BR \-i ,
+the temporary agent also serves the named identities, so they can be used
+through an
+.BR \-A
+(agent forwarding) connection while the login still signs with the primary
+identity's key.
 Any further arguments are passed to
 .B ssh
 after the destination, so they normally form a remote command.
@@ -236,6 +253,9 @@ The destination is
 and any further arguments follow it.
 .B \-\-host
 overrides the destination.
+.B \-i
+serves extra identities from the temporary agent, as for
+.BR ssh .
 .TP
 .BI ssh-copy-id " identity " [ ssh-copy-id-arg \fR.\|.\|.]
 Install the identity's public key in the remote
@@ -414,6 +434,40 @@ without a port uses the default port; the identity's
 suffix belongs to the identity's host and is not carried over.
 This lets one key identity reach several servers, for example
 .BI "okagent ssh " key@example.com " \-\-host " admin@server.example.com .
+.PP
+The
+.BR run ", " shell ", " serve ", " ssh " and " mosh
+commands also accept:
+.TP
+.BI \-i " identity, " \-\-identity " identity"
+Name an additional identity; repeatable.
+For
+.BR run ", " shell " and " serve
+the identity is appended to the list that would otherwise be used (the
+positional identities, else the configuration file's entries, else the
+comments of the
+.B \-\-pubkey\-file
+keys) instead of replacing it.
+For
+.B ssh
+and
+.BR mosh ,
+which require one primary identity, the extra identities are served by the
+temporary agent, so they are available to a forwarded
+.RB ( \-A )
+connection; the login itself still signs with the primary identity's key.
+Like a positional identity, an
+.B \-i
+identity takes its curve from
+.B \-\-curve
+and its slot from
+.BR \-\-slot .
+Give it before the identity, since a literal
+.B \-i
+meant for ssh must be passed after
+.BR \-\- .
+.BR pubkey " and " ssh-copy-id
+do not accept this option.
 .PP
 The
 .B serve

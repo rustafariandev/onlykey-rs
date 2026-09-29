@@ -63,7 +63,7 @@ pub enum Cmd {
     /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Run(RunArgs),
     /// Start $SHELL with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
-    Shell(IdentityArgs),
+    Shell(ExtraIdentityArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
     /// Connect with mosh, whose ssh step uses the identity's key.
@@ -77,6 +77,7 @@ pub enum Cmd {
     Completions(CompletionsArgs),
 }
 
+/// Identities given as positional arguments, with `--pubkey-file`.
 #[derive(Debug, Args, Default)]
 pub struct IdentityArgs {
     /// Identities as [user@]host; defaults to the config file's list, then
@@ -89,10 +90,23 @@ pub struct IdentityArgs {
     pub pubkey_file: Option<PathBuf>,
 }
 
+/// Positional identities plus extra identities given with `-i`/`--identity`,
+/// which are added to the list rather than replacing it.
+#[derive(Debug, Args, Default)]
+pub struct ExtraIdentityArgs {
+    #[command(flatten)]
+    pub base: IdentityArgs,
+
+    /// Additional identities, added to the positional or config-file list
+    /// instead of replacing it.
+    #[arg(short = 'i', long = "identity", value_name = "IDENTITY")]
+    pub additional: Vec<String>,
+}
+
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     #[command(flatten)]
-    pub identities: IdentityArgs,
+    pub identities: ExtraIdentityArgs,
 
     /// Socket path (default: $XDG_RUNTIME_DIR/okagent/agent.sock, or
     /// $TMPDIR/okagent/agent.sock on macOS).
@@ -108,7 +122,7 @@ pub struct ServeArgs {
 #[derive(Debug, Args)]
 pub struct RunArgs {
     #[command(flatten)]
-    pub identities: IdentityArgs,
+    pub identities: ExtraIdentityArgs,
 
     /// Command to run after "--".
     #[arg(last = true, required = true)]
@@ -130,6 +144,12 @@ pub struct SshArgs {
     /// Exported public keys to serve while the device is absent or locked.
     #[arg(long)]
     pub pubkey_file: Option<PathBuf>,
+
+    /// Additional identities to serve alongside the primary one, for example
+    /// for agent forwarding (-A). Repeatable; give it before the identity so
+    /// it is not mistaken for ssh's own -i.
+    #[arg(short = 'i', long = "identity", value_name = "IDENTITY")]
+    pub additional: Vec<String>,
 
     /// Extra arguments passed after the destination (a remote command).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -217,15 +237,21 @@ impl Context_ {
     }
 
     /// Identities in order of preference: the command line, then the config
-    /// file, then the comments of `preloaded` public keys.
-    fn entries(&self, args: &IdentityArgs, preloaded: &[PublicKey]) -> Result<Vec<KeySpec>> {
-        let entries = if !args.identity.is_empty() {
+    /// file, then the comments of `preloaded` public keys. `additional`
+    /// identities are appended to whichever list is chosen.
+    fn entries(
+        &self,
+        args: &IdentityArgs,
+        additional: &[String],
+        preloaded: &[PublicKey],
+    ) -> Result<Vec<KeySpec>> {
+        let mut entries = if !args.identity.is_empty() {
             args.identity
                 .iter()
                 .map(|s| self.key(s))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            if self.slot.is_some() {
+            if self.slot.is_some() && additional.is_empty() {
                 bail!(
                     "--slot applies to identities given on the command line; use `slot` in [[identity]] for config entries"
                 );
@@ -237,6 +263,9 @@ impl Context_ {
                 from_config
             }
         };
+        for identity in additional {
+            entries.push(self.key(identity)?);
+        }
         if entries.is_empty() {
             bail!(
                 "no identities given; pass [user@]host, add [[identity]] entries to the config file, or point --pubkey-file at exported keys"
@@ -250,7 +279,7 @@ impl Context_ {
         Ok(entries)
     }
 
-    fn agent(&self, args: &IdentityArgs) -> Result<Arc<Agent>> {
+    fn agent(&self, args: &IdentityArgs, additional: &[String]) -> Result<Arc<Agent>> {
         let pubkey_file = args
             .pubkey_file
             .clone()
@@ -259,7 +288,7 @@ impl Context_ {
             Some(path) => read_pubkey_file(path)?,
             None => Vec::new(),
         };
-        let entries = self.entries(args, &keys)?;
+        let entries = self.entries(args, additional, &keys)?;
         let timeouts = self.timeouts;
         let opener: Opener = Arc::new(move || Ok(OnlyKey::open_with_timeouts(timeouts)?.boxed()));
         let agent = Agent::new(entries, opener, Arc::clone(&self.sink));
@@ -416,7 +445,7 @@ fn status(ctx: &Context_) -> Result<ExitCode> {
 }
 
 fn pubkey(ctx: &Context_, args: &IdentityArgs) -> Result<ExitCode> {
-    let agent = ctx.agent(args)?;
+    let agent = ctx.agent(args, &[])?;
     let keys = agent.derive_all()?;
     let mut out = std::io::stdout().lock();
     for key in keys {
@@ -438,7 +467,7 @@ fn shutdown_flag() -> Result<Arc<AtomicBool>> {
 }
 
 fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
-    let agent = ctx.agent(&args.identities)?;
+    let agent = ctx.agent(&args.identities.base, &args.identities.additional)?;
     let path = args
         .socket
         .or_else(|| ctx.config.socket.clone())
@@ -490,8 +519,8 @@ fn daemonize(socket: &Path) -> Result<()> {
 
 /// Start an agent on a private socket, run `command` with `SSH_AUTH_SOCK`
 /// and `SSH_AGENT_PID` set, and stop the agent when it exits.
-fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Result<ExitCode> {
-    let agent = ctx.agent(identities)?;
+fn run(ctx: &Context_, identities: &ExtraIdentityArgs, command: Vec<String>) -> Result<ExitCode> {
+    let agent = ctx.agent(&identities.base, &identities.additional)?;
     let path = agent::ephemeral_socket_path();
     let (listener, guard) = agent::bind_socket(&path)?;
     let shutdown = shutdown_flag()?;
@@ -525,13 +554,20 @@ fn run(ctx: &Context_, identities: &IdentityArgs, command: Vec<String>) -> Resul
 fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
     let (destination, port) = destination(&identity, port, args.host.as_deref())?;
-    let id_args = IdentityArgs {
-        identity: vec![args.identity.clone()],
-        pubkey_file: args.pubkey_file.clone(),
+    let id_args = ExtraIdentityArgs {
+        base: IdentityArgs {
+            identity: vec![args.identity.clone()],
+            pubkey_file: args.pubkey_file.clone(),
+        },
+        additional: args.additional.clone(),
     };
-    let agent = ctx.agent(&id_args)?;
-    let keys = agent.derive_all()?;
-    let key = keys.first().ok_or_else(|| anyhow!("no key derived"))?;
+    let agent = ctx.agent(&id_args.base, &id_args.additional)?;
+    let primary = agent
+        .entries()
+        .first()
+        .ok_or_else(|| anyhow!("no identities given"))?
+        .clone();
+    let key = agent.derive_one(&primary)?;
     let dir = tempfile::tempdir()?;
     let pub_path = dir.path().join("id.pub");
     std::fs::write(&pub_path, format!("{}\n", key.to_openssh()?))?;
@@ -600,9 +636,12 @@ fn destination(
 fn ssh_copy_id(ctx: &Context_, args: SshCopyIdArgs) -> Result<ExitCode> {
     let (identity, port) = Identity::parse_with_port(&args.identity)?;
     let (destination, port) = destination(&identity, port, args.host.as_deref())?;
-    let id_args = IdentityArgs {
-        identity: vec![args.identity.clone()],
-        pubkey_file: args.pubkey_file.clone(),
+    let id_args = ExtraIdentityArgs {
+        base: IdentityArgs {
+            identity: vec![args.identity.clone()],
+            pubkey_file: args.pubkey_file.clone(),
+        },
+        additional: Vec::new(),
     };
     let command = ssh_copy_id_command(&destination, port, args.args);
     run(ctx, &id_args, command)
@@ -812,5 +851,179 @@ mod tests {
         std::fs::write(&path, "not a key\n").unwrap();
         assert!(read_pubkey_file(&path).is_err());
         assert!(read_pubkey_file(&dir.path().join("missing")).is_err());
+    }
+
+    fn context(config: Config) -> Context_ {
+        Context_ {
+            config,
+            curve: Curve::default(),
+            curve_given: false,
+            slot: None,
+            sink: Arc::new(TtyPrompt),
+            timeouts: Timeouts::default(),
+        }
+    }
+
+    #[test]
+    fn ssh_accepts_additional_identities_before_the_identity() {
+        for cmd in ["ssh", "mosh"] {
+            let cli = Cli::try_parse_from([
+                "okagent",
+                cmd,
+                "-i",
+                "git@github.com",
+                "--identity",
+                "other@example.com",
+                "ferris@example.com",
+            ])
+            .unwrap();
+            match cli.command {
+                Cmd::Ssh(args) | Cmd::Mosh(args) => {
+                    assert_eq!(args.identity, "ferris@example.com");
+                    assert_eq!(args.additional, ["git@github.com", "other@example.com"]);
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ssh_identity_flag_is_parsed_or_passed_through_after_dash_dash() {
+        // The flag is recognised even after the identity.
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "ssh",
+            "ferris@example.com",
+            "-i",
+            "git@github.com",
+        ])
+        .unwrap();
+        let Cmd::Ssh(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert_eq!(args.identity, "ferris@example.com");
+        assert_eq!(args.additional, ["git@github.com"]);
+        assert!(args.args.is_empty());
+
+        // After "--" a literal -i can still be handed to ssh.
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "ssh",
+            "ferris@example.com",
+            "--",
+            "-i",
+            "~/.ssh/id_rsa",
+        ])
+        .unwrap();
+        let Cmd::Ssh(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(args.additional.is_empty());
+        assert_eq!(args.args, ["-i", "~/.ssh/id_rsa"]);
+    }
+
+    #[test]
+    fn agent_commands_accept_additional_identities() {
+        let argvs = [
+            vec![
+                "okagent",
+                "run",
+                "-i",
+                "extra@example.com",
+                "base@example.com",
+                "--",
+                "true",
+            ],
+            vec![
+                "okagent",
+                "shell",
+                "-i",
+                "extra@example.com",
+                "base@example.com",
+            ],
+            vec![
+                "okagent",
+                "serve",
+                "-i",
+                "extra@example.com",
+                "base@example.com",
+            ],
+        ];
+        for argv in argvs {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let (base, additional) = match cli.command {
+                Cmd::Run(args) => (args.identities.base, args.identities.additional),
+                Cmd::Shell(args) => (args.base, args.additional),
+                Cmd::Serve(args) => (args.identities.base, args.identities.additional),
+                other => panic!("unexpected command {other:?}"),
+            };
+            assert_eq!(base.identity, ["base@example.com"]);
+            assert_eq!(additional, ["extra@example.com"]);
+        }
+    }
+
+    #[test]
+    fn pubkey_rejects_additional_identity_flag() {
+        assert!(Cli::try_parse_from(["okagent", "pubkey", "-i", "extra@example.com"]).is_err());
+    }
+
+    #[test]
+    fn additional_identities_extend_the_list() {
+        let config = Config::parse("[[identity]]\nname = \"config@example.com\"\n").unwrap();
+        let ctx = context(config);
+        let extra = ["extra@example.com".to_owned()];
+
+        // With no positional identities, -i extends the config list.
+        let entries = ctx.entries(&IdentityArgs::default(), &extra, &[]).unwrap();
+        let labels: Vec<String> = entries.iter().map(KeySpec::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "<ssh://config@example.com|ed25519>",
+                "<ssh://extra@example.com|ed25519>"
+            ]
+        );
+
+        // Positional identities replace the config list; -i is still appended.
+        let base = IdentityArgs {
+            identity: vec!["pos@example.com".to_owned()],
+            pubkey_file: None,
+        };
+        let entries = ctx.entries(&base, &extra, &[]).unwrap();
+        let labels: Vec<String> = entries.iter().map(KeySpec::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "<ssh://pos@example.com|ed25519>",
+                "<ssh://extra@example.com|ed25519>"
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_applies_to_additional_identities() {
+        let ctx = Context_ {
+            slot: Some("ECC3".parse().unwrap()),
+            ..context(Config::default())
+        };
+
+        // With only -i, --slot is allowed and applies to the -i identity.
+        let entries = ctx
+            .entries(
+                &IdentityArgs::default(),
+                &["stored@example.com".to_owned()],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            entries[0].kind,
+            KeyKind::StoredEcc {
+                slot: "ECC3".parse().unwrap(),
+                curve: Curve::default()
+            }
+        );
+
+        // With no command-line identities at all, --slot still errors.
+        assert!(ctx.entries(&IdentityArgs::default(), &[], &[]).is_err());
     }
 }

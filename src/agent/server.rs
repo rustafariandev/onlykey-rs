@@ -231,6 +231,28 @@ impl Agent {
         Ok(out)
     }
 
+    /// Fetch one key now; fails if the device is unavailable. Used by
+    /// commands that need a single key up front.
+    pub fn derive_one(&self, entry: &KeySpec) -> Result<PublicKey, AgentError> {
+        let cached = self
+            .cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(entry)
+            .cloned();
+        if let Some(key) = cached {
+            return Ok(key);
+        }
+        let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut device = (self.opener)()?;
+        let key = self.derive(&mut device, entry)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(entry.clone(), key.clone());
+        Ok(key)
+    }
+
     fn derive(&self, device: &mut Device, entry: &KeySpec) -> Result<PublicKey, AgentError> {
         Ok(device.ssh_public_key(entry)?)
     }
@@ -534,6 +556,28 @@ mod tests {
         assert_eq!(String::decode(&mut r).unwrap(), e.label());
         // Second listing is served from the cache: the opener would panic otherwise.
         assert_eq!(agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]), reply);
+    }
+
+    #[test]
+    fn derive_one_uses_cache_after_first_fetch() {
+        let e = entry();
+        let mut key_report = [0u8; 64];
+        key_report[..32].copy_from_slice(&[0x11; 32]);
+        let opener = opener_with(vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+            Step::ExpectWrite(protocol::getpubkey_report(
+                132,
+                0x01,
+                &e.identity.derivation_hash(),
+            )),
+            Step::Reply(key_report),
+        ]);
+        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
+        let key = agent.derive_one(&e).unwrap();
+        assert_eq!(key.key_data().ed25519().unwrap().0, [0x11; 32]);
+        // The opener would panic on a second call.
+        assert_eq!(agent.derive_one(&e).unwrap(), key);
     }
 
     #[test]
