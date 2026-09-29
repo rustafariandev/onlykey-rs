@@ -3,11 +3,6 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to build (defaults to the tag)"
-        required: false
 
 permissions:
   contents: write
@@ -16,7 +11,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  on-main:
+    # Only release tags that point at a commit on main.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify the tag is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::tag $GITHUB_REF_NAME is not on main; skipping release"
+            exit 1
+          fi
+
   test:
+    needs: on-main
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

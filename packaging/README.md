@@ -69,17 +69,17 @@ cargo generate-rpm -p okagent
 
 ```sh
 # Debian / Ubuntu
-sudo apt install ./okagent_0.1.0-1_amd64.deb
+sudo apt install ./okagent_1.0.0-1_amd64.deb
 
 # RHEL / Fedora
-sudo dnf install ./okagent-0.1.0-1.el8.x86_64.rpm
+sudo dnf install ./okagent-1.0.0-1.el8.x86_64.rpm
 
 # Arch
-sudo pacman -U okagent-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U okagent-1.0.0-1-x86_64.pkg.tar.zst
 
 # Universal static binary
-tar xzf okagent-0.1.0-x86_64-unknown-linux-musl.tar.gz
-sudo ./okagent-0.1.0-x86_64-unknown-linux-musl/install.sh
+tar xzf okagent-1.0.0-x86_64-unknown-linux-musl.tar.gz
+sudo ./okagent-1.0.0-x86_64-unknown-linux-musl/install.sh
 ```
 
 After installing, replug the OnlyKey (the udev rule is picked up on

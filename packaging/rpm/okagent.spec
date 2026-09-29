@@ -16,7 +16,7 @@
 %endif
 
 Name:           okagent
-Version:        0.1.0
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        SSH agent backed by an OnlyKey hardware token
 License:        MIT
@@ -97,5 +97,7 @@ if [ -x /usr/bin/udevadm ] && [ "$1" -eq 0 ]; then
 fi
 
 %changelog
+* Tue Sep 29 2026 Rustafarian Dev <rustafarian.dev@gmail.com> - 1.0.0-1
+- New upstream release v1.0.0.
 * Mon Sep 28 2026 Rustafarian Dev <rustafarian.dev@gmail.com> - 0.1.0-1
 - Initial package.
