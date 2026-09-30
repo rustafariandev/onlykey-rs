@@ -153,17 +153,29 @@ impl RsaLocalKey {
     }
 }
 
+/// Smallest RSA modulus accepted, in bits, as OpenSSH enforces.
+pub const MIN_RSA_BITS: usize = 1024;
+
 /// Rebuild an [`rsa::RsaPrivateKey`] from the SSH fields, with `p` and `q` in
 /// the order the wire gives them (`ssh-key`'s own conversion passes `p` twice,
-/// so it is not used).
+/// so it is not used). A modulus under [`MIN_RSA_BITS`] is refused.
 fn rsa_private_key(pair: &RsaKeypair) -> Result<rsa::RsaPrivateKey, KeyDecodeError> {
     let mpint = |m: &Mpint| {
         m.as_positive_bytes()
             .map(rsa::BigUint::from_bytes_be)
             .ok_or_else(malformed_rsa)
     };
+    let n = mpint(&pair.public.n)?;
+    let bits = n.bits();
+    if bits < MIN_RSA_BITS {
+        return Err(KeyDecodeError::TooSmall {
+            key_type: "ssh-rsa",
+            bits,
+            min: MIN_RSA_BITS,
+        });
+    }
     rsa::RsaPrivateKey::from_components(
-        mpint(&pair.public.n)?,
+        n,
         mpint(&pair.public.e)?,
         mpint(&pair.private.d)?,
         vec![mpint(&pair.private.p)?, mpint(&pair.private.q)?],
@@ -471,6 +483,24 @@ mod tests {
 
         let debug = format!("{key:?}");
         assert!(debug.contains("LocalKeyRef"), "{debug}");
+    }
+
+    /// An RSA key under 1024 bits is refused, as OpenSSH refuses it.
+    #[test]
+    fn rejects_an_rsa_key_below_1024_bits() {
+        let sk = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 768).unwrap();
+        let pair = RsaKeypair::try_from(&sk).unwrap();
+        let mut body = Vec::new();
+        pair.encode(&mut body).unwrap();
+        "weak@example.com".encode(&mut body).unwrap();
+        assert!(matches!(
+            decode("ssh-rsa", &mut body.as_slice()),
+            Err(KeyDecodeError::TooSmall {
+                key_type: "ssh-rsa",
+                bits: 768,
+                min: 1024,
+            })
+        ));
     }
 
     /// Build the agent's `ecdsa-sha2-*` private-key body for each NIST curve

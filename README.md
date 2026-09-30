@@ -128,7 +128,8 @@ memory, with no token and no button press; `ssh-add -d FILE` removes that key
 removes every identity, including those from the config file, until the agent
 restarts or they are added back with `ssh-add -s`. ed25519, RSA, ECDSA
 (`ecdsa-sha2-nistp256`, `-nistp384`, `-nistp521`) and DSA (`ssh-dss`) keys are
-accepted, matching the key types `ssh-agent` itself can hold. An RSA key signs
+accepted, matching the key types `ssh-agent` itself can hold; an RSA key
+under 1024 bits is refused, as OpenSSH refuses it. An RSA key signs
 `rsa-sha2-256` or `rsa-sha2-512` (a client asking for the legacy SHA-1
 `ssh-rsa` signature is refused, as with the token); ECDSA uses the curve's own
 digest and DSA uses SHA-1. DSA only works with OpenSSH builds that still enable

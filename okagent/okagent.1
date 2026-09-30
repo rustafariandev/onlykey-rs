@@ -186,7 +186,8 @@ being served. ed25519, RSA, ECDSA
 .IR \-nistp384 " and " \-nistp521 )
 and DSA
 .RB ( ssh-dss )
-keys are accepted, and the key is forgotten when the agent exits. DSA only
+keys are accepted, and the key is forgotten when the agent exits.
+An RSA key under 1024 bits is refused, as OpenSSH refuses it. DSA only
 works with OpenSSH builds that still enable
 .IR ssh-dss .
 A FIDO security key

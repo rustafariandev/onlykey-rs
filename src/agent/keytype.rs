@@ -25,6 +25,12 @@ pub enum KeyDecodeError {
     UnsupportedType(String),
     #[error("malformed {0} private key")]
     Malformed(&'static str),
+    #[error("{key_type} key of {bits} bits is below the {min}-bit minimum")]
+    TooSmall {
+        key_type: &'static str,
+        bits: usize,
+        min: usize,
+    },
 }
 
 /// A private key decoded from an `ADD_IDENTITY` request.
