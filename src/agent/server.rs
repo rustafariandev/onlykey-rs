@@ -1,6 +1,7 @@
 //! The agent itself: identity bookkeeping, request handling and the unix
 //! socket server.
 
+use super::local::{LocalKey, LocalKeyError, LocalKeyRef};
 use super::wire::{self, Request};
 use crate::challenge::ChallengeSink;
 use crate::device::{DeviceError, OnlyKey};
@@ -35,6 +36,8 @@ pub enum AgentError {
     #[error("requested key is not served by this agent")]
     UnknownKey,
     #[error(transparent)]
+    Local(#[from] LocalKeyError),
+    #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error("provider string is not valid UTF-8")]
     BadProvider,
@@ -50,6 +53,8 @@ pub enum AgentError {
 /// one identity in the SSH sense.
 pub struct Agent {
     entries: Mutex<Vec<ServedKey>>,
+    /// Private keys added at runtime with `ssh-add FILE`, held in memory.
+    local: Mutex<Vec<LocalEntry>>,
     opener: Opener,
     sink: Arc<dyn ChallengeSink>,
     /// Serialises every device operation, including the wait for the user.
@@ -59,8 +64,8 @@ pub struct Agent {
     passphrase_lock: Mutex<Option<PassphraseHash>>,
 }
 
-/// One identity the agent serves, with an optional expiry from the lifetime
-/// constraint of an `ssh-add -s -t` request.
+/// One identity the agent serves from the token, with an optional expiry from
+/// the lifetime constraint of an `ssh-add -s -t` request.
 struct ServedKey {
     spec: KeySpec,
     expires: Option<Instant>,
@@ -70,6 +75,34 @@ impl ServedKey {
     fn expired(&self) -> bool {
         self.expires.is_some_and(|at| Instant::now() >= at)
     }
+}
+
+/// One in-memory private key added with `ssh-add FILE`, with an optional
+/// expiry from the lifetime constraint of `ssh-add -t FILE`.
+struct LocalEntry {
+    key: Arc<dyn LocalKey>,
+    expires: Option<Instant>,
+}
+
+impl LocalEntry {
+    fn expired(&self) -> bool {
+        self.expires.is_some_and(|at| Instant::now() >= at)
+    }
+}
+
+/// What a sign or remove request named, once looked up.
+enum Target {
+    /// A key the token holds.
+    Device(KeySpec, PublicKey),
+    /// A private key held in memory.
+    Local(Arc<dyn LocalKey>),
+}
+
+/// `Some(Instant)` for a nonzero lifetime in seconds.
+fn expiry(lifetime: Option<u32>) -> Option<Instant> {
+    lifetime
+        .filter(|secs| *secs > 0)
+        .map(|secs| Instant::now() + Duration::from_secs(secs as u64))
 }
 
 /// A salted SHA-256 of the lock passphrase, so the passphrase itself is not
@@ -118,6 +151,7 @@ impl Agent {
                     })
                     .collect(),
             ),
+            local: Mutex::new(Vec::new()),
             opener,
             sink,
             device_lock: Mutex::new(()),
@@ -208,9 +242,7 @@ impl Agent {
     /// Record `spec` in the entry list, replacing any existing entry so a
     /// fresh lifetime takes effect.
     fn remember(&self, spec: KeySpec, lifetime: Option<u32>) {
-        let expires = lifetime
-            .filter(|secs| *secs > 0)
-            .map(|secs| Instant::now() + Duration::from_secs(secs as u64));
+        let expires = expiry(lifetime);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         entries.retain(|e| e.spec != spec);
         entries.push(ServedKey { spec, expires });
@@ -234,6 +266,8 @@ impl Agent {
                 cache.remove(&spec);
             }
         }
+        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
+        local.retain(|e| !e.expired());
     }
 
     /// Seed the key cache from previously exported public keys, matched by
@@ -289,11 +323,21 @@ impl Agent {
                 Err(e) => tracing::warn!(error = %e, "cannot open OnlyKey to get public keys"),
             }
         }
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        entries
-            .iter()
-            .filter_map(|e| cache.get(e).cloned())
-            .collect()
+        let mut keys: Vec<PublicKey> = {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            entries
+                .iter()
+                .filter_map(|e| cache.get(e).cloned())
+                .collect()
+        };
+        keys.extend(
+            self.local
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .map(|e| e.key.public_key().clone()),
+        );
+        keys
     }
 
     /// Fetch every key now; fails on the first problem. Used by commands that
@@ -403,6 +447,36 @@ impl Agent {
                     wire::failure()
                 }
             }
+            Ok(Request::AddIdentity { .. }) if self.is_locked() => {
+                tracing::warn!("add key refused: agent is locked");
+                wire::failure()
+            }
+            Ok(Request::AddIdentity { key, lifetime }) => {
+                self.add_local(key, lifetime);
+                wire::success()
+            }
+            Ok(Request::RemoveIdentity { .. }) if self.is_locked() => {
+                tracing::warn!("remove key refused: agent is locked");
+                wire::failure()
+            }
+            Ok(Request::RemoveIdentity { key_blob }) => {
+                if self.remove_local(&key_blob) {
+                    tracing::info!("removed local key");
+                    wire::success()
+                } else {
+                    tracing::debug!("no such local key to remove");
+                    wire::failure()
+                }
+            }
+            Ok(Request::RemoveAllIdentities) if self.is_locked() => {
+                tracing::warn!("remove all refused: agent is locked");
+                wire::failure()
+            }
+            Ok(Request::RemoveAllIdentities) => {
+                self.remove_all();
+                tracing::info!("removed every identity");
+                wire::success()
+            }
             Ok(Request::AddSmartcardKey { .. }) if self.is_locked() => {
                 tracing::warn!("add key refused: agent is locked");
                 wire::failure()
@@ -462,31 +536,89 @@ impl Agent {
         }
     }
 
-    fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
-        let (entry, key) = self.lookup(key_blob)?;
-        let hash = match wire::rsa_hash(flags) {
-            Some(hash) => hash,
-            None if entry.kind.is_rsa() => return Err(AgentError::Sha1Requested),
-            None => HashAlg::default(),
-        };
-        let subject = wire::describe_data(data);
-        let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut device = (self.opener)()?;
-        let raw = device.sign(&entry, data, hash, subject, self.sink.as_ref())?;
-        drop(device);
-        let sig = keys::signature(&entry.kind.signature_algorithm(hash), &raw)?;
-        keys::verify(&key, data, &sig)?;
-        tracing::info!(identity = %entry.identity, key = %entry.kind, algorithm = %sig.algorithm(), "signed");
-        Ok(wire::sign_response(&sig))
+    /// Add a private key held in memory, replacing any of the same public key
+    /// so a fresh lifetime takes effect.
+    fn add_local(&self, key: LocalKeyRef, lifetime: Option<u32>) {
+        self.purge_expired();
+        let blob = key.key_blob();
+        let comment = key.comment().to_owned();
+        let expires = expiry(lifetime);
+        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
+        local.retain(|e| e.key.key_blob() != blob);
+        local.push(LocalEntry {
+            key: Arc::from(key.into_inner()),
+            expires,
+        });
+        drop(local);
+        tracing::info!(comment, "serving local key");
     }
 
-    fn lookup(&self, key_blob: &[u8]) -> Result<(KeySpec, PublicKey), AgentError> {
+    /// Remove every in-memory key with this public key blob. Returns whether
+    /// anything was removed.
+    fn remove_local(&self, key_blob: &[u8]) -> bool {
+        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
+        let before = local.len();
+        local.retain(|e| e.key.key_blob() != key_blob);
+        local.len() != before
+    }
+
+    /// Drop every identity: token-backed entries, their cached keys, and the
+    /// in-memory private keys. Backs `ssh-add -D`.
+    fn remove_all(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.local.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
+        match self.lookup(key_blob)? {
+            Target::Local(key) => {
+                let sig = key.sign(data)?;
+                keys::verify(key.public_key(), data, &sig)?;
+                tracing::info!(
+                    comment = key.public_key().comment(),
+                    "signed with local key"
+                );
+                Ok(wire::sign_response(&sig))
+            }
+            Target::Device(entry, key) => {
+                let hash = match wire::rsa_hash(flags) {
+                    Some(hash) => hash,
+                    None if entry.kind.is_rsa() => return Err(AgentError::Sha1Requested),
+                    None => HashAlg::default(),
+                };
+                let subject = wire::describe_data(data);
+                let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let mut device = (self.opener)()?;
+                let raw = device.sign(&entry, data, hash, subject, self.sink.as_ref())?;
+                drop(device);
+                let sig = keys::signature(&entry.kind.signature_algorithm(hash), &raw)?;
+                keys::verify(&key, data, &sig)?;
+                tracing::info!(identity = %entry.identity, key = %entry.kind, algorithm = %sig.algorithm(), "signed");
+                Ok(wire::sign_response(&sig))
+            }
+        }
+    }
+
+    fn lookup(&self, key_blob: &[u8]) -> Result<Target, AgentError> {
         self.purge_expired();
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((entry, key)) = cache
+                .iter()
+                .find(|(_, key)| key.to_bytes().map(|b| b == key_blob).unwrap_or(false))
+            {
+                return Ok(Target::Device(entry.clone(), key.clone()));
+            }
+        }
+        let local = self.local.lock().unwrap_or_else(|p| p.into_inner());
+        local
             .iter()
-            .find(|(_, key)| key.to_bytes().map(|b| b == key_blob).unwrap_or(false))
-            .map(|(entry, key)| (entry.clone(), key.clone()))
+            .find(|e| e.key.key_blob() == key_blob)
+            .map(|e| Target::Local(Arc::clone(&e.key)))
             .ok_or(AgentError::UnknownKey)
     }
 
@@ -1051,6 +1183,128 @@ mod tests {
             agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]),
             vec![12, 0, 0, 0, 0]
         );
+    }
+
+    fn local_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
+        use ssh_key::private::Ed25519Keypair;
+        let pair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let public = PublicKey::new(ssh_key::public::KeyData::Ed25519(pair.public), comment);
+        let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-ed25519".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        (body, public)
+    }
+
+    #[test]
+    fn add_identity_signs_locally_without_the_device() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let (add, public) = local_key(0x11, "ferris@example.com");
+        let blob = public.to_bytes().unwrap();
+
+        assert_eq!(agent.handle(&add), wire::success());
+        // Re-adding the same key is a successful no-op.
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let reply = agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
+        assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
+        let mut r = &reply[5..];
+        assert_eq!(Vec::<u8>::decode(&mut r).unwrap(), blob);
+        assert_eq!(String::decode(&mut r).unwrap(), "ferris@example.com");
+        assert!(r.is_empty());
+
+        // Signing works with no device and no challenge, and verifies.
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        blob.encode(&mut sign).unwrap();
+        b"data".as_slice().encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        let reply = agent.handle(&sign);
+        assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+        let mut r = &reply[1..];
+        let sig_blob = Vec::<u8>::decode(&mut r).unwrap();
+        let mut b = sig_blob.as_slice();
+        assert_eq!(String::decode(&mut b).unwrap(), "ssh-ed25519");
+        let sig = ssh_key::Signature::new(
+            ssh_key::Algorithm::Ed25519,
+            Vec::<u8>::decode(&mut b).unwrap(),
+        )
+        .unwrap();
+        keys::verify(&public, b"data", &sig).unwrap();
+
+        // Removing by public key blob takes it away.
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        blob.encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert_eq!(agent.handle(&remove), wire::failure());
+        assert_eq!(
+            agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]),
+            vec![12, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn remove_all_clears_token_and_local_keys() {
+        let e = entry();
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
+        let raw = protocol::RawPublicKey::Ed25519([0x22; 32]);
+        assert_eq!(
+            agent.preload([keys::public_key(&raw, &e.label()).unwrap()]),
+            1
+        );
+
+        let (add, _) = local_key(0x11, "ferris@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+        assert_eq!(agent.public_keys().len(), 2);
+
+        assert_eq!(
+            agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]),
+            wire::success()
+        );
+        assert!(agent.public_keys().is_empty());
+        assert!(agent.entries().is_empty());
+    }
+
+    #[test]
+    fn local_add_and_remove_all_are_refused_while_locked() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let mut lock = vec![wire::SSH_AGENTC_LOCK];
+        b"hunter2".as_slice().encode(&mut lock).unwrap();
+        assert_eq!(agent.handle(&lock), wire::success());
+
+        let (add, public) = local_key(0x11, "ferris@example.com");
+        assert_eq!(agent.handle(&add), wire::failure());
+        assert!(agent.public_keys().is_empty());
+        assert_eq!(
+            agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]),
+            wire::failure()
+        );
+
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        public.to_bytes().unwrap().encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::failure());
+    }
+
+    #[test]
+    fn local_key_lifetime_expires() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let (add, _) = local_key(0x11, "ferris@example.com");
+        // A constrained add with a one-second lifetime.
+        let mut constrained = add;
+        constrained[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut constrained)
+            .unwrap();
+        1u32.encode(&mut constrained).unwrap();
+        assert_eq!(agent.handle(&constrained), wire::success());
+        assert_eq!(agent.public_keys().len(), 1);
+
+        // Pretend the lifetime elapsed.
+        agent.local.lock().unwrap()[0].expires = Some(Instant::now());
+        assert!(agent.public_keys().is_empty());
     }
 
     #[test]

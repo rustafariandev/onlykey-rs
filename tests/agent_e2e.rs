@@ -231,6 +231,69 @@ fn ssh_add_smartcard_adds_removes_and_signs() {
     assert!(!ssh_add_card(&h, dir.path(), "-e", "ferris@example.com"));
 }
 
+/// Run `ssh-add FILE`, loading a plain private key from disk.
+fn ssh_add_file(h: &Harness, path: &Path) -> bool {
+    h.cmd("ssh-add")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// `ssh-add FILE` loads a plain ed25519 key into the agent. It signs entirely
+/// in software (no token, no challenge), and `-d`/`-D` take it away again.
+#[test]
+fn ssh_add_loads_a_regular_ed25519_key() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(entries());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_ed25519");
+    let generated = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "regular@example.com", "-f"])
+        .arg(&key_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(generated.success(), "ssh-keygen failed");
+
+    assert_eq!(listed_keys(&h), 2, "the two derived keys");
+    assert!(ssh_add_file(&h, &key_path));
+    assert_eq!(listed_keys(&h), 3);
+
+    // The added key really signs, without a challenge on the token.
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with("regular@example.com"))
+        .expect("added key is listed");
+    assert!(line.starts_with("ssh-ed25519 "), "{line}");
+    sign_and_check(&h, dir.path(), line, "regular-ed25519");
+    assert_eq!(h.challenges(), 0, "a local key must not touch the token");
+
+    // `ssh-add -d FILE` removes just that key; `-D` removes everything.
+    assert!(ssh_add_file(&h, &key_path));
+    assert!(
+        h.cmd("ssh-add")
+            .arg("-d")
+            .arg(&key_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(listed_keys(&h), 2);
+    assert!(ssh_add_file(&h, &key_path));
+    assert!(h.cmd("ssh-add").arg("-D").status().unwrap().success());
+    assert_eq!(listed_keys(&h), 0);
+}
+
 #[test]
 fn ssh_add_smartcard_honours_a_lifetime() {
     if !have("ssh-add") {
@@ -452,8 +515,8 @@ fn roundtrip(socket: &Path, body: &[u8]) -> Vec<u8> {
 #[test]
 fn unsupported_and_unknown_key_requests_get_failure_and_keep_connection() {
     let h = Harness::start(entries());
-    // Add-identity is refused; extensions and the SSH v1 listing get the
-    // replies OpenSSH's own agent gives.
+    // An add-identity with an empty key type is refused; extensions and the
+    // SSH v1 listing get the replies OpenSSH's own agent gives.
     assert_eq!(
         roundtrip(&h.socket, &[17, 0, 0, 0, 0]),
         vec![wire::SSH_AGENT_FAILURE]

@@ -1,6 +1,7 @@
-//! SSH agent wire protocol: framing, the two requests this agent serves, and
+//! SSH agent wire protocol: framing, the requests this agent serves, and
 //! their replies (draft-miller-ssh-agent).
 
+use super::local::{self, LocalKeyError, LocalKeyRef};
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
@@ -15,12 +16,20 @@ pub const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
+/// `ssh-add FILE`: add a private key held in memory.
+pub const SSH2_AGENTC_ADD_IDENTITY: u8 = 17;
+/// `ssh-add -d FILE`: remove the identity with a given public key blob.
+pub const SSH2_AGENTC_REMOVE_IDENTITY: u8 = 18;
+/// `ssh-add -D`: remove every identity.
+pub const SSH_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
 /// `ssh-add -s`: add a key named by a provider string.
 pub const SSH_AGENTC_ADD_SMARTCARD_KEY: u8 = 20;
 /// `ssh-add -e`: remove a key named by a provider string.
 pub const SSH_AGENTC_REMOVE_SMARTCARD_KEY: u8 = 21;
 pub const SSH_AGENTC_LOCK: u8 = 22;
 pub const SSH_AGENTC_UNLOCK: u8 = 23;
+/// `ssh-add -t N FILE`: add a private key with constraints.
+pub const SSH2_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
 /// `ssh-add -s` with `-t`/`-c`/certificates: an add carrying constraints.
 pub const SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
@@ -57,6 +66,10 @@ pub enum WireError {
     Empty,
     #[error("malformed request: {0}")]
     Malformed(#[from] ssh_encoding::Error),
+    #[error(transparent)]
+    LocalKey(#[from] LocalKeyError),
+    #[error("unexpected trailing bytes in request")]
+    TrailingData,
     #[error("unsupported key constraint {0:#04x}")]
     UnsupportedConstraint(u8),
     #[error("unsupported key constraint extension {0:?}")]
@@ -66,7 +79,7 @@ pub enum WireError {
 }
 
 /// A decoded client request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Request {
     /// The SSH v1 identities request; answered with an empty list.
     RequestRsaIdentities,
@@ -76,6 +89,18 @@ pub enum Request {
         data: Vec<u8>,
         flags: u32,
     },
+    /// `ssh-add FILE`: add the private key held in memory. `lifetime` is the
+    /// constraint from `ssh-add -t` (seconds), if any.
+    AddIdentity {
+        key: LocalKeyRef,
+        lifetime: Option<u32>,
+    },
+    /// `ssh-add -d FILE`: remove the identity with this public key blob.
+    RemoveIdentity {
+        key_blob: Vec<u8>,
+    },
+    /// `ssh-add -D`: remove every identity.
+    RemoveAllIdentities,
     /// `ssh-add -x`: lock the agent with a passphrase.
     Lock(Vec<u8>),
     /// `ssh-add -X`: unlock it again.
@@ -105,6 +130,28 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
     match kind {
         SSH_AGENTC_REQUEST_RSA_IDENTITIES => Ok(Request::RequestRsaIdentities),
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
+        SSH2_AGENTC_ADD_IDENTITY => {
+            let key_type = String::decode(&mut rest)?;
+            let key = local::decode(&key_type, &mut rest)?;
+            if !rest.is_empty() {
+                return Err(WireError::TrailingData);
+            }
+            Ok(Request::AddIdentity {
+                key,
+                lifetime: None,
+            })
+        }
+        SSH2_AGENTC_ADD_ID_CONSTRAINED => {
+            let key_type = String::decode(&mut rest)?;
+            let key = local::decode(&key_type, &mut rest)?;
+            let (lifetime, _confirm) = parse_constraints(&mut rest)?;
+            Ok(Request::AddIdentity { key, lifetime })
+        }
+        SSH2_AGENTC_REMOVE_IDENTITY => {
+            let key_blob = Vec::<u8>::decode(&mut rest)?;
+            Ok(Request::RemoveIdentity { key_blob })
+        }
+        SSH_AGENTC_REMOVE_ALL_IDENTITIES => Ok(Request::RemoveAllIdentities),
         SSH_AGENTC_ADD_SMARTCARD_KEY => {
             let provider = Vec::<u8>::decode(&mut rest)?;
             let pin = Vec::<u8>::decode(&mut rest)?;
@@ -409,11 +456,80 @@ mod tests {
     }
 
     #[test]
+    fn add_and_remove_identity_requests() {
+        use ssh_key::private::Ed25519Keypair;
+
+        let pair = Ed25519Keypair::from_seed(&[0x11; 32]);
+        let public = PublicKey::new(KeyData::Ed25519(pair.public), "ferris@example.com");
+        let blob = public.to_bytes().unwrap();
+
+        let mut add = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-ed25519".encode(&mut add).unwrap();
+        pair.encode(&mut add).unwrap();
+        "ferris@example.com".encode(&mut add).unwrap();
+        match parse_request(&add).unwrap() {
+            Request::AddIdentity { key, lifetime } => {
+                assert_eq!(key.comment(), "ferris@example.com");
+                assert_eq!(key.key_blob(), blob);
+                assert_eq!(lifetime, None);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        // Trailing bytes after the comment are rejected.
+        let mut trailing = add.clone();
+        trailing.push(0);
+        assert!(matches!(
+            parse_request(&trailing),
+            Err(WireError::TrailingData)
+        ));
+
+        // The constrained add carries a lifetime; confirm is ignored.
+        let mut constrained = add;
+        constrained[0] = SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut constrained)
+            .unwrap();
+        60u32.encode(&mut constrained).unwrap();
+        SSH_AGENT_CONSTRAIN_CONFIRM
+            .encode(&mut constrained)
+            .unwrap();
+        match parse_request(&constrained).unwrap() {
+            Request::AddIdentity { lifetime, .. } => assert_eq!(lifetime, Some(60)),
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        // An unsupported key type is a local-key error, not a crash.
+        let mut rsa = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-rsa".encode(&mut rsa).unwrap();
+        assert!(matches!(
+            parse_request(&rsa),
+            Err(WireError::LocalKey(LocalKeyError::UnsupportedType(_)))
+        ));
+
+        let mut remove = vec![SSH2_AGENTC_REMOVE_IDENTITY];
+        blob.encode(&mut remove).unwrap();
+        assert_eq!(
+            parse_request(&remove).unwrap(),
+            Request::RemoveIdentity { key_blob: blob }
+        );
+        assert_eq!(
+            parse_request(&[SSH_AGENTC_REMOVE_ALL_IDENTITIES]).unwrap(),
+            Request::RemoveAllIdentities
+        );
+    }
+
+    #[test]
     fn unknown_and_empty_requests() {
         assert_eq!(
-            parse_request(&[17, 1, 2]).unwrap(),
-            Request::Unsupported(17)
+            parse_request(&[200, 1, 2]).unwrap(),
+            Request::Unsupported(200)
         );
+        // A truncated identity add is a local-key error, not a panic.
+        assert!(matches!(
+            parse_request(&[SSH2_AGENTC_ADD_IDENTITY, 1, 2]),
+            Err(WireError::Malformed(_))
+        ));
         assert!(matches!(parse_request(&[]), Err(WireError::Empty)));
     }
 

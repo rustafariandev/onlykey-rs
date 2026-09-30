@@ -92,13 +92,17 @@ is an SSH agent whose private keys live on an
 OnlyKey
 .UE
 hardware token.
-No key material is stored on the host: for every operation the token
+No key material is written to disk: for every token-backed operation the token
 re-derives the key from an
 .I identity
 string such as
 .BR ferris@example.com ,
 and every signature must be confirmed on the device by entering a
 three-digit challenge on its buttons.
+A plain ed25519 private key can instead be loaded into a running agent with
+.B ssh-add
+(see below), in which case it is held in the agent's memory and signed in
+software, with no token involvement.
 .PP
 Given the same identity and curve,
 .B okagent
@@ -169,9 +173,23 @@ The lifetime constraint of
 .B ssh-add \-s \-t
 is honoured; the PIN and the confirm constraint are ignored, and destination
 or certificate constraints are refused.
-Adding a private key directly
+A private key file given directly to
+.B ssh-add
 .RB ( SSH2_AGENTC_ADD_IDENTITY )
-is still refused, as is anything else not listed here.
+is loaded into the agent: the key is held in memory and every signature is
+made in software, with no OnlyKey and no challenge, even while another key is
+being served. Only ed25519 keys are accepted, and the key is forgotten when
+the agent exits.
+.BR "ssh-add \-d " file
+removes only that key again and
+.B ssh-add \-D
+removes every identity, token-backed or in-memory.
+The lifetime constraint of
+.B ssh-add \-t
+is honoured and the confirm constraint is ignored, as with
+.BR ssh-add \-s ;
+destination or certificate constraints are refused.
+Anything else not listed here is refused.
 .B ssh-add \-x
 locks the agent with a passphrase: until
 .B ssh-add \-X
@@ -787,6 +805,17 @@ Use the RSA key the OnlyKey app stored in slot 1:
 .EX
 okagent \-\-slot RSA1 pubkey ferris@old.example.com
 okagent \-\-slot RSA1 ssh ferris@old.example.com
+.EE
+.RE
+.PP
+Load a plain ed25519 private key into a running agent (signed in memory, no
+token):
+.PP
+.RS
+.EX
+okagent serve ferris@example.com &
+ssh\-add ~/.ssh/id_ed25519
+ssh\-add \-d ~/.ssh/id_ed25519
 .EE
 .RE
 .PP

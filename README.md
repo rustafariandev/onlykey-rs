@@ -19,7 +19,8 @@ Two crates:
 
 Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macOS.
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
-(stored only).
+(stored only). A plain ed25519 private key can also be loaded into a running
+agent with `ssh-add FILE` and signed in memory, with no token involved.
 
 ## Setup
 
@@ -114,6 +115,18 @@ ssh-add -s git@github.com                       # derived ed25519
 ssh-add -s '<ssh://old@example.com|rsa|RSA1>'   # stored RSA key
 ssh-add -L
 ssh-add -e git@github.com
+```
+
+A plain private key can be loaded the same way with `ssh-add FILE`
+(`ssh-add ~/.ssh/id_ed25519`). The agent then signs with it entirely in
+memory, with no token and no button press; `ssh-add -d FILE` removes that key
+and `ssh-add -D` removes every identity. Only ed25519 keys are accepted, and a
+key stays loaded only for the life of the agent:
+
+```sh
+okagent serve ferris@example.com &
+ssh-add ~/.ssh/id_ed25519
+ssh-add -d ~/.ssh/id_ed25519
 ```
 
 If the key's public key is already known there is no need to read it from
@@ -355,10 +368,15 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   reported as `SSH_AGENT_FAILURE`. Only the lifetime constraint of
   `ssh-add -s -t` is honoured; the provider's PIN and the confirm constraint
   are ignored, and destination or certificate constraints are refused.
-  Extension requests get `SSH_AGENT_EXTENSION_FAILURE` and the SSH protocol
-  1 listing an empty `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's agent
-  replies; everything else, such as adding a private key directly, gets a
-  failure reply, which OpenSSH treats as "unsupported".
+  `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
+  which loads a plain ed25519 private key into the agent; the agent signs with
+  it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
+  / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The
+  in-memory keys are pluggable: key types implement the `LocalKey` trait and
+  one arm of `onlykey_agent::agent::local::decode`. Extension requests get
+  `SSH_AGENT_EXTENSION_FAILURE` and the SSH protocol 1 listing an empty
+  `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's agent replies; everything
+  else gets a failure reply, which OpenSSH treats as "unsupported".
 
 Differences from the Python agent:
 
