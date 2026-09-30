@@ -502,7 +502,9 @@ mod tests {
         SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut confirm).unwrap();
         assert!(matches!(
             parse_request(&confirm),
-            Err(WireError::UnsupportedConstraint(SSH_AGENT_CONSTRAIN_CONFIRM))
+            Err(WireError::UnsupportedConstraint(
+                SSH_AGENT_CONSTRAIN_CONFIRM
+            ))
         ));
 
         let mut extension = body.clone();
@@ -587,7 +589,9 @@ mod tests {
         SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut confirm).unwrap();
         assert!(matches!(
             parse_request(&confirm),
-            Err(WireError::UnsupportedConstraint(SSH_AGENT_CONSTRAIN_CONFIRM))
+            Err(WireError::UnsupportedConstraint(
+                SSH_AGENT_CONSTRAIN_CONFIRM
+            ))
         ));
 
         // A security key is decoded, not rejected.

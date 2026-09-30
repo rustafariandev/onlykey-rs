@@ -613,6 +613,17 @@ and, for a stored key,
 (for example
 .BR ECC3 ).
 .PP
+When a FIDO security key
+.RB ( sk-
+key) is waiting to be touched, the same terminal and notify command are told
+.IR "Security key: touch it to sign as " comment ;
+the notify command then sees
+.B OKAGENT_TOUCH=1
+and
+.B OKAGENT_IDENTITY
+set to the key's comment, and no digits.
+The agent gives up after 30 seconds without a touch.
+.PP
 Every signature is verified against the public key before it is returned to
 the client.
 .PP

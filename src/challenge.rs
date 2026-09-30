@@ -1,4 +1,5 @@
-//! Presenting the 3-digit button challenge to the user.
+//! Presenting the 3-digit button challenge to the user, and the request to
+//! touch a FIDO security key.
 //!
 //! The agent may run without a controlling terminal (daemon mode, agent
 //! forwarding), so the prompt is abstracted behind [`ChallengeSink`].
@@ -40,9 +41,37 @@ impl Challenge {
     }
 }
 
+/// A signing request waiting for the user to touch a FIDO security key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TouchRequest {
+    /// Comment of the key being used, e.g. `ferris@example.com`.
+    pub identity: String,
+    /// What is being signed, if the request could be summarised.
+    pub subject: Option<String>,
+}
+
+impl TouchRequest {
+    /// One-line human-readable prompt.
+    pub fn message(&self) -> String {
+        let subject = self
+            .subject
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        format!(
+            "Security key: touch it to sign as {}{subject}",
+            self.identity
+        )
+    }
+}
+
 /// Somewhere a challenge can be shown.
 pub trait ChallengeSink: Send + Sync {
     fn present(&self, challenge: &Challenge);
+
+    /// Tell the user a FIDO security key is waiting for a touch. The default
+    /// does nothing, for sinks that only handle OnlyKey challenges.
+    fn present_touch(&self, _request: &TouchRequest) {}
 }
 
 /// Writes the prompt to the controlling terminal, or stderr if there is none.
@@ -51,21 +80,31 @@ pub struct TtyPrompt;
 
 impl ChallengeSink for TtyPrompt {
     fn present(&self, challenge: &Challenge) {
-        let line = format!("{}\n", challenge.message());
-        let written = OpenOptions::new()
-            .write(true)
-            .open("/dev/tty")
-            .and_then(|mut tty| tty.write_all(line.as_bytes()));
-        if written.is_err() {
-            let _ = std::io::stderr().write_all(line.as_bytes());
-        }
+        write_tty(&challenge.message());
+    }
+
+    fn present_touch(&self, request: &TouchRequest) {
+        write_tty(&request.message());
+    }
+}
+
+/// Write one line to the controlling terminal, or stderr if there is none.
+fn write_tty(message: &str) {
+    let line = format!("{message}\n");
+    let written = OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .and_then(|mut tty| tty.write_all(line.as_bytes()));
+    if written.is_err() {
+        let _ = std::io::stderr().write_all(line.as_bytes());
     }
 }
 
 /// Runs an external command with the prompt as its last argument, e.g.
 /// `notify-send OnlyKey`. Environment variables `OKAGENT_DIGITS` and
 /// `OKAGENT_IDENTITY` carry the parts separately, and `OKAGENT_SLOT` names
-/// the slot (`ECC3`) when a stored key is used.
+/// the slot (`ECC3`) when a stored key is used. A security-key touch request
+/// sets `OKAGENT_TOUCH=1` and `OKAGENT_IDENTITY`, with no digits.
 #[derive(Debug, Clone)]
 pub struct CommandNotifier {
     program: String,
@@ -96,8 +135,24 @@ impl ChallengeSink for CommandNotifier {
         if let KeySource::Stored(slot) = challenge.source {
             command.env("OKAGENT_SLOT", slot.to_string());
         }
-        let result = command.spawn();
-        match result {
+        self.spawn(command);
+    }
+
+    fn present_touch(&self, request: &TouchRequest) {
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.args)
+            .arg(request.message())
+            .env("OKAGENT_TOUCH", "1")
+            .env("OKAGENT_IDENTITY", &request.identity);
+        self.spawn(command);
+    }
+}
+
+impl CommandNotifier {
+    /// Start `command` and reap it in the background.
+    fn spawn(&self, mut command: Command) {
+        match command.spawn() {
             Ok(mut child) => {
                 std::thread::spawn(move || {
                     let _ = child.wait();
@@ -118,15 +173,28 @@ impl ChallengeSink for MultiSink {
             sink.present(challenge);
         }
     }
+
+    fn present_touch(&self, request: &TouchRequest) {
+        for sink in &self.0 {
+            sink.present_touch(request);
+        }
+    }
 }
 
-/// Records challenges instead of showing them; for tests.
+/// Records challenges and touch requests instead of showing them; for tests.
 #[derive(Debug, Default)]
-pub struct RecordingSink(pub std::sync::Mutex<Vec<Challenge>>);
+pub struct RecordingSink(
+    pub std::sync::Mutex<Vec<Challenge>>,
+    pub std::sync::Mutex<Vec<TouchRequest>>,
+);
 
 impl ChallengeSink for RecordingSink {
     fn present(&self, challenge: &Challenge) {
         self.0.lock().unwrap().push(challenge.clone());
+    }
+
+    fn present_touch(&self, request: &TouchRequest) {
+        self.1.lock().unwrap().push(request.clone());
     }
 }
 
@@ -155,6 +223,23 @@ mod tests {
             stored
                 .message()
                 .contains("sign as ferris@example.com with stored key ECC3 (ssh login to host)")
+        );
+    }
+
+    #[test]
+    fn touch_message_mentions_identity_and_subject() {
+        let r = TouchRequest {
+            identity: "ferris@example.com".into(),
+            subject: Some("ssh login to host".into()),
+        };
+        assert_eq!(
+            r.message(),
+            "Security key: touch it to sign as ferris@example.com (ssh login to host)"
+        );
+        let bare = TouchRequest { subject: None, ..r };
+        assert_eq!(
+            bare.message(),
+            "Security key: touch it to sign as ferris@example.com"
         );
     }
 

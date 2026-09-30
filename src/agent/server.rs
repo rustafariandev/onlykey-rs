@@ -6,7 +6,7 @@ use super::keytype::{KeyDecoder, KeyRegistry};
 use super::local::{LocalKey, LocalKeyError, LocalKeyRef};
 use super::sk::SkKey;
 use super::wire::{self, Request};
-use crate::challenge::ChallengeSink;
+use crate::challenge::{ChallengeSink, TouchRequest};
 use crate::device::{DeviceError, OnlyKey};
 use crate::fido::FidoError;
 use crate::identity::KeySpec;
@@ -764,8 +764,13 @@ impl Agent {
             Target::SecurityKey(key) => {
                 let _guard = self.sk_lock.lock().unwrap_or_else(|p| p.into_inner());
                 let transport = (self.sk_opener)()?;
+                let request = TouchRequest {
+                    identity: key.public_key().comment().to_owned(),
+                    subject: wire::describe_data(data),
+                };
                 let sig = key.sign(transport, data, &|| {
-                    tracing::info!("security key is waiting for a touch")
+                    tracing::info!("security key is waiting for a touch");
+                    self.sink.present_touch(&request);
                 })?;
                 keys::verify(key.public_key(), data, &sig)?;
                 tracing::info!(
@@ -838,15 +843,25 @@ pub fn handle_connection(agent: &Agent, mut stream: UnixStream) {
     }
 }
 
+/// How often [`serve`] drops keys whose lifetime has run out.
+const PURGE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Accept connections until `shutdown` is set. Each connection runs on its
-/// own thread.
+/// own thread. Keys whose lifetime has run out are dropped as it goes.
 pub fn serve(
     listener: UnixListener,
     agent: Arc<Agent>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
+    let mut last_purge = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
+        // Drop keys whose `ssh-add -t` lifetime has run out even when no
+        // client is talking to the agent, so their secrets do not linger.
+        if last_purge.elapsed() >= PURGE_INTERVAL {
+            agent.purge_expired();
+            last_purge = Instant::now();
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let agent = Arc::clone(&agent);
@@ -1764,11 +1779,16 @@ mod tests {
 
         let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
         let sk_opener: SkOpener = Arc::new(move || {
-            let device = FakeFido::new(&seed, "ssh:", &handle, 0x01);
+            let device = FakeFido::new(&seed, "ssh:", &handle, 0x01).with_touch();
             Ok(Box::new(device) as Box<dyn HidTransport>)
         });
-        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()))
-            .with_sk_opener(sk_opener);
+        let sink = Arc::new(RecordingSink::default());
+        let agent = Agent::new(
+            Vec::new(),
+            opener,
+            Arc::clone(&sink) as Arc<dyn ChallengeSink>,
+        )
+        .with_sk_opener(sk_opener);
 
         assert_eq!(agent.handle(&add), wire::success());
 
@@ -1792,6 +1812,12 @@ mod tests {
         assert_eq!(sig.algorithm(), ssh_key::Algorithm::SkEd25519);
         let public_key = PublicKey::from_bytes(&key_blob).unwrap();
         keys::verify(&public_key, b"data", &sig).unwrap();
+
+        // The touch request reached the sink, naming the key.
+        let touches = sink.1.lock().unwrap();
+        assert_eq!(touches.len(), 1);
+        assert_eq!(touches[0].identity, "ferris@example.com");
+        drop(touches);
 
         // Removing by public key takes it away.
         let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];

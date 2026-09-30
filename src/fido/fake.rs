@@ -286,7 +286,10 @@ mod tests {
         let result = get_assertion(&mut hid, "ssh:", &hash, &[1, 2, 3, 4], true, &|| {
             prompts.set(prompts.get() + 1)
         });
-        assert!(matches!(result, Err(crate::fido::FidoError::Timeout)), "{result:?}");
+        assert!(
+            matches!(result, Err(crate::fido::FidoError::Timeout)),
+            "{result:?}"
+        );
         assert_eq!(prompts.get(), 1);
         let device = hid.into_transport();
         assert!(device.cancelled());

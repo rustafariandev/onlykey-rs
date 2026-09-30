@@ -293,8 +293,18 @@ mod tests {
         assert!(is_fido_candidate(yubikey, fido, "/dev/hidraw3", None));
         assert!(!is_fido_candidate(onlykey, fido, "/dev/hidraw5", None));
         // Naming the OnlyKey's interface selects it after all.
-        assert!(is_fido_candidate(onlykey, fido, "/dev/hidraw5", Some("hidraw5")));
-        assert!(!is_fido_candidate(yubikey, fido, "/dev/hidraw3", Some("hidraw5")));
+        assert!(is_fido_candidate(
+            onlykey,
+            fido,
+            "/dev/hidraw5",
+            Some("hidraw5")
+        ));
+        assert!(!is_fido_candidate(
+            yubikey,
+            fido,
+            "/dev/hidraw3",
+            Some("hidraw5")
+        ));
         // Other interfaces are never FIDO candidates.
         let keyboard = (0x0001, 0x0006);
         assert!(!is_fido_candidate(yubikey, keyboard, "/dev/hidraw3", None));
