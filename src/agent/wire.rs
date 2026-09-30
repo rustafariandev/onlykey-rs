@@ -114,13 +114,12 @@ pub enum Request {
     /// `ssh-add -X`: unlock it again.
     Unlock(Vec<u8>),
     /// `ssh-add -s`: add the key named by `provider`. `lifetime` is the
-    /// constraint from `ssh-add -t` (seconds), if any; `pin` and `confirm`
-    /// are accepted but unused.
+    /// constraint from `ssh-add -t` (seconds), if any; `pin` is accepted but
+    /// unused.
     AddSmartcardKey {
         provider: Vec<u8>,
         pin: Vec<u8>,
         lifetime: Option<u32>,
-        confirm: bool,
     },
     /// `ssh-add -e`: remove the key named by `provider`.
     RemoveSmartcardKey {
@@ -162,7 +161,7 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
         SSH2_AGENTC_ADD_ID_CONSTRAINED => {
             let key_type = String::decode(&mut rest)?;
             let key = key_types.decode(&key_type, &mut rest)?;
-            let (lifetime, _confirm) = parse_constraints(&mut rest)?;
+            let lifetime = parse_constraints(&mut rest)?;
             Ok(add_request(key, lifetime))
         }
         SSH2_AGENTC_REMOVE_IDENTITY => {
@@ -177,18 +176,16 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
                 provider,
                 pin,
                 lifetime: None,
-                confirm: false,
             })
         }
         SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => {
             let provider = Vec::<u8>::decode(&mut rest)?;
             let pin = Vec::<u8>::decode(&mut rest)?;
-            let (lifetime, confirm) = parse_constraints(&mut rest)?;
+            let lifetime = parse_constraints(&mut rest)?;
             Ok(Request::AddSmartcardKey {
                 provider,
                 pin,
                 lifetime,
-                confirm,
             })
         }
         SSH_AGENTC_REMOVE_SMARTCARD_KEY => {
@@ -235,20 +232,19 @@ fn add_request(key: HeldKey, lifetime: Option<u32>) -> Request {
 }
 
 /// Decode the constraint list that follows the provider and PIN of a
-/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` request. The lifetime and
-/// confirm constraints are understood, as is the `sk-provider@openssh.com`
+/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` request, returning the lifetime.
+/// The lifetime constraint is understood, as is the `sk-provider@openssh.com`
 /// extension `ssh-add` always attaches to a FIDO key (whose value names the
 /// middleware library; this agent has its own, so it is ignored). Anything
-/// else (destination constraints, associated certificates) is rejected so it
-/// is not silently dropped.
-fn parse_constraints(rest: &mut &[u8]) -> Result<(Option<u32>, bool), WireError> {
+/// else is rejected so it is not silently dropped: the confirm constraint
+/// (`ssh-add -c`), since the agent has no way to ask before each signature,
+/// and destination constraints or associated certificates.
+fn parse_constraints(rest: &mut &[u8]) -> Result<Option<u32>, WireError> {
     let mut lifetime = None;
-    let mut confirm = false;
     while !rest.is_empty() {
         let kind = u8::decode(rest)?;
         match kind {
             SSH_AGENT_CONSTRAIN_LIFETIME => lifetime = Some(u32::decode(rest)?),
-            SSH_AGENT_CONSTRAIN_CONFIRM => confirm = true,
             SSH_AGENT_CONSTRAIN_EXTENSION => {
                 let name = String::decode(rest)?;
                 if name == "sk-provider@openssh.com" {
@@ -260,7 +256,7 @@ fn parse_constraints(rest: &mut &[u8]) -> Result<(Option<u32>, bool), WireError>
             other => return Err(WireError::UnsupportedConstraint(other)),
         }
     }
-    Ok((lifetime, confirm))
+    Ok(lifetime)
 }
 
 /// `SSH2_AGENT_IDENTITIES_ANSWER` listing `keys` with their comments.
@@ -482,7 +478,6 @@ mod tests {
                 provider: b"ferris@example.com".to_vec(),
                 pin: b"pin".to_vec(),
                 lifetime: None,
-                confirm: false,
             }
         );
 
@@ -492,18 +487,23 @@ mod tests {
             .encode(&mut constrained)
             .unwrap();
         60u32.encode(&mut constrained).unwrap();
-        SSH_AGENT_CONSTRAIN_CONFIRM
-            .encode(&mut constrained)
-            .unwrap();
         assert_eq!(
             parse_request(&constrained).unwrap(),
             Request::AddSmartcardKey {
                 provider: b"ferris@example.com".to_vec(),
                 pin: b"pin".to_vec(),
                 lifetime: Some(60),
-                confirm: true,
             }
         );
+
+        // `ssh-add -c` asks for confirmation before each use, which the
+        // agent cannot do, so the add is refused rather than weakened.
+        let mut confirm = constrained.clone();
+        SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut confirm).unwrap();
+        assert!(matches!(
+            parse_request(&confirm),
+            Err(WireError::UnsupportedConstraint(SSH_AGENT_CONSTRAIN_CONFIRM))
+        ));
 
         let mut extension = body.clone();
         extension[0] = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED;
@@ -571,20 +571,24 @@ mod tests {
             Err(WireError::TrailingData)
         ));
 
-        // The constrained add carries a lifetime; confirm is ignored.
+        // The constrained add carries a lifetime.
         let mut constrained = add;
         constrained[0] = SSH2_AGENTC_ADD_ID_CONSTRAINED;
         SSH_AGENT_CONSTRAIN_LIFETIME
             .encode(&mut constrained)
             .unwrap();
         60u32.encode(&mut constrained).unwrap();
-        SSH_AGENT_CONSTRAIN_CONFIRM
-            .encode(&mut constrained)
-            .unwrap();
         match parse_request(&constrained).unwrap() {
             Request::AddIdentity { lifetime, .. } => assert_eq!(lifetime, Some(60)),
             other => panic!("unexpected request {other:?}"),
         }
+        // A confirm constraint is refused rather than silently dropped.
+        let mut confirm = constrained;
+        SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut confirm).unwrap();
+        assert!(matches!(
+            parse_request(&confirm),
+            Err(WireError::UnsupportedConstraint(SSH_AGENT_CONSTRAIN_CONFIRM))
+        ));
 
         // A security key is decoded, not rejected.
         use ssh_key::private::SkEd25519;

@@ -172,8 +172,10 @@ succeeds even while the OnlyKey is unplugged.
 Answer the PKCS#11 PIN prompt with an empty passphrase.
 The lifetime constraint of
 .B ssh-add \-s \-t
-is honoured; the PIN and the confirm constraint are ignored, and destination
-or certificate constraints are refused.
+is honoured and the PIN is ignored. The confirm constraint
+.RB ( "ssh-add \-c" )
+is refused, since the agent cannot ask before each signature, as are
+destination or certificate constraints.
 A private key file given directly to
 .B ssh-add
 .RB ( SSH2_AGENTC_ADD_IDENTITY )
@@ -203,9 +205,9 @@ removes only that key again and
 removes every identity, token-backed or in-memory.
 The lifetime constraint of
 .B ssh-add \-t
-is honoured and the confirm constraint is ignored, as with
-.BR ssh-add \-s ;
-destination or certificate constraints are refused.
+is honoured; the confirm constraint and destination or certificate
+constraints are refused, as with
+.BR "ssh-add \-s" .
 Anything else not listed here is refused.
 .B ssh-add \-x
 locks the agent with a passphrase: until

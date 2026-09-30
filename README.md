@@ -406,8 +406,10 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   backs `ssh-add -e`. The key is derived and verified against the token when
   it is added, so an absent device, an empty slot or a bad provider is
   reported as `SSH_AGENT_FAILURE`. Only the lifetime constraint of
-  `ssh-add -s -t` is honoured; the provider's PIN and the confirm constraint
-  are ignored, and destination or certificate constraints are refused.
+  `ssh-add -t` is honoured, for `ssh-add -s` and `ssh-add FILE` alike; the
+  provider's PIN is ignored, and the confirm constraint (`ssh-add -c`, which
+  the agent cannot honour) and destination or certificate constraints are
+  refused.
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
   which loads a plain ed25519, RSA, ECDSA or DSA private key into the agent;
   the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
