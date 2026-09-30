@@ -6,7 +6,7 @@
 //! agent path — CTAPHID framing, CBOR, signature assembly and verification —
 //! run against a device that actually signs, with no hardware.
 
-use super::ctaphid::{CTAPHID_CBOR, CTAPHID_INIT, CTAPHID_KEEPALIVE};
+use super::ctaphid::{CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_INIT, CTAPHID_KEEPALIVE};
 use crate::protocol::Report;
 use crate::transport::{HidTransport, TransportError};
 use minicbor::{Decoder, Encoder};
@@ -30,7 +30,14 @@ pub struct FakeFido {
     cid: u32,
     out: VecDeque<Report>,
     incoming: Vec<u8>,
-    incoming_len: Option<usize>,
+    /// The command and total length of a message still awaiting
+    /// continuation packets.
+    pending: Option<(u8, usize)>,
+    /// Never reply to a getAssertion; see [`FakeFido::never_touched`].
+    never_touched: bool,
+    /// A request is outstanding and waiting for a touch that never comes.
+    waiting: bool,
+    cancelled: bool,
 }
 
 impl FakeFido {
@@ -47,8 +54,28 @@ impl FakeFido {
             cid: FAKE_CID,
             out: VecDeque::new(),
             incoming: Vec::new(),
-            incoming_len: None,
+            pending: None,
+            never_touched: false,
+            waiting: false,
+            cancelled: false,
         }
+    }
+
+    /// Make the authenticator wait for a touch that never comes: it answers
+    /// every read with an `UPNEEDED` keepalive until it is cancelled.
+    pub fn never_touched(mut self) -> Self {
+        self.never_touched = true;
+        self
+    }
+
+    /// Whether the host sent `CTAPHID_CANCEL`.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// How many getAssertion requests the device received.
+    pub fn requests(&self) -> u32 {
+        self.counter - 1
     }
 
     /// Make the authenticator send a keepalive (as if waiting for a touch)
@@ -76,31 +103,41 @@ impl FakeFido {
     fn handle(&mut self, report: &Report) {
         let cid = u32::from_be_bytes(report[..4].try_into().expect("slice of four"));
         let cmd = report[4];
-        if cmd == CTAPHID_INIT {
-            self.reply_init(cid, &report[7..15]);
-            return;
-        }
-        let bcnt = ((report[5] as usize) << 8) | report[6] as usize;
-        if self.incoming_len.is_none() {
-            self.incoming.clear();
-            let head = bcnt.min(57);
-            self.incoming.extend_from_slice(&report[7..7 + head]);
-            if bcnt <= 57 {
-                let message = std::mem::take(&mut self.incoming);
-                self.process(cmd, &message);
-            } else {
-                self.incoming_len = Some(bcnt);
-            }
-        } else {
-            let total = self.incoming_len.expect("set when a continuation starts");
+        // Bit 7 marks an initialization packet, as a real device checks.
+        if cmd & 0x80 == 0 {
+            let Some((cmd, total)) = self.pending else {
+                return; // a stray continuation; a real device ignores it
+            };
             let remaining = total - self.incoming.len();
             let chunk = remaining.min(59);
             self.incoming.extend_from_slice(&report[5..5 + chunk]);
             if self.incoming.len() == total {
-                self.incoming_len = None;
+                self.pending = None;
                 let message = std::mem::take(&mut self.incoming);
                 self.process(cmd, &message);
             }
+            return;
+        }
+        match cmd {
+            CTAPHID_INIT => self.reply_init(cid, &report[7..15]),
+            CTAPHID_CANCEL => {
+                self.cancelled = true;
+                self.waiting = false;
+                self.out.clear();
+            }
+            CTAPHID_CBOR => {
+                let bcnt = ((report[5] as usize) << 8) | report[6] as usize;
+                self.incoming.clear();
+                let head = bcnt.min(57);
+                self.incoming.extend_from_slice(&report[7..7 + head]);
+                if bcnt <= 57 {
+                    let message = std::mem::take(&mut self.incoming);
+                    self.process(cmd, &message);
+                } else {
+                    self.pending = Some((cmd, bcnt));
+                }
+            }
+            _ => self.push_message(self.cid, super::ctaphid::CTAPHID_ERROR, &[0x01]),
         }
     }
 
@@ -121,13 +158,13 @@ impl FakeFido {
                 return;
             }
         };
-        let _ = &self.application;
         let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
         auth_data.push(self.flags);
         auth_data.extend_from_slice(&self.counter.to_be_bytes());
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&client_data_hash);
         let signature: ssh_key::Signature = self.pair.try_sign(&signed).expect("ed25519 signs");
+        self.counter += 1;
 
         let mut cbor = Vec::new();
         let mut e = Encoder::new(&mut cbor);
@@ -143,7 +180,11 @@ impl FakeFido {
         if self.require_touch {
             self.push_message(self.cid, CTAPHID_KEEPALIVE, &[0x02]);
         }
-        self.push_message(self.cid, CTAPHID_CBOR, &reply);
+        if self.never_touched {
+            self.waiting = true;
+        } else {
+            self.push_message(self.cid, CTAPHID_CBOR, &reply);
+        }
     }
 
     fn push_message(&mut self, cid: u32, cmd: u8, payload: &[u8]) {
@@ -195,7 +236,15 @@ impl HidTransport for FakeFido {
     }
 
     fn read_report(&mut self, _timeout: Duration) -> Result<Option<Report>, TransportError> {
-        Ok(self.out.pop_front())
+        if let Some(report) = self.out.pop_front() {
+            return Ok(Some(report));
+        }
+        // A device left waiting for a touch keeps sending keepalives.
+        if self.waiting {
+            self.push_message(self.cid, CTAPHID_KEEPALIVE, &[0x02]);
+            return Ok(self.out.pop_front());
+        }
+        Ok(None)
     }
 }
 
@@ -224,5 +273,23 @@ mod tests {
         signed.extend_from_slice(&hash);
         let sig = ed25519_dalek::Signature::from_slice(&assertion.signature).unwrap();
         key.verify(&signed, &sig).unwrap();
+    }
+
+    /// A key that is never touched is asked once, cancelled when the touch
+    /// timeout runs out, and never sent the request a second time.
+    #[test]
+    fn an_untouched_key_is_cancelled_not_asked_again() {
+        let device = FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3, 4], 0x01).never_touched();
+        let mut hid = CtapHid::new(device).with_touch_timeout(Duration::from_millis(50));
+        let hash: [u8; 32] = Sha256::digest(b"hello").into();
+        let prompts = std::cell::Cell::new(0);
+        let result = get_assertion(&mut hid, "ssh:", &hash, &[1, 2, 3, 4], true, &|| {
+            prompts.set(prompts.get() + 1)
+        });
+        assert!(matches!(result, Err(crate::fido::FidoError::Timeout)), "{result:?}");
+        assert_eq!(prompts.get(), 1);
+        let device = hid.into_transport();
+        assert!(device.cancelled());
+        assert_eq!(device.requests(), 1);
     }
 }

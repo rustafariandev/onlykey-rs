@@ -20,18 +20,27 @@ const CONT_DATA: usize = PACKET_SIZE - 5;
 /// Largest CTAPHID message (57 + 128 * 59), as in the specification.
 pub const MAX_MESSAGE: usize = INIT_DATA + 128 * CONT_DATA;
 
-pub const CTAPHID_MSG: u8 = 0x03;
-pub const CTAPHID_INIT: u8 = 0x06;
-pub const CTAPHID_CBOR: u8 = 0x10;
-pub const CTAPHID_KEEPALIVE: u8 = 0x3B;
-pub const CTAPHID_ERROR: u8 = 0x3F;
+/// Bit 7 of the command byte marks an initialization packet; a
+/// continuation packet carries a sequence number there instead.
+const TYPE_INIT: u8 = 0x80;
+
+pub const CTAPHID_MSG: u8 = TYPE_INIT | 0x03;
+pub const CTAPHID_INIT: u8 = TYPE_INIT | 0x06;
+pub const CTAPHID_CBOR: u8 = TYPE_INIT | 0x10;
+pub const CTAPHID_CANCEL: u8 = TYPE_INIT | 0x11;
+pub const CTAPHID_KEEPALIVE: u8 = TYPE_INIT | 0x3B;
+pub const CTAPHID_ERROR: u8 = TYPE_INIT | 0x3F;
+
+/// `KEEPALIVE` status: the authenticator is waiting for a touch.
+const STATUS_UPNEEDED: u8 = 0x02;
 
 /// How long to wait before retransmitting when the device says nothing at
 /// all, and how many times to try.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const RETRIES: usize = 15;
-/// How long to keep waiting once the device has asked for a touch.
-const TOUCH_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long to wait in all once the device has started working on a request
+/// (sending keepalives), typically for a touch.
+const TOUCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The result of one read loop: a complete reply, or silence that merits a
 /// retransmission.
@@ -44,6 +53,7 @@ enum Outcome {
 pub struct CtapHid<T: HidTransport> {
     transport: T,
     cid: u32,
+    touch_timeout: Duration,
 }
 
 impl<T: HidTransport> CtapHid<T> {
@@ -52,7 +62,15 @@ impl<T: HidTransport> CtapHid<T> {
         CtapHid {
             transport,
             cid: CID_BROADCAST,
+            touch_timeout: TOUCH_TIMEOUT,
         }
+    }
+
+    /// Change how long to wait once the device has started working on a
+    /// request, typically for a touch. Defaults to 30 seconds.
+    pub fn with_touch_timeout(mut self, timeout: Duration) -> Self {
+        self.touch_timeout = timeout;
+        self
     }
 
     /// Take the transport back.
@@ -94,6 +112,12 @@ impl<T: HidTransport> CtapHid<T> {
 
     /// Send one message and wait for its reply. `on_presence` is called once
     /// if the device asks the user to touch it.
+    ///
+    /// The request is resent only while the device has said nothing at all.
+    /// Once it has acknowledged the request with a keepalive, resending would
+    /// start a second operation (and ask for a second touch), so a device
+    /// that then goes quiet or is not touched in time gets a
+    /// `CTAPHID_CANCEL` and the call fails with [`FidoError::Timeout`].
     pub fn transact(
         &mut self,
         cmd: u8,
@@ -146,14 +170,24 @@ impl<T: HidTransport> CtapHid<T> {
         Ok(packets)
     }
 
-    /// Wait for the reply to `expected`, ignoring keepalives from other
+    /// Wait for the reply to `expected`, ignoring packets from other
     /// channels. Returns `Silent` if nothing at all arrives before the
-    /// retransmit timeout.
+    /// retransmit timeout. After a keepalive, silence or the touch timeout
+    /// cancels the request instead.
     fn receive(&mut self, expected: u8, on_presence: &dyn Fn()) -> Result<Outcome, FidoError> {
         let mut deadline = Instant::now() + READ_TIMEOUT;
+        // Set by the first keepalive and never extended, so a device that
+        // keeps sending keepalives cannot hold the caller forever.
+        let mut busy_until: Option<Instant> = None;
         let mut notified = false;
         loop {
             let now = Instant::now();
+            if let Some(at) = busy_until
+                && (now >= at || now >= deadline)
+            {
+                self.cancel();
+                return Err(FidoError::Timeout);
+            }
             if now >= deadline {
                 return Ok(Outcome::Silent);
             }
@@ -167,18 +201,33 @@ impl<T: HidTransport> CtapHid<T> {
             }
             match packet[4] {
                 CTAPHID_KEEPALIVE => {
-                    if !notified {
+                    if packet[7] == STATUS_UPNEEDED && !notified {
                         notified = true;
                         on_presence();
                     }
-                    // The key is waiting for the user; keep listening.
-                    deadline = Instant::now() + TOUCH_TIMEOUT;
+                    // The device is working on it; keep listening, but only
+                    // for so long in all.
+                    let now = Instant::now();
+                    busy_until.get_or_insert(now + self.touch_timeout);
+                    deadline = now + READ_TIMEOUT;
                 }
                 CTAPHID_ERROR => return Err(FidoError::Hid(packet[7])),
                 cmd if cmd == expected => {
                     return Ok(Outcome::Got(self.read_message(&packet, &mut deadline)?));
                 }
                 cmd => return Err(FidoError::Unexpected { cmd, expected }),
+            }
+        }
+    }
+
+    /// Abandon the request in progress. Best effort: the call is already
+    /// failing, so a write error here changes nothing.
+    fn cancel(&mut self) {
+        if let Ok(packets) = self.frame(CTAPHID_CANCEL, &[]) {
+            for packet in &packets {
+                if self.transport.write_report(packet).is_err() {
+                    return;
+                }
             }
         }
     }
@@ -299,5 +348,64 @@ mod tests {
         hid.cid = 1; // pretend the channel is already allocated
         let got = hid.transact(CTAPHID_CBOR, &[9, 9, 9], &|| {}).unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// Commands go out with the initialization bit set, as the CTAPHID
+    /// specification numbers them.
+    #[test]
+    fn command_bytes_carry_the_init_bit() {
+        for cmd in [
+            CTAPHID_MSG,
+            CTAPHID_INIT,
+            CTAPHID_CBOR,
+            CTAPHID_CANCEL,
+            CTAPHID_KEEPALIVE,
+            CTAPHID_ERROR,
+        ] {
+            assert_eq!(cmd & TYPE_INIT, TYPE_INIT, "{cmd:#04x}");
+        }
+        assert_eq!(CTAPHID_INIT, 0x86);
+        assert_eq!(CTAPHID_CBOR, 0x90);
+        assert_eq!(CTAPHID_KEEPALIVE, 0xBB);
+    }
+
+    /// After a keepalive, the request is not resent: when the touch timeout
+    /// runs out the host sends `CTAPHID_CANCEL` once and gives up.
+    #[test]
+    fn a_touch_timeout_cancels_instead_of_resending() {
+        let request = {
+            let mut p = [0u8; 64];
+            p[..4].copy_from_slice(&1u32.to_be_bytes());
+            p[4] = CTAPHID_CBOR;
+            p[6] = 1;
+            p[7] = 0x42;
+            p
+        };
+        let keepalive = {
+            let mut p = [0u8; 64];
+            p[..4].copy_from_slice(&1u32.to_be_bytes());
+            p[4] = CTAPHID_KEEPALIVE;
+            p[6] = 1;
+            p[7] = STATUS_UPNEEDED;
+            p
+        };
+        let cancel = {
+            let mut p = [0u8; 64];
+            p[..4].copy_from_slice(&1u32.to_be_bytes());
+            p[4] = CTAPHID_CANCEL;
+            p
+        };
+        let transport = ScriptedTransport::new(vec![
+            Step::ExpectWrite(request),
+            Step::Reply(keepalive),
+            Step::ExpectWrite(cancel),
+        ]);
+        let mut hid = CtapHid::new(transport).with_touch_timeout(Duration::ZERO);
+        hid.cid = 1;
+        let prompts = std::cell::Cell::new(0);
+        let result = hid.transact(CTAPHID_CBOR, &[0x42], &|| prompts.set(prompts.get() + 1));
+        assert!(matches!(result, Err(FidoError::Timeout)), "{result:?}");
+        assert_eq!(prompts.get(), 1);
+        hid.into_transport().assert_done();
     }
 }
