@@ -125,8 +125,13 @@ pub enum Request {
     RemoveSmartcardKey {
         provider: Vec<u8>,
     },
-    /// A protocol extension; none are implemented.
-    Extension,
+    /// A protocol extension: a name and the opaque payload after it. Answered
+    /// by a registered [`Extension`](super::extension::Extension), or with
+    /// `SSH_AGENT_EXTENSION_FAILURE` when none matches.
+    Extension {
+        name: String,
+        data: Vec<u8>,
+    },
     /// Any message type this agent does not implement.
     Unsupported(u8),
 }
@@ -206,7 +211,13 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
         }
         SSH_AGENTC_LOCK => Ok(Request::Lock(Vec::<u8>::decode(&mut rest)?)),
         SSH_AGENTC_UNLOCK => Ok(Request::Unlock(Vec::<u8>::decode(&mut rest)?)),
-        SSH_AGENTC_EXTENSION => Ok(Request::Extension),
+        SSH_AGENTC_EXTENSION => {
+            let name = String::decode(&mut rest)?;
+            Ok(Request::Extension {
+                name,
+                data: rest.to_vec(),
+            })
+        }
         SSH2_AGENTC_SIGN_REQUEST => {
             let key_blob = Vec::<u8>::decode(&mut rest)?;
             let data = Vec::<u8>::decode(&mut rest)?;
@@ -409,7 +420,31 @@ mod tests {
     #[test]
     fn legacy_and_extension_requests() {
         assert_eq!(parse_request(&[1]).unwrap(), Request::RequestRsaIdentities);
-        assert_eq!(parse_request(&[27, 1, 2]).unwrap(), Request::Extension);
+        let mut ping = vec![SSH_AGENTC_EXTENSION];
+        "ping".encode(&mut ping).unwrap();
+        ping.extend_from_slice(&[1, 2]);
+        assert_eq!(
+            parse_request(&ping).unwrap(),
+            Request::Extension {
+                name: "ping".to_owned(),
+                data: vec![1, 2],
+            }
+        );
+        // A name with no payload is still a valid extension request.
+        let mut empty = vec![SSH_AGENTC_EXTENSION];
+        "query@openssh.com".encode(&mut empty).unwrap();
+        assert_eq!(
+            parse_request(&empty).unwrap(),
+            Request::Extension {
+                name: "query@openssh.com".to_owned(),
+                data: Vec::new(),
+            }
+        );
+        // A missing name string is malformed, not an extension failure.
+        assert!(matches!(
+            parse_request(&[SSH_AGENTC_EXTENSION]),
+            Err(WireError::Malformed(_))
+        ));
         assert_eq!(rsa_identities_answer(), vec![2, 0, 0, 0, 0]);
         assert_eq!(extension_failure(), vec![28]);
     }

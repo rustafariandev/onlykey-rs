@@ -213,8 +213,9 @@ locks the agent with a passphrase: until
 unlocks it with the same passphrase, it lists no keys and refuses to sign,
 add or remove keys.
 This lock is the SSH agent's own and is separate from the OnlyKey's PIN.
-Protocol extensions are answered with the extension-failure code and the
-SSH protocol 1 key listing with an empty list, as
+The CLI registers no protocol extensions, so extension requests are answered
+with the extension-failure code and the SSH protocol 1 key listing with an
+empty list, as
 .BR ssh-agent (1)
 itself does.
 .SH COMMANDS

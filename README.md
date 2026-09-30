@@ -413,10 +413,16 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
   / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The
   in-memory keys are pluggable: key types implement the `LocalKey` trait and
-  one arm of `onlykey_agent::agent::local::decode`. Extension requests get
-  `SSH_AGENT_EXTENSION_FAILURE` and the SSH protocol 1 listing an empty
-  `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's agent replies; everything
-  else gets a failure reply, which OpenSSH treats as "unsupported".
+  one arm of `onlykey_agent::agent::local::decode`. SSH protocol extension
+  requests are pluggable too: implement `onlykey_agent::agent::Extension` and
+  register it with `Agent::with_extension` (or `register_extension`), and the
+  handler answers the `SSH_AGENTC_EXTENSION` requests whose name it matches,
+  seeing whether the agent is locked through `ExtensionContext`. A handler is
+  not refused automatically while locked, so it decides for itself.
+  Unregistered extensions get `SSH_AGENT_EXTENSION_FAILURE` and the SSH
+  protocol 1 listing an empty `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's
+  agent replies; everything else gets a failure reply, which OpenSSH treats as
+  "unsupported".
 
 Differences from the Python agent:
 

@@ -1,6 +1,7 @@
 //! The agent itself: identity bookkeeping, request handling and the unix
 //! socket server.
 
+use super::extension::{Extension, ExtensionContext};
 use super::local::{LocalKey, LocalKeyError, LocalKeyRef};
 use super::sk::SkKey;
 use super::wire::{self, Request};
@@ -68,6 +69,8 @@ pub struct Agent {
     local: Mutex<Vec<LocalEntry>>,
     /// FIDO credentials added with `ssh-add FILE`, signed by the device.
     security_keys: Mutex<Vec<SkEntry>>,
+    /// Protocol extension handlers, matched by name.
+    extensions: Mutex<Vec<Arc<dyn Extension>>>,
     opener: Opener,
     sk_opener: SkOpener,
     sink: Arc<dyn ChallengeSink>,
@@ -183,6 +186,7 @@ impl Agent {
             ),
             local: Mutex::new(Vec::new()),
             security_keys: Mutex::new(Vec::new()),
+            extensions: Mutex::new(Vec::new()),
             opener,
             sk_opener: default_sk_opener(),
             sink,
@@ -198,6 +202,24 @@ impl Agent {
     pub fn with_sk_opener(mut self, opener: SkOpener) -> Self {
         self.sk_opener = opener;
         self
+    }
+
+    /// Register a protocol extension handler and return the agent, for the
+    /// builder style of [`Self::new`]. A later registration under the same
+    /// name wins.
+    pub fn with_extension(self, extension: impl Extension + 'static) -> Self {
+        self.register_extension(extension);
+        self
+    }
+
+    /// Register a protocol extension handler, answering
+    /// `SSH_AGENTC_EXTENSION` requests whose name it matches. A later
+    /// registration under the same name wins.
+    pub fn register_extension(&self, extension: impl Extension + 'static) {
+        let name = extension.name().to_owned();
+        let mut extensions = self.extensions.lock().unwrap_or_else(|p| p.into_inner());
+        extensions.retain(|e| e.name() != name);
+        extensions.push(Arc::new(extension));
     }
 
     /// Add a FIDO credential to the served identities, with an optional
@@ -607,9 +629,26 @@ impl Agent {
                 tracing::debug!("SSH v1 identities request: answering with none");
                 wire::rsa_identities_answer()
             }
-            Ok(Request::Extension) => {
-                tracing::debug!("extension request: none supported");
-                wire::extension_failure()
+            Ok(Request::Extension { name, data }) => {
+                let extension = {
+                    let extensions = self.extensions.lock().unwrap_or_else(|p| p.into_inner());
+                    extensions
+                        .iter()
+                        .rev()
+                        .find(|e| e.name() == name.as_str())
+                        .cloned()
+                };
+                match extension {
+                    Some(extension) => {
+                        tracing::debug!(extension = %name, "extension request");
+                        let ctx = ExtensionContext::new(self.is_locked());
+                        extension.handle(&ctx, &data).into_body()
+                    }
+                    None => {
+                        tracing::debug!(extension = %name, "unsupported extension request");
+                        wire::extension_failure()
+                    }
+                }
             }
             Ok(Request::Unsupported(kind)) => {
                 tracing::debug!(kind, "unsupported request");
@@ -879,6 +918,7 @@ fn runtime_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ExtensionReply;
     use crate::challenge::RecordingSink;
     use crate::device::Timeouts;
     use crate::identity::{Curve, EccSlot};
@@ -1046,9 +1086,76 @@ mod tests {
         0u32.encode(&mut body).unwrap();
         assert_eq!(agent.handle(&body), wire::failure());
         assert_eq!(agent.handle(&[17]), wire::failure());
-        assert_eq!(agent.handle(&[27]), wire::extension_failure());
+        // A named but unregistered extension is an extension failure; a
+        // nameless one is malformed and gets the plain failure code.
+        assert_eq!(agent.handle(&[27, 0, 0, 0, 0]), wire::extension_failure());
+        assert_eq!(agent.handle(&[27]), wire::failure());
         assert_eq!(agent.handle(&[1]), wire::rsa_identities_answer());
         assert_eq!(agent.handle(&[]), wire::failure());
+    }
+
+    struct Ping;
+
+    impl Extension for Ping {
+        fn name(&self) -> &str {
+            "ping@example.com"
+        }
+
+        fn handle(&self, ctx: &ExtensionContext, data: &[u8]) -> ExtensionReply {
+            match (ctx.locked(), data) {
+                (false, b"ping") => ExtensionReply::Success,
+                (true, b"ping") => ExtensionReply::Failure,
+                (_, b"raw") => ExtensionReply::Raw(vec![42, 1, 2]),
+                _ => ExtensionReply::ExtensionFailure,
+            }
+        }
+    }
+
+    struct PingOverride;
+
+    impl Extension for PingOverride {
+        fn name(&self) -> &str {
+            "ping@example.com"
+        }
+
+        fn handle(&self, _ctx: &ExtensionContext, _data: &[u8]) -> ExtensionReply {
+            ExtensionReply::Raw(vec![7])
+        }
+    }
+
+    #[test]
+    fn registered_extensions_answer_by_name() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent =
+            Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default())).with_extension(Ping);
+
+        let ext = |name: &str, data: &[u8]| {
+            let mut body = vec![wire::SSH_AGENTC_EXTENSION];
+            name.encode(&mut body).unwrap();
+            body.extend_from_slice(data);
+            agent.handle(&body)
+        };
+
+        assert_eq!(ext("ping@example.com", b"ping"), wire::success());
+        assert_eq!(ext("ping@example.com", b"raw"), vec![42, 1, 2]);
+        assert_eq!(ext("ping@example.com", b"nope"), wire::extension_failure());
+        // An unknown name still gets the extension-failure code.
+        assert_eq!(ext("other@example.com", b""), wire::extension_failure());
+
+        // The handler decides what to do while the agent is locked.
+        assert!(agent.lock(b"hunter2"));
+        assert_eq!(ext("ping@example.com", b"ping"), wire::failure());
+    }
+
+    #[test]
+    fn last_extension_registered_under_a_name_wins() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent =
+            Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default())).with_extension(Ping);
+        agent.register_extension(PingOverride);
+        let mut body = vec![wire::SSH_AGENTC_EXTENSION];
+        "ping@example.com".encode(&mut body).unwrap();
+        assert_eq!(agent.handle(&body), vec![7]);
     }
 
     #[test]

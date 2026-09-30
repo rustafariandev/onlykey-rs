@@ -4,7 +4,7 @@ mod common;
 
 use common::SigningFake;
 use onlykey_agent::agent::wire;
-use onlykey_agent::agent::{self, Agent, Opener};
+use onlykey_agent::agent::{self, Agent, Extension, ExtensionContext, ExtensionReply, Opener};
 use onlykey_agent::challenge::RecordingSink;
 use onlykey_agent::identity::{Curve, EccSlot, KeySource, KeySpec, RsaSlot, Slot};
 use ssh_encoding::Decode;
@@ -26,11 +26,18 @@ struct Harness {
 
 impl Harness {
     fn start(entries: Vec<KeySpec>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("agent.sock");
         let sink = Arc::new(RecordingSink::default());
         let opener: Opener = Arc::new(|| Ok(SigningFake::open()));
-        let agent = Arc::new(Agent::new(entries, opener, sink.clone()));
+        let agent = Agent::new(entries, opener, sink.clone());
+        Self::serve(agent, sink)
+    }
+
+    /// Serve an agent the caller built itself, for tests that register
+    /// extensions or otherwise tweak it before the socket opens.
+    fn serve(agent: Agent, sink: Arc<RecordingSink>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let agent = Arc::new(agent);
         let (listener, guard) = agent::bind_socket(&socket).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = {
@@ -695,4 +702,41 @@ fn unsupported_and_unknown_key_requests_get_failure_and_keep_connection() {
     let reply = wire::read_frame(&mut stream).unwrap().unwrap();
     assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
     assert_eq!(h.challenges(), 0);
+}
+
+struct Ping;
+
+impl Extension for Ping {
+    fn name(&self) -> &str {
+        "ping@example.com"
+    }
+
+    fn handle(&self, _ctx: &ExtensionContext, data: &[u8]) -> ExtensionReply {
+        if data == b"ping" {
+            ExtensionReply::Success
+        } else {
+            ExtensionReply::Failure
+        }
+    }
+}
+
+#[test]
+fn registered_extension_answers_over_the_socket() {
+    let sink = Arc::new(RecordingSink::default());
+    let opener: Opener = Arc::new(|| Ok(SigningFake::open()));
+    let agent = Agent::new(entries(), opener, sink.clone()).with_extension(Ping);
+    let h = Harness::serve(agent, sink);
+
+    let mut body = vec![wire::SSH_AGENTC_EXTENSION];
+    b"ping@example.com".as_slice().encode(&mut body).unwrap();
+    body.extend_from_slice(b"ping");
+    assert_eq!(roundtrip(&h.socket, &body), vec![wire::SSH_AGENT_SUCCESS]);
+
+    // Unregistered names are still answered with the extension-failure code.
+    let mut unknown = vec![wire::SSH_AGENTC_EXTENSION];
+    b"nope@example.com".as_slice().encode(&mut unknown).unwrap();
+    assert_eq!(
+        roundtrip(&h.socket, &unknown),
+        vec![wire::SSH_AGENT_EXTENSION_FAILURE]
+    );
 }

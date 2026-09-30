@@ -75,7 +75,8 @@
 //! - [`challenge`]: how the 3-digit challenge reaches the user.
 //! - [`fido`]: the CTAPHID/CTAP2 client that signs with a FIDO authenticator
 //!   when an `sk-` key is served.
-//! - [`agent`]: the SSH agent wire protocol and unix-socket server.
+//! - [`agent`]: the SSH agent wire protocol and unix-socket server;
+//!   [`agent::Extension`] lets callers answer protocol extension requests.
 //!
 //! Any [`HidTransport`] implementation can stand in for the hardware, which is
 //! how the test suite drives the full agent with a fake token.
