@@ -147,9 +147,10 @@ pure-Rust CTAP2 client, so it works with any FIDO2 key (a YubiKey, the
 OnlyKey's own FIDO applet, and so on) and needs no C library. A key made with
 `ssh-keygen -t ed25519-sk` or `-t ecdsa-sk` must be touched to sign; a key
 made with `-O verify-required` needs a PIN, which is not supported yet and is
-refused with a clear error. On a host with more than one authenticator, pass
-`--fido-device /dev/hidrawN` (or set `fido-device` in the config) to choose
-one:
+refused with a clear error. By default the first authenticator other than
+the OnlyKey is used; on a host with more than one, or to sign with the
+OnlyKey's own FIDO applet, pass `--fido-device /dev/hidrawN` (or set
+`fido-device` in the config) to choose one:
 
 ```sh
 okagent serve ferris@example.com &

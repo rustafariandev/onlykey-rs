@@ -438,8 +438,9 @@ Use the FIDO security key whose hidraw or HID path contains
 for
 .B sk-
 keys.
-By default the only attached authenticator is used; with several, the first
-match is chosen.
+By default the first attached authenticator other than the OnlyKey is used
+(with several, a warning names the one chosen); give the OnlyKey's own
+FIDO interface here to sign with it instead.
 The same value can be set with the
 .B fido-device
 config key.

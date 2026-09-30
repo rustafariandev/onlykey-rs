@@ -50,9 +50,9 @@ pub struct Cli {
     pub notify_command: Option<String>,
 
     /// FIDO security key to use for `sk-` keys, by hidraw path substring.
-    /// Defaults to the only attached authenticator.
+    /// Defaults to the first attached authenticator other than the OnlyKey.
     #[arg(long, global = true, value_name = "PATH")]
-    pub fido_device: Option<PathBuf>,
+    pub fido_device: Option<String>,
 
     #[command(subcommand)]
     pub command: Cmd,
@@ -220,7 +220,7 @@ struct Context_ {
     sink: Arc<dyn ChallengeSink>,
     timeouts: Timeouts,
     /// Optional FIDO device path for `sk-` keys.
-    fido_device: Option<PathBuf>,
+    fido_device: Option<String>,
 }
 
 impl Context_ {
@@ -301,8 +301,7 @@ impl Context_ {
         let opener: Opener = Arc::new(move || Ok(OnlyKey::open_with_timeouts(timeouts)?.boxed()));
         let fido_device = self.fido_device.clone();
         let sk_opener: SkOpener = Arc::new(move || {
-            let hint = fido_device.as_deref().and_then(Path::to_str);
-            let transport = HidapiTransport::open_fido(hint)?;
+            let transport = HidapiTransport::open_fido(fido_device.as_deref())?;
             Ok(Box::new(transport) as Box<dyn HidTransport>)
         });
         let agent = Agent::new(entries, opener, Arc::clone(&self.sink)).with_sk_opener(sk_opener);

@@ -85,6 +85,22 @@ fn is_command_interface(info: &DeviceInfo) -> bool {
         && (info.usage_page() == COMMAND_USAGE_PAGE || info.interface_number() == COMMAND_INTERFACE)
 }
 
+/// Whether an enumerated HID interface is a FIDO authenticator to sign with:
+/// one whose path contains `wanted`, or else any but an OnlyKey.
+fn is_fido_candidate(
+    usb_id: (u16, u16),
+    (usage_page, usage): (u16, u16),
+    path: &str,
+    wanted: Option<&str>,
+) -> bool {
+    usage_page == FIDO_USAGE_PAGE
+        && usage == FIDO_USAGE
+        && match wanted {
+            Some(wanted) => path.contains(wanted),
+            None => !USB_IDS.contains(&usb_id),
+        }
+}
+
 /// A real OnlyKey reached through hidapi.
 pub struct HidapiTransport {
     device: HidDevice,
@@ -100,16 +116,18 @@ impl HidapiTransport {
     /// Enumerate and open the attached FIDO security key's CTAPHID interface.
     ///
     /// `device` is an optional path substring, for hosts with more than one
-    /// authenticator; without it the first (sorted) match is used.
+    /// authenticator; without it the first (sorted) match is used. The
+    /// OnlyKey's own FIDO interface is skipped unless `device` names it, so
+    /// the token that serves the agent's other keys is not picked by accident.
     pub fn open_fido(device: Option<&str>) -> Result<Self, TransportError> {
         let device = device.map(str::to_owned);
         let filter = move |info: &DeviceInfo| {
-            info.usage_page() == FIDO_USAGE_PAGE
-                && info.usage() == FIDO_USAGE
-                && device
-                    .as_deref()
-                    .map(|wanted| info.path().to_string_lossy().contains(wanted))
-                    .unwrap_or(true)
+            is_fido_candidate(
+                (info.vendor_id(), info.product_id()),
+                (info.usage_page(), info.usage()),
+                &info.path().to_string_lossy(),
+                device.as_deref(),
+            )
         };
         Self::open_with("FIDO security key", filter, TransportError::NoDevice)
     }
@@ -260,5 +278,25 @@ pub mod fake {
                 Some(Step::ExpectWrite(_)) | None => Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fido_discovery_skips_the_onlykey_unless_named() {
+        let fido = (FIDO_USAGE_PAGE, FIDO_USAGE);
+        let yubikey = (0x1050, 0x0407);
+        let onlykey = USB_IDS[0];
+        assert!(is_fido_candidate(yubikey, fido, "/dev/hidraw3", None));
+        assert!(!is_fido_candidate(onlykey, fido, "/dev/hidraw5", None));
+        // Naming the OnlyKey's interface selects it after all.
+        assert!(is_fido_candidate(onlykey, fido, "/dev/hidraw5", Some("hidraw5")));
+        assert!(!is_fido_candidate(yubikey, fido, "/dev/hidraw3", Some("hidraw5")));
+        // Other interfaces are never FIDO candidates.
+        let keyboard = (0x0001, 0x0006);
+        assert!(!is_fido_candidate(yubikey, keyboard, "/dev/hidraw3", None));
     }
 }

@@ -39,7 +39,7 @@ pub struct Config {
     pub pubkey_file: Option<PathBuf>,
     pub log_file: Option<PathBuf>,
     /// FIDO security key path substring for `sk-` keys.
-    pub fido_device: Option<PathBuf>,
+    pub fido_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
