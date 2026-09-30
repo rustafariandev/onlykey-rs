@@ -200,9 +200,12 @@ Keys enrolled with
 .B ssh-keygen \-O verify-required
 need a PIN, which is not supported yet and is refused.
 .BR "ssh-add \-d " file
-removes only that key again and
+removes only that key again (given the public key of a token-backed identity,
+it removes that identity) and
 .B ssh-add \-D
-removes every identity, token-backed or in-memory.
+removes every identity, token-backed or in-memory, including those from the
+configuration, until the agent restarts or they are added back with
+.BR "ssh-add \-s" .
 The lifetime constraint of
 .B ssh-add \-t
 is honoured; the confirm constraint and destination or certificate

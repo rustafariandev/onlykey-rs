@@ -597,6 +597,11 @@ impl Agent {
                 } else if self.remove_security_key(&key_blob) {
                     tracing::info!("removed security key");
                     wire::success()
+                } else if let Some((spec, _)) = self.device_key(&key_blob)
+                    && self.remove(&spec)
+                {
+                    tracing::info!(identity = %spec.identity, key = %spec.kind, "removed key");
+                    wire::success()
                 } else {
                     tracing::debug!("no such key to remove");
                     wire::failure()
@@ -783,16 +788,20 @@ impl Agent {
         }
     }
 
+    /// The served token key whose public key blob is `key_blob`, if its
+    /// public key is known.
+    fn device_key(&self, key_blob: &[u8]) -> Option<(KeySpec, PublicKey)> {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache
+            .iter()
+            .find(|(_, key)| key.to_bytes().is_ok_and(|b| b == key_blob))
+            .map(|(spec, key)| (spec.clone(), key.clone()))
+    }
+
     fn lookup(&self, key_blob: &[u8]) -> Result<Target, AgentError> {
         self.purge_expired();
-        {
-            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((entry, key)) = cache
-                .iter()
-                .find(|(_, key)| key.to_bytes().map(|b| b == key_blob).unwrap_or(false))
-            {
-                return Ok(Target::Device(entry.clone(), key.clone()));
-            }
+        if let Some((spec, key)) = self.device_key(key_blob) {
+            return Ok(Target::Device(spec, key));
         }
         let local = self.local.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = local.iter().find(|e| e.key.key_blob() == key_blob) {
@@ -1427,6 +1436,25 @@ mod tests {
         assert_eq!(agent.handle(&unlock), wire::success());
         assert_eq!(agent.handle(&remove), wire::success());
         assert!(agent.entries().is_empty());
+    }
+
+    /// `ssh-add -d` of a token key's public key removes it, as it does for
+    /// an in-memory key.
+    #[test]
+    fn remove_identity_removes_a_token_key_by_blob() {
+        let e = entry();
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
+        let raw = protocol::RawPublicKey::Ed25519([0x22; 32]);
+        let key = keys::public_key(&raw, &e.label()).unwrap();
+        assert_eq!(agent.preload([key.clone()]), 1);
+
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        key.to_bytes().unwrap().encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert!(agent.entries().is_empty());
+        assert!(agent.public_keys().is_empty());
+        assert_eq!(agent.handle(&remove), wire::failure());
     }
 
     #[test]

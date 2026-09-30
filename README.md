@@ -124,7 +124,9 @@ ssh-add -e git@github.com
 A plain private key can be loaded the same way with `ssh-add FILE`
 (`ssh-add ~/.ssh/id_ed25519`). The agent then signs with it entirely in
 memory, with no token and no button press; `ssh-add -d FILE` removes that key
-and `ssh-add -D` removes every identity. ed25519, RSA, ECDSA
+(given the `.pub` of a token key, it removes that one too) and `ssh-add -D`
+removes every identity, including those from the config file, until the agent
+restarts or they are added back with `ssh-add -s`. ed25519, RSA, ECDSA
 (`ecdsa-sha2-nistp256`, `-nistp384`, `-nistp521`) and DSA (`ssh-dss`) keys are
 accepted, matching the key types `ssh-agent` itself can hold. An RSA key signs
 `rsa-sha2-256` or `rsa-sha2-512` (a client asking for the legacy SHA-1
