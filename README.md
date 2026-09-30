@@ -21,7 +21,10 @@ Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macO
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
 (stored only). A plain ed25519, RSA, ECDSA (nistp256/384/521) or DSA private
 key can also be loaded into a running agent with `ssh-add FILE` and signed in
-memory, with no token involved.
+memory, with no token involved. FIDO security-key SSH keys
+(`sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com`) can be
+loaded the same way and are signed by the attached authenticator over a
+pure-Rust CTAP2 client, with no C library involved.
 
 ## Setup
 
@@ -137,6 +140,24 @@ ssh-add ~/.ssh/id_ecdsa
 ssh-add -d ~/.ssh/id_rsa
 ```
 
+FIDO security-key SSH keys work the same way. `ssh-add ~/.ssh/id_ed25519_sk`
+(or `id_ecdsa_sk`) loads a key whose private half is actually on the
+authenticator; when a client signs, okagent drives the device with a
+pure-Rust CTAP2 client, so it works with any FIDO2 key (a YubiKey, the
+OnlyKey's own FIDO applet, and so on) and needs no C library. A key made with
+`ssh-keygen -t ed25519-sk` or `-t ecdsa-sk` must be touched to sign; a key
+made with `-O verify-required` needs a PIN, which is not supported yet and is
+refused with a clear error. On a host with more than one authenticator, pass
+`--fido-device /dev/hidrawN` (or set `fido-device` in the config) to choose
+one:
+
+```sh
+okagent serve ferris@example.com &
+ssh-add ~/.ssh/id_ed25519_sk
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/okagent/agent.sock"
+ssh ferris@example.com          # touch the key to sign
+```
+
 If the key's public key is already known there is no need to read it from
 the device: start the agent with `--pubkey-file` and an add for one of those
 identities is served from the file, so `ssh-add -s` works with the OnlyKey
@@ -183,6 +204,7 @@ notify-command = "notify-send OnlyKey"  # optional
 # socket = "/run/user/1000/okagent/agent.sock"
 # pubkey-file = "/home/ferris/.ssh/onlykey.pub"
 # log-file = "/home/ferris/.local/state/okagent.log"
+# fido-device = "/dev/hidraw5"          # optional, for several FIDO keys
 
 [[identity]]
 name = "ferris@example.com"
@@ -361,6 +383,16 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   the PKCS#1 v1.5 padding and returns the signature over four or eight
   reports. The challenge digits are over `SHA-256(digest)`. The comment is
   `<ssh://ferris@example.com|rsa|RSA1>`.
+- FIDO `sk-` keys carry no secret: `ssh-add FILE` sends the public key,
+  application and key handle, which the agent holds. Signing opens the
+  authenticator's CTAPHID interface (HID usage page `0xF1D0`), allocates a
+  channel with `CTAPHID_INIT`, and sends CTAP2 `authenticatorGetAssertion`
+  with `rpId = application`, `clientDataHash = SHA-256(data)` and the key
+  handle in the allow list. The assertion signs `SHA-256(application) ||
+  flags || counter || SHA-256(data)`, which is exactly the SSH `sk-`
+  signature, so the flags and counter from the authenticator data are appended
+  to the signature as `PROTOCOL.u2f` requires. The whole exchange is a
+  pure-Rust implementation of CTAPHID and CTAP2, with CBOR from `minicbor`.
 - Every signature is verified against the public key before it is returned.
   Any device error, timeout or wrong challenge answers the SSH client with
   `SSH_AGENT_FAILURE` and keeps the agent running.

@@ -2,8 +2,9 @@
 //! their replies (draft-miller-ssh-agent).
 
 use super::local::{self, LocalKeyError, LocalKeyRef};
+use super::sk::{self, SkKey};
 use ssh_encoding::{Decode, Encode};
-use ssh_key::{HashAlg, PublicKey, Signature};
+use ssh_key::{Algorithm, HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
 use thiserror::Error;
 
@@ -95,6 +96,12 @@ pub enum Request {
         key: LocalKeyRef,
         lifetime: Option<u32>,
     },
+    /// `ssh-add FILE` of an `sk-` key: a FIDO credential signed by the device.
+    /// `lifetime` is the constraint from `ssh-add -t` (seconds), if any.
+    AddSecurityKey {
+        key: SkKey,
+        lifetime: Option<u32>,
+    },
     /// `ssh-add -d FILE`: remove the identity with this public key blob.
     RemoveIdentity {
         key_blob: Vec<u8>,
@@ -132,6 +139,16 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
         SSH2_AGENTC_ADD_IDENTITY => {
             let key_type = String::decode(&mut rest)?;
+            if sk::is_security_key(&key_type) {
+                let key = sk::decode(&key_type, &mut rest)?;
+                if !rest.is_empty() {
+                    return Err(WireError::TrailingData);
+                }
+                return Ok(Request::AddSecurityKey {
+                    key,
+                    lifetime: None,
+                });
+            }
             let key = local::decode(&key_type, &mut rest)?;
             if !rest.is_empty() {
                 return Err(WireError::TrailingData);
@@ -143,6 +160,11 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
         }
         SSH2_AGENTC_ADD_ID_CONSTRAINED => {
             let key_type = String::decode(&mut rest)?;
+            if sk::is_security_key(&key_type) {
+                let key = sk::decode(&key_type, &mut rest)?;
+                let (lifetime, _confirm) = parse_constraints(&mut rest)?;
+                return Ok(Request::AddSecurityKey { key, lifetime });
+            }
             let key = local::decode(&key_type, &mut rest)?;
             let (lifetime, _confirm) = parse_constraints(&mut rest)?;
             Ok(Request::AddIdentity { key, lifetime })
@@ -200,10 +222,12 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
 }
 
 /// Decode the constraint list that follows the provider and PIN of a
-/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` request. Only the lifetime and
-/// confirm constraints are understood; anything else (destination
-/// constraints, associated certificates) is rejected so it is not silently
-/// dropped.
+/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` request. The lifetime and
+/// confirm constraints are understood, as is the `sk-provider@openssh.com`
+/// extension `ssh-add` always attaches to a FIDO key (whose value names the
+/// middleware library; this agent has its own, so it is ignored). Anything
+/// else (destination constraints, associated certificates) is rejected so it
+/// is not silently dropped.
 fn parse_constraints(rest: &mut &[u8]) -> Result<(Option<u32>, bool), WireError> {
     let mut lifetime = None;
     let mut confirm = false;
@@ -213,7 +237,12 @@ fn parse_constraints(rest: &mut &[u8]) -> Result<(Option<u32>, bool), WireError>
             SSH_AGENT_CONSTRAIN_LIFETIME => lifetime = Some(u32::decode(rest)?),
             SSH_AGENT_CONSTRAIN_CONFIRM => confirm = true,
             SSH_AGENT_CONSTRAIN_EXTENSION => {
-                return Err(WireError::UnsupportedExtension(String::decode(rest)?));
+                let name = String::decode(rest)?;
+                if name == "sk-provider@openssh.com" {
+                    let _provider = String::decode(rest)?;
+                } else {
+                    return Err(WireError::UnsupportedExtension(name));
+                }
             }
             other => return Err(WireError::UnsupportedConstraint(other)),
         }
@@ -234,9 +263,29 @@ pub fn identities_answer(keys: &[PublicKey]) -> Vec<u8> {
 }
 
 /// `SSH2_AGENT_SIGN_RESPONSE` carrying `sig`.
+///
+/// The `sk-` signature types put a one-byte flags field and a four-byte
+/// counter after the signature string, and `ssh-key` 0.6.7 encodes that
+/// trailer consistently only for `sk-ssh-ed25519`; for
+/// `sk-ecdsa-sha2-nistp256` it folds the trailer into the signature string.
+/// Both are written here per `PROTOCOL.u2f` so the reply decodes elsewhere.
 pub fn sign_response(sig: &Signature) -> Vec<u8> {
     let mut blob = Vec::new();
-    sig.encode(&mut blob).expect("vec write");
+    if matches!(
+        sig.algorithm(),
+        Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256
+    ) {
+        sig.algorithm().encode(&mut blob).expect("vec write");
+        let body = sig.as_bytes();
+        let split = body
+            .len()
+            .checked_sub(5)
+            .expect("sk signature carries a trailer");
+        body[..split].encode(&mut blob).expect("vec write");
+        blob.extend_from_slice(&body[split..]);
+    } else {
+        sig.encode(&mut blob).expect("vec write");
+    }
     let mut out = vec![SSH2_AGENT_SIGN_RESPONSE];
     blob.encode(&mut out).expect("vec write");
     out
@@ -500,12 +549,48 @@ mod tests {
             other => panic!("unexpected request {other:?}"),
         }
 
-        // An unsupported key type is a local-key error, not a crash.
+        // A security key is decoded, not rejected.
+        use ssh_key::private::SkEd25519;
+        use ssh_key::public::SkEd25519 as SkEd25519Public;
+        let public = SkEd25519Public::new(Ed25519PublicKey([0x42; 32]), "ssh:");
+        let sk_pair = SkEd25519::new(public, 0x01, [1u8, 2, 3]).unwrap();
         let mut sk = vec![SSH2_AGENTC_ADD_IDENTITY];
         "sk-ssh-ed25519@openssh.com".encode(&mut sk).unwrap();
+        sk_pair.encode(&mut sk).unwrap();
+        "ferris@example.com".encode(&mut sk).unwrap();
+        match parse_request(&sk).unwrap() {
+            Request::AddSecurityKey { key, lifetime } => {
+                assert_eq!(key.public_key().comment(), "ferris@example.com");
+                assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519);
+                assert_eq!(lifetime, None);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        // `ssh-add` sends an sk key as a constrained add carrying the
+        // `sk-provider@openssh.com` extension; it is accepted and ignored.
+        let mut sk_constrained = sk.clone();
+        sk_constrained[0] = SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        SSH_AGENT_CONSTRAIN_EXTENSION
+            .encode(&mut sk_constrained)
+            .unwrap();
+        "sk-provider@openssh.com"
+            .encode(&mut sk_constrained)
+            .unwrap();
+        "internal".encode(&mut sk_constrained).unwrap();
+        match parse_request(&sk_constrained).unwrap() {
+            Request::AddSecurityKey { key, .. } => {
+                assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519)
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        // A malformed security key body is a local-key error, not a crash.
+        let mut truncated = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "sk-ssh-ed25519@openssh.com".encode(&mut truncated).unwrap();
         assert!(matches!(
-            parse_request(&sk),
-            Err(WireError::LocalKey(LocalKeyError::UnsupportedType(_)))
+            parse_request(&truncated),
+            Err(WireError::LocalKey(LocalKeyError::Malformed(_)))
         ));
 
         // A supported type with a malformed body is likewise a local-key
@@ -591,6 +676,34 @@ mod tests {
         let mut b = blob.as_slice();
         assert_eq!(String::decode(&mut b).unwrap(), "ssh-ed25519");
         assert_eq!(Vec::<u8>::decode(&mut b).unwrap(), vec![9u8; 64]);
+    }
+
+    /// An `sk-ecdsa` signature carries its flags/counter after the signature
+    /// string. `ssh-key` 0.6.7 writes them inside the string, so the agent
+    /// encodes the reply itself; it must decode back unchanged.
+    #[test]
+    fn sign_response_encodes_sk_ecdsa_per_u2f_spec() {
+        use ssh_key::Mpint;
+        let mut data = Vec::new();
+        Mpint::from_positive_bytes(&[0x01; 32])
+            .unwrap()
+            .encode(&mut data)
+            .unwrap();
+        Mpint::from_positive_bytes(&[0x02; 32])
+            .unwrap()
+            .encode(&mut data)
+            .unwrap();
+        data.push(0x01);
+        data.extend_from_slice(&7u32.to_be_bytes());
+        let sig = Signature::new(Algorithm::SkEcdsaSha2NistP256, data).unwrap();
+
+        let reply = sign_response(&sig);
+        assert_eq!(reply[0], SSH2_AGENT_SIGN_RESPONSE);
+        let mut r = &reply[1..];
+        let blob = Vec::<u8>::decode(&mut r).unwrap();
+        let decoded = Signature::try_from(blob.as_slice()).unwrap();
+        assert_eq!(decoded.algorithm(), Algorithm::SkEcdsaSha2NistP256);
+        assert_eq!(decoded.as_bytes(), sig.as_bytes());
     }
 
     #[test]

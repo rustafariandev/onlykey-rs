@@ -19,6 +19,10 @@ pub const COMMAND_USAGE_PAGE: u16 = 0xFFAB;
 /// USB interface number of the command interface on the original OnlyKey,
 /// used when the usage page is not reported.
 pub const COMMAND_INTERFACE: i32 = 2;
+/// HID usage page of the FIDO/U2F authenticator interface (CTAPHID).
+pub const FIDO_USAGE_PAGE: u16 = 0xF1D0;
+/// HID usage of the FIDO/U2F authenticator interface.
+pub const FIDO_USAGE: u16 = 0x01;
 
 #[cfg(target_os = "linux")]
 const PERMISSION_HINT: &str =
@@ -30,6 +34,8 @@ const PERMISSION_HINT: &str = "check that no other program has the OnlyKey open"
 pub enum TransportError {
     #[error("no OnlyKey found; is it plugged in?")]
     NotFound,
+    #[error("no FIDO security key found; is one plugged in?")]
+    NoDevice,
     #[error("permission denied opening {path}; {PERMISSION_HINT}")]
     PermissionDenied { path: String },
     #[error("USB HID error: {0}")]
@@ -41,7 +47,10 @@ pub enum TransportError {
 impl TransportError {
     /// Whether waiting and trying again could help.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, TransportError::NotFound | TransportError::Hid(_))
+        matches!(
+            self,
+            TransportError::NotFound | TransportError::NoDevice | TransportError::Hid(_)
+        )
     }
 }
 
@@ -85,21 +94,44 @@ pub struct HidapiTransport {
 impl HidapiTransport {
     /// Enumerate and open the attached OnlyKey's command interface.
     pub fn open() -> Result<Self, TransportError> {
+        Self::open_with("OnlyKey", is_command_interface, TransportError::NotFound)
+    }
+
+    /// Enumerate and open the attached FIDO security key's CTAPHID interface.
+    ///
+    /// `device` is an optional path substring, for hosts with more than one
+    /// authenticator; without it the first (sorted) match is used.
+    pub fn open_fido(device: Option<&str>) -> Result<Self, TransportError> {
+        let device = device.map(str::to_owned);
+        let filter = move |info: &DeviceInfo| {
+            info.usage_page() == FIDO_USAGE_PAGE
+                && info.usage() == FIDO_USAGE
+                && device
+                    .as_deref()
+                    .map(|wanted| info.path().to_string_lossy().contains(wanted))
+                    .unwrap_or(true)
+        };
+        Self::open_with("FIDO security key", filter, TransportError::NoDevice)
+    }
+
+    /// Open the first enumerated interface matching `filter`.
+    fn open_with(
+        label: &str,
+        filter: impl Fn(&DeviceInfo) -> bool,
+        missing: TransportError,
+    ) -> Result<Self, TransportError> {
         let mut api = hid_api().lock().unwrap_or_else(|p| p.into_inner());
         api.refresh_devices()?;
-        let mut candidates: Vec<&DeviceInfo> = api
-            .device_list()
-            .filter(|d| is_command_interface(d))
-            .collect();
+        let mut candidates: Vec<&DeviceInfo> = api.device_list().filter(|d| filter(d)).collect();
         candidates.sort_by_key(|d| d.path().to_bytes().to_vec());
         // macOS lists a device once per top-level usage, all with one path.
         candidates.dedup_by_key(|d| d.path().to_bytes().to_vec());
         let Some(info) = candidates.first() else {
-            return Err(TransportError::NotFound);
+            return Err(missing);
         };
         let path = info.path().to_string_lossy().into_owned();
         if candidates.len() > 1 {
-            tracing::warn!(count = candidates.len(), chosen = %path, "several OnlyKey interfaces matched");
+            tracing::warn!(count = candidates.len(), chosen = %path, "several {label} interfaces matched");
         }
         let device = match info.open_device(&api) {
             Ok(device) => device,
@@ -111,7 +143,7 @@ impl HidapiTransport {
             Err(e) => return Err(e.into()),
         };
         device.set_blocking_mode(true)?;
-        tracing::debug!(%path, "opened OnlyKey");
+        tracing::debug!(%path, "opened {label}");
         Ok(HidapiTransport { device, path })
     }
 

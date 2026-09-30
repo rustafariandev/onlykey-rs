@@ -2,12 +2,14 @@
 //! socket server.
 
 use super::local::{LocalKey, LocalKeyError, LocalKeyRef};
+use super::sk::SkKey;
 use super::wire::{self, Request};
 use crate::challenge::ChallengeSink;
 use crate::device::{DeviceError, OnlyKey};
+use crate::fido::FidoError;
 use crate::identity::KeySpec;
 use crate::keys;
-use crate::transport::HidTransport;
+use crate::transport::{HidTransport, HidapiTransport};
 use nix::sys::stat::{Mode, umask};
 use sha2::{Digest, Sha256};
 use ssh_key::HashAlg;
@@ -26,6 +28,13 @@ use thiserror::Error;
 pub type Device = OnlyKey<Box<dyn HidTransport>>;
 /// How the agent obtains a device for each operation.
 pub type Opener = Arc<dyn Fn() -> Result<Device, DeviceError> + Send + Sync>;
+/// How the agent obtains a FIDO authenticator for each security-key signature.
+pub type SkOpener = Arc<dyn Fn() -> Result<Box<dyn HidTransport>, FidoError> + Send + Sync>;
+
+/// The default: the attached FIDO security key, discovered over hidraw.
+fn default_sk_opener() -> SkOpener {
+    Arc::new(|| Ok(Box::new(HidapiTransport::open_fido(None)?)))
+}
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -37,6 +46,8 @@ pub enum AgentError {
     UnknownKey,
     #[error(transparent)]
     Local(#[from] LocalKeyError),
+    #[error(transparent)]
+    Fido(#[from] FidoError),
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error("provider string is not valid UTF-8")]
@@ -55,10 +66,15 @@ pub struct Agent {
     entries: Mutex<Vec<ServedKey>>,
     /// Private keys added at runtime with `ssh-add FILE`, held in memory.
     local: Mutex<Vec<LocalEntry>>,
+    /// FIDO credentials added with `ssh-add FILE`, signed by the device.
+    security_keys: Mutex<Vec<SkEntry>>,
     opener: Opener,
+    sk_opener: SkOpener,
     sink: Arc<dyn ChallengeSink>,
     /// Serialises every device operation, including the wait for the user.
     device_lock: Mutex<()>,
+    /// Serialises FIDO operations, which also wait for a touch.
+    sk_lock: Mutex<()>,
     cache: Mutex<HashMap<KeySpec, PublicKey>>,
     /// `ssh-add -x` state: a salted hash of the passphrase while locked.
     passphrase_lock: Mutex<Option<PassphraseHash>>,
@@ -90,12 +106,26 @@ impl LocalEntry {
     }
 }
 
+/// One FIDO credential added with `ssh-add FILE`, with an optional expiry.
+struct SkEntry {
+    key: Arc<SkKey>,
+    expires: Option<Instant>,
+}
+
+impl SkEntry {
+    fn expired(&self) -> bool {
+        self.expires.is_some_and(|at| Instant::now() >= at)
+    }
+}
+
 /// What a sign or remove request named, once looked up.
 enum Target {
     /// A key the token holds.
     Device(KeySpec, PublicKey),
     /// A private key held in memory.
     Local(Arc<dyn LocalKey>),
+    /// A FIDO credential signed by the authenticator.
+    SecurityKey(Arc<SkKey>),
 }
 
 /// `Some(Instant)` for a nonzero lifetime in seconds.
@@ -152,12 +182,48 @@ impl Agent {
                     .collect(),
             ),
             local: Mutex::new(Vec::new()),
+            security_keys: Mutex::new(Vec::new()),
             opener,
+            sk_opener: default_sk_opener(),
             sink,
             device_lock: Mutex::new(()),
+            sk_lock: Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
             passphrase_lock: Mutex::new(None),
         }
+    }
+
+    /// Replace how FIDO authenticators are opened (for tests and for a fixed
+    /// `--fido-device` path).
+    pub fn with_sk_opener(mut self, opener: SkOpener) -> Self {
+        self.sk_opener = opener;
+        self
+    }
+
+    /// Add a FIDO credential to the served identities, with an optional
+    /// lifetime from `ssh-add -t`.
+    pub fn add_security_key(&self, key: SkKey, lifetime: Option<u32>) {
+        self.purge_expired();
+        let blob = key.key_blob();
+        let comment = key.public_key().comment().to_owned();
+        let expires = expiry(lifetime);
+        let mut keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
+        keys.retain(|e| e.key.key_blob() != blob);
+        keys.push(SkEntry {
+            key: Arc::new(key),
+            expires,
+        });
+        drop(keys);
+        tracing::info!(comment, "serving security key");
+    }
+
+    /// Remove every FIDO credential with this public key blob. Returns whether
+    /// anything was removed.
+    pub fn remove_security_key(&self, key_blob: &[u8]) -> bool {
+        let mut keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
+        let before = keys.len();
+        keys.retain(|e| e.key.key_blob() != key_blob);
+        keys.len() != before
     }
 
     /// Whether `ssh-add -x` has locked the agent.
@@ -268,6 +334,8 @@ impl Agent {
         }
         let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
         local.retain(|e| !e.expired());
+        let mut security_keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
+        security_keys.retain(|e| !e.expired());
     }
 
     /// Seed the key cache from previously exported public keys, matched by
@@ -332,6 +400,13 @@ impl Agent {
         };
         keys.extend(
             self.local
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .map(|e| e.key.public_key().clone()),
+        );
+        keys.extend(
+            self.security_keys
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .iter()
@@ -455,6 +530,14 @@ impl Agent {
                 self.add_local(key, lifetime);
                 wire::success()
             }
+            Ok(Request::AddSecurityKey { .. }) if self.is_locked() => {
+                tracing::warn!("add key refused: agent is locked");
+                wire::failure()
+            }
+            Ok(Request::AddSecurityKey { key, lifetime }) => {
+                self.add_security_key(key, lifetime);
+                wire::success()
+            }
             Ok(Request::RemoveIdentity { .. }) if self.is_locked() => {
                 tracing::warn!("remove key refused: agent is locked");
                 wire::failure()
@@ -463,8 +546,11 @@ impl Agent {
                 if self.remove_local(&key_blob) {
                     tracing::info!("removed local key");
                     wire::success()
+                } else if self.remove_security_key(&key_blob) {
+                    tracing::info!("removed security key");
+                    wire::success()
                 } else {
-                    tracing::debug!("no such local key to remove");
+                    tracing::debug!("no such key to remove");
                     wire::failure()
                 }
             }
@@ -571,6 +657,10 @@ impl Agent {
             .clear();
         self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.local.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.security_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
     fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
@@ -578,6 +668,7 @@ impl Agent {
         let is_rsa = match &target {
             Target::Local(key) => key.public_key().algorithm().is_rsa(),
             Target::Device(entry, _) => entry.kind.is_rsa(),
+            Target::SecurityKey(_) => false,
         };
         let hash = match wire::rsa_hash(flags) {
             Some(hash) => hash,
@@ -605,6 +696,20 @@ impl Agent {
                 tracing::info!(identity = %entry.identity, key = %entry.kind, algorithm = %sig.algorithm(), "signed");
                 Ok(wire::sign_response(&sig))
             }
+            Target::SecurityKey(key) => {
+                let _guard = self.sk_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let transport = (self.sk_opener)()?;
+                let sig = key.sign(transport, data, &|| {
+                    tracing::info!("security key is waiting for a touch")
+                })?;
+                keys::verify(key.public_key(), data, &sig)?;
+                tracing::info!(
+                    comment = key.public_key().comment(),
+                    algorithm = %sig.algorithm(),
+                    "signed with security key"
+                );
+                Ok(wire::sign_response(&sig))
+            }
         }
     }
 
@@ -620,10 +725,15 @@ impl Agent {
             }
         }
         let local = self.local.lock().unwrap_or_else(|p| p.into_inner());
-        local
+        if let Some(entry) = local.iter().find(|e| e.key.key_blob() == key_blob) {
+            return Ok(Target::Local(Arc::clone(&entry.key)));
+        }
+        drop(local);
+        let security_keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
+        security_keys
             .iter()
             .find(|e| e.key.key_blob() == key_blob)
-            .map(|e| Target::Local(Arc::clone(&e.key)))
+            .map(|e| Target::SecurityKey(Arc::clone(&e.key)))
             .ok_or(AgentError::UnknownKey)
     }
 
@@ -1425,6 +1535,69 @@ mod tests {
 
         // Pretend the lifetime elapsed.
         agent.local.lock().unwrap()[0].expires = Some(Instant::now());
+        assert!(agent.public_keys().is_empty());
+    }
+
+    /// An `sk-ssh-ed25519` key added with `ssh-add FILE` is listed, signs
+    /// through the (fake) authenticator, and is removed by public key.
+    #[test]
+    fn security_key_adds_lists_signs_and_removes() {
+        use crate::agent::sk::SK_SSH_ED25519;
+        use crate::fido::fake::FakeFido;
+        use ssh_key::private::SkEd25519;
+        use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
+
+        let seed = [0x42u8; 32];
+        let handle = [9u8, 8, 7];
+
+        // The key file body, as `ssh-add id_ed25519_sk` would send it.
+        let probe = FakeFido::new(&seed, "ssh:", &handle, 0x01);
+        let public = SkEd25519Public::new(Ed25519PublicKey(probe.public()), "ssh:");
+        let key_blob = PublicKey::new(KeyData::SkEd25519(public.clone()), "ferris@example.com")
+            .to_bytes()
+            .unwrap();
+        let pair = SkEd25519::new(public, 0x01, handle).unwrap();
+        let mut add = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        SK_SSH_ED25519.encode(&mut add).unwrap();
+        pair.encode(&mut add).unwrap();
+        "ferris@example.com".encode(&mut add).unwrap();
+
+        let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
+        let sk_opener: SkOpener = Arc::new(move || {
+            let device = FakeFido::new(&seed, "ssh:", &handle, 0x01);
+            Ok(Box::new(device) as Box<dyn HidTransport>)
+        });
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()))
+            .with_sk_opener(sk_opener);
+
+        assert_eq!(agent.handle(&add), wire::success());
+
+        // It is listed with its comment.
+        let reply = agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
+        assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
+        let mut r = &reply[5..];
+        assert_eq!(Vec::<u8>::decode(&mut r).unwrap(), key_blob);
+        assert_eq!(String::decode(&mut r).unwrap(), "ferris@example.com");
+
+        // Signing drives the authenticator and verifies.
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        key_blob.encode(&mut sign).unwrap();
+        b"data".as_slice().encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        let reply = agent.handle(&sign);
+        assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+        let mut r = &reply[1..];
+        let sig_blob = Vec::<u8>::decode(&mut r).unwrap();
+        let sig = ssh_key::Signature::try_from(sig_blob.as_slice()).unwrap();
+        assert_eq!(sig.algorithm(), ssh_key::Algorithm::SkEd25519);
+        let public_key = PublicKey::from_bytes(&key_blob).unwrap();
+        keys::verify(&public_key, b"data", &sig).unwrap();
+
+        // Removing by public key takes it away.
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        key_blob.encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert_eq!(agent.handle(&remove), wire::failure());
         assert!(agent.public_keys().is_empty());
     }
 

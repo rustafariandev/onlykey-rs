@@ -187,6 +187,16 @@ and DSA
 keys are accepted, and the key is forgotten when the agent exits. DSA only
 works with OpenSSH builds that still enable
 .IR ssh-dss .
+A FIDO security key
+.RB ( sk-ssh-ed25519@openssh.com
+or
+.IR sk-ecdsa-sha2-nistp256@openssh.com )
+is also accepted: it holds no secret, so every signature is made by the
+attached authenticator, which must be touched. See
+.BR \-\-fido\-device .
+Keys enrolled with
+.B ssh-keygen \-O verify-required
+need a PIN, which is not supported yet and is refused.
 .BR "ssh-add \-d " file
 removes only that key again and
 .B ssh-add \-D
@@ -419,6 +429,18 @@ The prompt is still written to the terminal as well.
 See
 .BR "CHALLENGE PROMPT" .
 .TP
+.BI \-\-fido\-device " path"
+Use the FIDO security key whose hidraw or HID path contains
+.I path
+for
+.B sk-
+keys.
+By default the only attached authenticator is used; with several, the first
+match is chosen.
+The same value can be set with the
+.B fido-device
+config key.
+.TP
 .BR \-v ", " \-\-verbose
 Log more.
 Once for informational messages, twice for debug output, three times for
@@ -634,6 +656,10 @@ See
 See
 .BR \-\-log\-file .
 .TP
+.BI fido-device " = \(dq" path \(dq
+See
+.BR \-\-fido\-device .
+.TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
 line.
@@ -668,6 +694,7 @@ notify-command = "notify-send OnlyKey"
 # socket = "/run/user/1000/okagent/agent.sock"
 # pubkey-file = "/home/ferris/.ssh/onlykey.pub"
 # log-file = "/home/ferris/.local/state/okagent.log"
+# fido-device = "/dev/hidraw5"
 
 [[identity]]
 name = "ferris@example.com"

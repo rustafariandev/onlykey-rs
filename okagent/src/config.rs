@@ -5,6 +5,7 @@
 //! notify-command = "notify-send OnlyKey"
 //! socket = "/run/user/1000/okagent/agent.sock"
 //! log-file = "/home/ferris/.local/state/okagent.log"
+//! fido-device = "/dev/hidraw5"  # optional, when several FIDO keys are attached
 //!
 //! [[identity]]
 //! name = "ferris@example.com"
@@ -37,6 +38,8 @@ pub struct Config {
     pub notify_command: Option<String>,
     pub pubkey_file: Option<PathBuf>,
     pub log_file: Option<PathBuf>,
+    /// FIDO security key path substring for `sk-` keys.
+    pub fido_device: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

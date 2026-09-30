@@ -14,6 +14,11 @@
 //! in memory, with no token and no challenge. New in-memory key types implement
 //! [`agent::local::LocalKey`].
 //!
+//! FIDO security-key SSH keys (`sk-ssh-ed25519@openssh.com` and
+//! `sk-ecdsa-sha2-nistp256@openssh.com`) can be loaded the same way; the agent
+//! signs with the attached authenticator through a small pure-Rust CTAP2
+//! client in [`fido`], touch required, no C library involved.
+//!
 //! # Deriving a key and signing
 //!
 //! ```no_run
@@ -68,6 +73,8 @@
 //! - [`identity`], [`keys`]: identity parsing and hashing, curves and slots
 //!   ([`KeySpec`]), SSH encoding.
 //! - [`challenge`]: how the 3-digit challenge reaches the user.
+//! - [`fido`]: the CTAPHID/CTAP2 client that signs with a FIDO authenticator
+//!   when an `sk-` key is served.
 //! - [`agent`]: the SSH agent wire protocol and unix-socket server.
 //!
 //! Any [`HidTransport`] implementation can stand in for the hardware, which is
@@ -76,6 +83,7 @@
 pub mod agent;
 pub mod challenge;
 pub mod device;
+pub mod fido;
 pub mod identity;
 pub mod keys;
 pub mod protocol;

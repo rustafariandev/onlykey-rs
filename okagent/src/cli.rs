@@ -4,13 +4,14 @@ use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
-use onlykey_agent::agent::{self, Agent, Opener};
+use onlykey_agent::agent::{self, Agent, Opener, SkOpener};
 use onlykey_agent::challenge::{ChallengeSink, CommandNotifier, MultiSink, TtyPrompt};
 use onlykey_agent::device::{OnlyKey, Timeouts};
 use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use onlykey_agent::protocol::DeviceStatus;
 use onlykey_agent::ssh_key::HashAlg;
 use onlykey_agent::ssh_key::PublicKey;
+use onlykey_agent::transport::{HidTransport, HidapiTransport};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -47,6 +48,11 @@ pub struct Cli {
     /// (e.g. "notify-send OnlyKey"); also used when no terminal is available.
     #[arg(long, global = true)]
     pub notify_command: Option<String>,
+
+    /// FIDO security key to use for `sk-` keys, by hidraw path substring.
+    /// Defaults to the only attached authenticator.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub fido_device: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Cmd,
@@ -213,6 +219,8 @@ struct Context_ {
     slot: Option<Slot>,
     sink: Arc<dyn ChallengeSink>,
     timeouts: Timeouts,
+    /// Optional FIDO device path for `sk-` keys.
+    fido_device: Option<PathBuf>,
 }
 
 impl Context_ {
@@ -291,7 +299,13 @@ impl Context_ {
         let entries = self.entries(args, additional, &keys)?;
         let timeouts = self.timeouts;
         let opener: Opener = Arc::new(move || Ok(OnlyKey::open_with_timeouts(timeouts)?.boxed()));
-        let agent = Agent::new(entries, opener, Arc::clone(&self.sink));
+        let fido_device = self.fido_device.clone();
+        let sk_opener: SkOpener = Arc::new(move || {
+            let hint = fido_device.as_deref().and_then(Path::to_str);
+            let transport = HidapiTransport::open_fido(hint)?;
+            Ok(Box::new(transport) as Box<dyn HidTransport>)
+        });
+        let agent = Agent::new(entries, opener, Arc::clone(&self.sink)).with_sk_opener(sk_opener);
         if let Some(path) = pubkey_file {
             let matched = agent.preload(keys);
             tracing::info!(matched, path = %path.display(), "preloaded public keys");
@@ -393,6 +407,10 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
             CommandNotifier::parse(cmd).ok_or_else(|| anyhow!("empty notify command"))?;
         sinks.push(Box::new(notifier));
     }
+    let fido_device = cli
+        .fido_device
+        .clone()
+        .or_else(|| config.fido_device.clone());
     let ctx = Context_ {
         config,
         curve,
@@ -400,6 +418,7 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         slot: cli.slot,
         sink: Arc::new(MultiSink(sinks)),
         timeouts: Timeouts::default(),
+        fido_device,
     };
 
     match cli.command {
@@ -861,6 +880,7 @@ mod tests {
             slot: None,
             sink: Arc::new(TtyPrompt),
             timeouts: Timeouts::default(),
+            fido_device: None,
         }
     }
 
