@@ -9,9 +9,9 @@
 //! token's ECC or RSA slots with the OnlyKey app ("stored keys") can be used
 //! the same way; see [`KeySpec::stored`] and [`KeySpec::rsa`].
 //!
-//! A plain ed25519 private key can also be loaded into a running agent with
-//! `ssh-add FILE`; the agent signs with it in memory, with no token and no
-//! challenge. New in-memory key types implement [`agent::local::LocalKey`].
+//! A plain ed25519 or RSA private key can also be loaded into a running agent
+//! with `ssh-add FILE`; the agent signs with it in memory, with no token and
+//! no challenge. New in-memory key types implement [`agent::local::LocalKey`].
 //!
 //! # Deriving a key and signing
 //!

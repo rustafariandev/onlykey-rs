@@ -294,6 +294,64 @@ fn ssh_add_loads_a_regular_ed25519_key() {
     assert_eq!(listed_keys(&h), 0);
 }
 
+/// `ssh-add FILE` loads a plain RSA key too, signing in software with the
+/// digest the client asks for (`rsa-sha2-512` for `ssh-keygen -Y sign`).
+#[test]
+fn ssh_add_loads_a_regular_rsa_key() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(entries());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_rsa");
+    let generated = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "rsa",
+            "-b",
+            "2048",
+            "-N",
+            "",
+            "-C",
+            "regular-rsa@example.com",
+            "-f",
+        ])
+        .arg(&key_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(generated.success(), "ssh-keygen failed");
+
+    assert_eq!(listed_keys(&h), 2, "the two derived keys");
+    assert!(ssh_add_file(&h, &key_path));
+    assert_eq!(listed_keys(&h), 3);
+
+    // The added key really signs, without a challenge on the token.
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with("regular-rsa@example.com"))
+        .expect("added key is listed");
+    assert!(line.starts_with("ssh-rsa "), "{line}");
+    sign_and_check(&h, dir.path(), line, "regular-rsa");
+    assert_eq!(h.challenges(), 0, "a local key must not touch the token");
+
+    // `ssh-add -d FILE` removes just that key.
+    assert!(ssh_add_file(&h, &key_path));
+    assert!(
+        h.cmd("ssh-add")
+            .arg("-d")
+            .arg(&key_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(listed_keys(&h), 2);
+}
+
 #[test]
 fn ssh_add_smartcard_honours_a_lifetime() {
     if !have("ssh-add") {

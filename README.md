@@ -120,13 +120,16 @@ ssh-add -e git@github.com
 A plain private key can be loaded the same way with `ssh-add FILE`
 (`ssh-add ~/.ssh/id_ed25519`). The agent then signs with it entirely in
 memory, with no token and no button press; `ssh-add -d FILE` removes that key
-and `ssh-add -D` removes every identity. Only ed25519 keys are accepted, and a
-key stays loaded only for the life of the agent:
+and `ssh-add -D` removes every identity. ed25519 and RSA keys are accepted; an
+RSA key signs `rsa-sha2-256` or `rsa-sha2-512` (a client asking for the legacy
+SHA-1 `ssh-rsa` signature is refused, as with the token). A key stays loaded
+only for the life of the agent:
 
 ```sh
 okagent serve ferris@example.com &
 ssh-add ~/.ssh/id_ed25519
-ssh-add -d ~/.ssh/id_ed25519
+ssh-add ~/.ssh/id_rsa
+ssh-add -d ~/.ssh/id_rsa
 ```
 
 If the key's public key is already known there is no need to read it from

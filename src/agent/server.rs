@@ -42,7 +42,7 @@ pub enum AgentError {
     #[error("provider string is not valid UTF-8")]
     BadProvider,
     #[error(
-        "client asked for an ssh-rsa (SHA-1) signature, which the OnlyKey cannot produce; it must request rsa-sha2-256 or rsa-sha2-512"
+        "client asked for an ssh-rsa (SHA-1) signature, which is not supported; it must request rsa-sha2-256 or rsa-sha2-512"
     )]
     Sha1Requested,
     #[error(transparent)]
@@ -574,9 +574,19 @@ impl Agent {
     }
 
     fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
-        match self.lookup(key_blob)? {
+        let target = self.lookup(key_blob)?;
+        let is_rsa = match &target {
+            Target::Local(key) => key.public_key().algorithm().is_rsa(),
+            Target::Device(entry, _) => entry.kind.is_rsa(),
+        };
+        let hash = match wire::rsa_hash(flags) {
+            Some(hash) => hash,
+            None if is_rsa => return Err(AgentError::Sha1Requested),
+            None => HashAlg::default(),
+        };
+        match target {
             Target::Local(key) => {
-                let sig = key.sign(data)?;
+                let sig = key.sign(data, hash)?;
                 keys::verify(key.public_key(), data, &sig)?;
                 tracing::info!(
                     comment = key.public_key().comment(),
@@ -585,11 +595,6 @@ impl Agent {
                 Ok(wire::sign_response(&sig))
             }
             Target::Device(entry, key) => {
-                let hash = match wire::rsa_hash(flags) {
-                    Some(hash) => hash,
-                    None if entry.kind.is_rsa() => return Err(AgentError::Sha1Requested),
-                    None => HashAlg::default(),
-                };
                 let subject = wire::describe_data(data);
                 let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
                 let mut device = (self.opener)()?;
@@ -1241,6 +1246,54 @@ mod tests {
             agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]),
             vec![12, 0, 0, 0, 0]
         );
+    }
+
+    fn local_rsa_key(comment: &str) -> (Vec<u8>, PublicKey) {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        let sk = rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../../tests/common/rsa2048.pem"))
+            .unwrap();
+        let pair = ssh_key::private::RsaKeypair::try_from(&sk).unwrap();
+        let public = PublicKey::new(ssh_key::public::KeyData::Rsa(pair.public.clone()), comment);
+        let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-rsa".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        (body, public)
+    }
+
+    #[test]
+    fn local_rsa_key_signs_with_the_requested_digest() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let (add, public) = local_rsa_key("old@example.com");
+        let blob = public.to_bytes().unwrap();
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let sign_request = |flags: u32| {
+            let mut body = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+            blob.encode(&mut body).unwrap();
+            b"data".as_slice().encode(&mut body).unwrap();
+            flags.encode(&mut body).unwrap();
+            body
+        };
+        // The legacy SHA-1 `ssh-rsa` request is refused, like the token.
+        assert_eq!(agent.handle(&sign_request(0)), wire::failure());
+
+        for (flags, hash) in [
+            (wire::SSH_AGENT_RSA_SHA2_256, HashAlg::Sha256),
+            (wire::SSH_AGENT_RSA_SHA2_512, HashAlg::Sha512),
+        ] {
+            let reply = agent.handle(&sign_request(flags));
+            assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+            let mut r = &reply[1..];
+            let sig_blob = Vec::<u8>::decode(&mut r).unwrap();
+            let sig = ssh_key::Signature::try_from(sig_blob.as_slice()).unwrap();
+            assert_eq!(
+                sig.algorithm(),
+                ssh_key::Algorithm::Rsa { hash: Some(hash) }
+            );
+            keys::verify(&public, b"data", &sig).unwrap();
+        }
     }
 
     #[test]

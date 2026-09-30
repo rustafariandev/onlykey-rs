@@ -457,6 +457,7 @@ mod tests {
 
     #[test]
     fn add_and_remove_identity_requests() {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
         use ssh_key::private::Ed25519Keypair;
 
         let pair = Ed25519Keypair::from_seed(&[0x11; 32]);
@@ -500,12 +501,32 @@ mod tests {
         }
 
         // An unsupported key type is a local-key error, not a crash.
-        let mut rsa = vec![SSH2_AGENTC_ADD_IDENTITY];
-        "ssh-rsa".encode(&mut rsa).unwrap();
+        let mut dss = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-dss".encode(&mut dss).unwrap();
         assert!(matches!(
-            parse_request(&rsa),
+            parse_request(&dss),
             Err(WireError::LocalKey(LocalKeyError::UnsupportedType(_)))
         ));
+
+        // An `ssh-rsa` add is decoded into a local key.
+        let sk = rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../../tests/common/rsa2048.pem"))
+            .unwrap();
+        let rsa_pair = ssh_key::private::RsaKeypair::try_from(&sk).unwrap();
+        let mut rsa = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-rsa".encode(&mut rsa).unwrap();
+        rsa_pair.encode(&mut rsa).unwrap();
+        "old@example.com".encode(&mut rsa).unwrap();
+        match parse_request(&rsa).unwrap() {
+            Request::AddIdentity { key, lifetime } => {
+                assert_eq!(key.comment(), "old@example.com");
+                assert_eq!(
+                    key.public_key().algorithm(),
+                    ssh_key::Algorithm::Rsa { hash: None }
+                );
+                assert_eq!(lifetime, None);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
 
         let mut remove = vec![SSH2_AGENTC_REMOVE_IDENTITY];
         blob.encode(&mut remove).unwrap();
