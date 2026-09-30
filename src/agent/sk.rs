@@ -38,11 +38,6 @@ pub struct SkKey {
     public: PublicKey,
 }
 
-/// Whether `key_type` names a FIDO security key this agent can hold.
-pub fn is_security_key(key_type: &str) -> bool {
-    matches!(key_type, SK_SSH_ED25519 | SK_ECDSA_P256)
-}
-
 /// Decode the type-specific fields of an `ADD_IDENTITY` request body for a
 /// security key, plus the trailing comment.
 pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<SkKey, LocalKeyError> {

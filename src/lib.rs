@@ -11,8 +11,10 @@
 //!
 //! A plain ed25519, RSA, ECDSA (nistp256/384/521) or DSA private key can also
 //! be loaded into a running agent with `ssh-add FILE`; the agent signs with it
-//! in memory, with no token and no challenge. New in-memory key types implement
-//! [`agent::local::LocalKey`].
+//! in memory, with no token and no challenge. The key types the agent can load
+//! are pluggable: implement [`agent::KeyDecoder`] and register it with
+//! [`agent::Agent::register_key_type`]. In-memory keys are signed by a
+//! [`agent::local::LocalKey`] implementation.
 //!
 //! FIDO security-key SSH keys (`sk-ssh-ed25519@openssh.com` and
 //! `sk-ecdsa-sha2-nistp256@openssh.com`) can be loaded the same way; the agent
@@ -76,7 +78,8 @@
 //! - [`fido`]: the CTAPHID/CTAP2 client that signs with a FIDO authenticator
 //!   when an `sk-` key is served.
 //! - [`agent`]: the SSH agent wire protocol and unix-socket server;
-//!   [`agent::Extension`] lets callers answer protocol extension requests.
+//!   [`agent::Extension`] lets callers answer protocol extension requests and
+//!   [`agent::KeyDecoder`] lets them add key types.
 //!
 //! Any [`HidTransport`] implementation can stand in for the hardware, which is
 //! how the test suite drives the full agent with a fake token.

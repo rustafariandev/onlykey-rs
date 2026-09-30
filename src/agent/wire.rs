@@ -1,8 +1,9 @@
 //! SSH agent wire protocol: framing, the requests this agent serves, and
 //! their replies (draft-miller-ssh-agent).
 
-use super::local::{self, LocalKeyError, LocalKeyRef};
-use super::sk::{self, SkKey};
+use super::keytype::{HeldKey, KeyRegistry};
+use super::local::{LocalKeyError, LocalKeyRef};
+use super::sk::SkKey;
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{Algorithm, HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
@@ -136,43 +137,33 @@ pub enum Request {
     Unsupported(u8),
 }
 
-/// Decode one request body (without its length prefix).
+/// Decode one request body (without its length prefix), resolving key types
+/// through the built-in [`KeyRegistry`] only. Use [`parse_request_with`] to
+/// honour key types registered by a caller.
 pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
+    parse_request_with(&KeyRegistry::builtin(), body)
+}
+
+/// Decode one request body (without its length prefix), resolving the key type
+/// of an `ADD_IDENTITY` request through `key_types`.
+pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Request, WireError> {
     let (&kind, mut rest) = body.split_first().ok_or(WireError::Empty)?;
     match kind {
         SSH_AGENTC_REQUEST_RSA_IDENTITIES => Ok(Request::RequestRsaIdentities),
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
         SSH2_AGENTC_ADD_IDENTITY => {
             let key_type = String::decode(&mut rest)?;
-            if sk::is_security_key(&key_type) {
-                let key = sk::decode(&key_type, &mut rest)?;
-                if !rest.is_empty() {
-                    return Err(WireError::TrailingData);
-                }
-                return Ok(Request::AddSecurityKey {
-                    key,
-                    lifetime: None,
-                });
-            }
-            let key = local::decode(&key_type, &mut rest)?;
+            let key = key_types.decode(&key_type, &mut rest)?;
             if !rest.is_empty() {
                 return Err(WireError::TrailingData);
             }
-            Ok(Request::AddIdentity {
-                key,
-                lifetime: None,
-            })
+            Ok(add_request(key, None))
         }
         SSH2_AGENTC_ADD_ID_CONSTRAINED => {
             let key_type = String::decode(&mut rest)?;
-            if sk::is_security_key(&key_type) {
-                let key = sk::decode(&key_type, &mut rest)?;
-                let (lifetime, _confirm) = parse_constraints(&mut rest)?;
-                return Ok(Request::AddSecurityKey { key, lifetime });
-            }
-            let key = local::decode(&key_type, &mut rest)?;
+            let key = key_types.decode(&key_type, &mut rest)?;
             let (lifetime, _confirm) = parse_constraints(&mut rest)?;
-            Ok(Request::AddIdentity { key, lifetime })
+            Ok(add_request(key, lifetime))
         }
         SSH2_AGENTC_REMOVE_IDENTITY => {
             let key_blob = Vec::<u8>::decode(&mut rest)?;
@@ -229,6 +220,17 @@ pub fn parse_request(body: &[u8]) -> Result<Request, WireError> {
             })
         }
         other => Ok(Request::Unsupported(other)),
+    }
+}
+
+/// Wrap a decoded key in the `Request` variant for its signing capability.
+fn add_request(key: HeldKey, lifetime: Option<u32>) -> Request {
+    match key {
+        HeldKey::Local(key) => Request::AddIdentity { key, lifetime },
+        HeldKey::SecurityKey(key) => Request::AddSecurityKey {
+            key: *key,
+            lifetime,
+        },
     }
 }
 

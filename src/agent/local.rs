@@ -4,7 +4,8 @@
 //! OnlyKey and no challenge. Keys arrive over the agent protocol as an
 //! `SSH2_AGENTC_ADD_IDENTITY` request (`ssh-add ~/.ssh/id_ed25519`); see
 //! [`crate::agent::wire`]. New key types are added by implementing [`LocalKey`]
-//! and one arm of [`decode`], without touching the server.
+//! and a [`KeyDecoder`](super::keytype::KeyDecoder) registered on the agent,
+//! without touching the server.
 
 use sha2::{Sha256, Sha512};
 use signature::{SignatureEncoding, Signer};
@@ -283,8 +284,8 @@ impl fmt::Debug for DsaLocalKey {
 /// Decode the type-specific private fields of an `ADD_IDENTITY` request body,
 /// plus the trailing comment, leaving the reader just past the comment.
 ///
-/// This is the extension point for new local key types: add an arm for the key
-/// type and an implementation of [`LocalKey`].
+/// These are the built-in key types. A caller can add or replace a key type
+/// with a [`KeyDecoder`](super::keytype::KeyDecoder) registered on the agent.
 pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<LocalKeyRef, LocalKeyError> {
     match key_type {
         "ssh-ed25519" => {

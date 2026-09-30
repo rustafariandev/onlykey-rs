@@ -2,6 +2,7 @@
 //! socket server.
 
 use super::extension::{Extension, ExtensionContext};
+use super::keytype::{KeyDecoder, KeyRegistry};
 use super::local::{LocalKey, LocalKeyError, LocalKeyRef};
 use super::sk::SkKey;
 use super::wire::{self, Request};
@@ -71,6 +72,8 @@ pub struct Agent {
     security_keys: Mutex<Vec<SkEntry>>,
     /// Protocol extension handlers, matched by name.
     extensions: Mutex<Vec<Arc<dyn Extension>>>,
+    /// Key-type decoders for `ssh-add FILE`, matched by the request's key type.
+    key_types: Mutex<KeyRegistry>,
     opener: Opener,
     sk_opener: SkOpener,
     sink: Arc<dyn ChallengeSink>,
@@ -187,6 +190,7 @@ impl Agent {
             local: Mutex::new(Vec::new()),
             security_keys: Mutex::new(Vec::new()),
             extensions: Mutex::new(Vec::new()),
+            key_types: Mutex::new(KeyRegistry::builtin()),
             opener,
             sk_opener: default_sk_opener(),
             sink,
@@ -220,6 +224,24 @@ impl Agent {
         let mut extensions = self.extensions.lock().unwrap_or_else(|p| p.into_inner());
         extensions.retain(|e| e.name() != name);
         extensions.push(Arc::new(extension));
+    }
+
+    /// Register a key-type decoder for `ssh-add FILE` and return the agent,
+    /// for the builder style of [`Self::new`]. A later registration under a
+    /// name wins, so a built-in key type can be replaced as well as extended.
+    pub fn with_key_type(self, decoder: impl KeyDecoder + 'static) -> Self {
+        self.register_key_type(decoder);
+        self
+    }
+
+    /// Register a key-type decoder, consulted for `SSH2_AGENTC_ADD_IDENTITY`
+    /// requests whose key type it answers. A later registration under a name
+    /// wins.
+    pub fn register_key_type(&self, decoder: impl KeyDecoder + 'static) {
+        self.key_types
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(decoder);
     }
 
     /// Add a FIDO credential to the served identities, with an optional
@@ -498,7 +520,11 @@ impl Agent {
 
     /// Handle one request body and produce the reply body.
     pub fn handle(&self, body: &[u8]) -> Vec<u8> {
-        match wire::parse_request(body) {
+        let request = {
+            let key_types = self.key_types.lock().unwrap_or_else(|p| p.into_inner());
+            wire::parse_request_with(&key_types, body)
+        };
+        match request {
             Ok(Request::RequestIdentities) if self.is_locked() => {
                 tracing::debug!("listing identities: agent is locked, none");
                 wire::identities_answer(&[])
@@ -1463,6 +1489,73 @@ mod tests {
             agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]),
             vec![12, 0, 0, 0, 0]
         );
+    }
+
+    /// Build an `ADD_IDENTITY` body for a made-up key type, `ssh-custom`,
+    /// carrying the same body as an ed25519 key.
+    fn custom_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
+        use ssh_key::private::Ed25519Keypair;
+        let pair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let public = PublicKey::new(ssh_key::public::KeyData::Ed25519(pair.public), comment);
+        let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-custom@example.com".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        (body, public)
+    }
+
+    /// A key type registered with `register_key_type` is served end to end:
+    /// the agent decodes, lists and signs with it through the registry.
+    #[test]
+    fn a_registered_key_type_is_served_end_to_end() {
+        struct CustomDecoder;
+
+        impl KeyDecoder for CustomDecoder {
+            fn key_types(&self) -> &[&str] {
+                &["ssh-custom@example.com"]
+            }
+
+            fn decode(
+                &self,
+                _key_type: &str,
+                reader: &mut &[u8],
+            ) -> Result<crate::agent::HeldKey, LocalKeyError> {
+                crate::agent::local::decode("ssh-ed25519", reader).map(crate::agent::HeldKey::Local)
+            }
+        }
+
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let (add, public) = custom_key(0x21, "custom@example.com");
+        let blob = public.to_bytes().unwrap();
+
+        // Without the decoder the key type is unknown and the add fails...
+        let plain = Agent::new(
+            Vec::new(),
+            Arc::clone(&opener),
+            Arc::new(RecordingSink::default()),
+        );
+        assert_eq!(plain.handle(&add), wire::failure());
+
+        // ...but registering it makes the agent decode and serve it.
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()))
+            .with_key_type(CustomDecoder);
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let reply = agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
+        let mut r = &reply[5..];
+        assert_eq!(Vec::<u8>::decode(&mut r).unwrap(), blob);
+        assert_eq!(String::decode(&mut r).unwrap(), "custom@example.com");
+
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        blob.encode(&mut sign).unwrap();
+        b"data".as_slice().encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        let reply = agent.handle(&sign);
+        assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+        let mut r = &reply[1..];
+        let sig_blob = Vec::<u8>::decode(&mut r).unwrap();
+        let sig = ssh_key::Signature::try_from(sig_blob.as_slice()).unwrap();
+        keys::verify(&public, b"data", &sig).unwrap();
     }
 
     fn local_rsa_key(comment: &str) -> (Vec<u8>, PublicKey) {

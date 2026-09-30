@@ -411,9 +411,13 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
   which loads a plain ed25519, RSA, ECDSA or DSA private key into the agent;
   the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
-  / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The
-  in-memory keys are pluggable: key types implement the `LocalKey` trait and
-  one arm of `onlykey_agent::agent::local::decode`. SSH protocol extension
+  / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The key
+  types the agent can load are pluggable: implement
+  `onlykey_agent::agent::KeyDecoder` and register it with
+  `Agent::with_key_type` (or `register_key_type`); the built-in ed25519, RSA,
+  ECDSA, DSA and FIDO `sk-` types are registered the same way, and a later
+  registration under a name wins. An in-memory key is signed by a
+  `LocalKey` implementation. SSH protocol extension
   requests are pluggable too: implement `onlykey_agent::agent::Extension` and
   register it with `Agent::with_extension` (or `register_extension`), and the
   handler answers the `SSH_AGENTC_EXTENSION` requests whose name it matches,
