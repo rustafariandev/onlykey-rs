@@ -99,7 +99,8 @@ string such as
 .BR ferris@example.com ,
 and every signature must be confirmed on the device by entering a
 three-digit challenge on its buttons.
-A plain ed25519 private key can instead be loaded into a running agent with
+A plain ed25519, RSA, ECDSA or DSA private key can instead be loaded into a
+running agent with
 .B ssh-add
 (see below), in which case it is held in the agent's memory and signed in
 software, with no token involvement.
@@ -178,8 +179,14 @@ A private key file given directly to
 .RB ( SSH2_AGENTC_ADD_IDENTITY )
 is loaded into the agent: the key is held in memory and every signature is
 made in software, with no OnlyKey and no challenge, even while another key is
-being served. Only ed25519 keys are accepted, and the key is forgotten when
-the agent exits.
+being served. ed25519, RSA, ECDSA
+.RB ( ecdsa-sha2-nistp256 ,
+.IR \-nistp384 " and " \-nistp521 )
+and DSA
+.RB ( ssh-dss )
+keys are accepted, and the key is forgotten when the agent exits. DSA only
+works with OpenSSH builds that still enable
+.IR ssh-dss .
 .BR "ssh-add \-d " file
 removes only that key again and
 .B ssh-add \-D
@@ -808,13 +815,14 @@ okagent \-\-slot RSA1 ssh ferris@old.example.com
 .EE
 .RE
 .PP
-Load a plain ed25519 private key into a running agent (signed in memory, no
-token):
+Load a plain ed25519, RSA or ECDSA private key into a running agent (signed in
+memory, no token):
 .PP
 .RS
 .EX
 okagent serve ferris@example.com &
 ssh\-add ~/.ssh/id_ed25519
+ssh\-add ~/.ssh/id_ecdsa
 ssh\-add \-d ~/.ssh/id_ed25519
 .EE
 .RE

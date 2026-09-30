@@ -352,6 +352,99 @@ fn ssh_add_loads_a_regular_rsa_key() {
     assert_eq!(listed_keys(&h), 2);
 }
 
+/// `ssh-add FILE` loads a plain ECDSA key on any NIST curve, signing in
+/// software with the curve's own digest.
+#[test]
+fn ssh_add_loads_a_regular_ecdsa_key() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    for (bits, name) in [(256, "nistp256"), (384, "nistp384"), (521, "nistp521")] {
+        let h = Harness::start(entries());
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join(format!("id_ecdsa_{bits}"));
+        let comment = format!("regular-{name}@example.com");
+        let generated = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ecdsa",
+                "-b",
+                &bits.to_string(),
+                "-N",
+                "",
+                "-C",
+                &comment,
+                "-f",
+            ])
+            .arg(&key_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(generated.success(), "ssh-keygen failed for {name}");
+
+        assert_eq!(listed_keys(&h), 2, "the two derived keys");
+        assert!(ssh_add_file(&h, &key_path), "{name}");
+
+        let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.ends_with(&comment))
+            .unwrap_or_else(|| panic!("{name} key is listed: {text}"));
+        assert!(line.starts_with(&format!("ecdsa-sha2-{name} ")), "{line}");
+        sign_and_check(&h, dir.path(), line, name);
+        assert_eq!(h.challenges(), 0, "a local key must not touch the token");
+
+        assert!(
+            h.cmd("ssh-add")
+                .arg("-d")
+                .arg(&key_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(listed_keys(&h), 2, "{name}");
+    }
+}
+
+/// `ssh-add FILE` loads a plain DSA key where OpenSSH still supports DSA.
+/// Since OpenSSH 9.8 `ssh-dss` is compiled out by default, so this skips on
+/// modern builds; the agent path is covered by unit tests either way.
+#[test]
+fn ssh_add_loads_a_regular_dsa_key() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(entries());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_dsa");
+    let generated = Command::new("ssh-keygen")
+        .args(["-t", "dsa", "-N", "", "-C", "regular-dsa@example.com", "-f"])
+        .arg(&key_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    if !generated.success() {
+        eprintln!("ssh-keygen has no DSA support; skipping");
+        return;
+    }
+
+    assert!(ssh_add_file(&h, &key_path));
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with("regular-dsa@example.com"))
+        .expect("added key is listed");
+    assert!(line.starts_with("ssh-dss "), "{line}");
+    sign_and_check(&h, dir.path(), line, "regular-dsa");
+    assert_eq!(h.challenges(), 0, "a local key must not touch the token");
+}
+
 #[test]
 fn ssh_add_smartcard_honours_a_lifetime() {
     if !have("ssh-add") {

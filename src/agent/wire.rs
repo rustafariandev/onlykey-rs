@@ -501,11 +501,20 @@ mod tests {
         }
 
         // An unsupported key type is a local-key error, not a crash.
+        let mut sk = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "sk-ssh-ed25519@openssh.com".encode(&mut sk).unwrap();
+        assert!(matches!(
+            parse_request(&sk),
+            Err(WireError::LocalKey(LocalKeyError::UnsupportedType(_)))
+        ));
+
+        // A supported type with a malformed body is likewise a local-key
+        // error, not a crash.
         let mut dss = vec![SSH2_AGENTC_ADD_IDENTITY];
         "ssh-dss".encode(&mut dss).unwrap();
         assert!(matches!(
             parse_request(&dss),
-            Err(WireError::LocalKey(LocalKeyError::UnsupportedType(_)))
+            Err(WireError::LocalKey(LocalKeyError::Malformed("ssh-dss")))
         ));
 
         // An `ssh-rsa` add is decoded into a local key.

@@ -19,8 +19,9 @@ Two crates:
 
 Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macOS.
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
-(stored only). A plain ed25519 private key can also be loaded into a running
-agent with `ssh-add FILE` and signed in memory, with no token involved.
+(stored only). A plain ed25519, RSA, ECDSA (nistp256/384/521) or DSA private
+key can also be loaded into a running agent with `ssh-add FILE` and signed in
+memory, with no token involved.
 
 ## Setup
 
@@ -120,15 +121,19 @@ ssh-add -e git@github.com
 A plain private key can be loaded the same way with `ssh-add FILE`
 (`ssh-add ~/.ssh/id_ed25519`). The agent then signs with it entirely in
 memory, with no token and no button press; `ssh-add -d FILE` removes that key
-and `ssh-add -D` removes every identity. ed25519 and RSA keys are accepted; an
-RSA key signs `rsa-sha2-256` or `rsa-sha2-512` (a client asking for the legacy
-SHA-1 `ssh-rsa` signature is refused, as with the token). A key stays loaded
-only for the life of the agent:
+and `ssh-add -D` removes every identity. ed25519, RSA, ECDSA
+(`ecdsa-sha2-nistp256`, `-nistp384`, `-nistp521`) and DSA (`ssh-dss`) keys are
+accepted, matching the key types `ssh-agent` itself can hold. An RSA key signs
+`rsa-sha2-256` or `rsa-sha2-512` (a client asking for the legacy SHA-1
+`ssh-rsa` signature is refused, as with the token); ECDSA uses the curve's own
+digest and DSA uses SHA-1. DSA only works with OpenSSH builds that still enable
+`ssh-dss`. A key stays loaded only for the life of the agent:
 
 ```sh
 okagent serve ferris@example.com &
 ssh-add ~/.ssh/id_ed25519
 ssh-add ~/.ssh/id_rsa
+ssh-add ~/.ssh/id_ecdsa
 ssh-add -d ~/.ssh/id_rsa
 ```
 
@@ -372,8 +377,8 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   `ssh-add -s -t` is honoured; the provider's PIN and the confirm constraint
   are ignored, and destination or certificate constraints are refused.
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
-  which loads a plain ed25519 private key into the agent; the agent signs with
-  it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
+  which loads a plain ed25519, RSA, ECDSA or DSA private key into the agent;
+  the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
   / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The
   in-memory keys are pluggable: key types implement the `LocalKey` trait and
   one arm of `onlykey_agent::agent::local::decode`. Extension requests get

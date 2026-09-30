@@ -1296,6 +1296,74 @@ mod tests {
         }
     }
 
+    fn local_ecdsa_key(curve: ssh_key::EcdsaCurve, comment: &str) -> (Vec<u8>, PublicKey) {
+        let pair = ssh_key::private::EcdsaKeypair::random(&mut rand_core::OsRng, curve).unwrap();
+        let public = PublicKey::new(
+            ssh_key::public::KeyData::Ecdsa(ssh_key::public::EcdsaPublicKey::from(&pair)),
+            comment,
+        );
+        let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        ssh_key::Algorithm::Ecdsa { curve }
+            .as_str()
+            .encode(&mut body)
+            .unwrap();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        (body, public)
+    }
+
+    fn local_dsa_key(comment: &str) -> (Vec<u8>, PublicKey) {
+        let pair = ssh_key::private::DsaKeypair::random(&mut rand_core::OsRng).unwrap();
+        let public = PublicKey::new(
+            ssh_key::public::KeyData::Dsa(ssh_key::public::DsaPublicKey::from(&pair)),
+            comment,
+        );
+        let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-dss".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        (body, public)
+    }
+
+    /// The ECDSA and DSA local keys are added and sign through the agent with
+    /// no device and no challenge, as ed25519 and RSA do.
+    #[test]
+    fn local_ecdsa_and_dsa_keys_sign_without_the_device() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let cases = [
+            local_ecdsa_key(ssh_key::EcdsaCurve::NistP256, "p256@example.com"),
+            local_ecdsa_key(ssh_key::EcdsaCurve::NistP384, "p384@example.com"),
+            local_ecdsa_key(ssh_key::EcdsaCurve::NistP521, "p521@example.com"),
+            local_dsa_key("dsa@example.com"),
+        ];
+        for (add, public) in cases {
+            let blob = public.to_bytes().unwrap();
+            assert_eq!(agent.handle(&add), wire::success());
+            let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+            blob.encode(&mut sign).unwrap();
+            b"data".as_slice().encode(&mut sign).unwrap();
+            0u32.encode(&mut sign).unwrap();
+            let reply = agent.handle(&sign);
+            assert_eq!(
+                reply[0],
+                wire::SSH2_AGENT_SIGN_RESPONSE,
+                "{}",
+                public.algorithm()
+            );
+            let mut r = &reply[1..];
+            let sig_blob = Vec::<u8>::decode(&mut r).unwrap();
+            let sig = ssh_key::Signature::try_from(sig_blob.as_slice()).unwrap();
+            assert_eq!(sig.algorithm(), public.algorithm());
+            keys::verify(&public, b"data", &sig).unwrap();
+
+            let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+            blob.encode(&mut remove).unwrap();
+            assert_eq!(agent.handle(&remove), wire::success());
+        }
+        assert!(agent.public_keys().is_empty());
+    }
+
     #[test]
     fn remove_all_clears_token_and_local_keys() {
         let e = entry();
