@@ -2,8 +2,8 @@
 //! socket server.
 
 use super::extension::{Extension, ExtensionContext};
-use super::keytype::{KeyDecoder, KeyRegistry};
-use super::local::{LocalKey, LocalKeyError, LocalKeyRef};
+use super::keytype::{HeldKey, KeyDecoder, KeyRegistry};
+use super::local::{LocalKeyError, LocalKeyRef};
 use super::sk::SkKey;
 use super::wire::{self, Request};
 use crate::challenge::{ChallengeSink, TouchRequest};
@@ -65,11 +65,10 @@ pub enum AgentError {
 /// Agent state shared between connections. Each [`KeySpec`] it serves is
 /// one identity in the SSH sense.
 pub struct Agent {
-    entries: Mutex<Vec<ServedKey>>,
-    /// Private keys added at runtime with `ssh-add FILE`, held in memory.
-    local: Mutex<Vec<LocalEntry>>,
-    /// FIDO credentials added with `ssh-add FILE`, signed by the device.
-    security_keys: Mutex<Vec<SkEntry>>,
+    entries: Mutex<Vec<Timed<KeySpec>>>,
+    /// Keys added at runtime with `ssh-add FILE`: private keys held in memory
+    /// and FIDO credentials signed by the authenticator.
+    held: Mutex<Vec<Timed<Arc<HeldKey>>>>,
     /// Protocol extension handlers, matched by name.
     extensions: Mutex<Vec<Arc<dyn Extension>>>,
     /// Key-type decoders for `ssh-add FILE`, matched by the request's key type.
@@ -86,59 +85,33 @@ pub struct Agent {
     passphrase_lock: Mutex<Option<PassphraseHash>>,
 }
 
-/// One identity the agent serves from the token, with an optional expiry from
-/// the lifetime constraint of an `ssh-add -s -t` request.
-struct ServedKey {
-    spec: KeySpec,
+/// A served identity with an optional expiry from the lifetime constraint of
+/// an `ssh-add -t` request.
+struct Timed<T> {
+    item: T,
     expires: Option<Instant>,
 }
 
-impl ServedKey {
+impl<T> Timed<T> {
+    /// `lifetime` is in seconds; `None` or zero never expires.
+    fn new(item: T, lifetime: Option<u32>) -> Self {
+        let expires = lifetime
+            .filter(|secs| *secs > 0)
+            .map(|secs| Instant::now() + Duration::from_secs(secs as u64));
+        Timed { item, expires }
+    }
+
     fn expired(&self) -> bool {
         self.expires.is_some_and(|at| Instant::now() >= at)
     }
 }
 
-/// One in-memory private key added with `ssh-add FILE`, with an optional
-/// expiry from the lifetime constraint of `ssh-add -t FILE`.
-struct LocalEntry {
-    key: Arc<dyn LocalKey>,
-    expires: Option<Instant>,
-}
-
-impl LocalEntry {
-    fn expired(&self) -> bool {
-        self.expires.is_some_and(|at| Instant::now() >= at)
-    }
-}
-
-/// One FIDO credential added with `ssh-add FILE`, with an optional expiry.
-struct SkEntry {
-    key: Arc<SkKey>,
-    expires: Option<Instant>,
-}
-
-impl SkEntry {
-    fn expired(&self) -> bool {
-        self.expires.is_some_and(|at| Instant::now() >= at)
-    }
-}
-
-/// What a sign or remove request named, once looked up.
+/// What a sign request named, once looked up.
 enum Target {
     /// A key the token holds.
-    Device(KeySpec, PublicKey),
-    /// A private key held in memory.
-    Local(Arc<dyn LocalKey>),
-    /// A FIDO credential signed by the authenticator.
-    SecurityKey(Arc<SkKey>),
-}
-
-/// `Some(Instant)` for a nonzero lifetime in seconds.
-fn expiry(lifetime: Option<u32>) -> Option<Instant> {
-    lifetime
-        .filter(|secs| *secs > 0)
-        .map(|secs| Instant::now() + Duration::from_secs(secs as u64))
+    Device(KeySpec, Box<PublicKey>),
+    /// A key added with `ssh-add FILE`.
+    Held(Arc<HeldKey>),
 }
 
 /// A salted SHA-256 of the lock passphrase, so the passphrase itself is not
@@ -181,14 +154,10 @@ impl Agent {
             entries: Mutex::new(
                 entries
                     .into_iter()
-                    .map(|spec| ServedKey {
-                        spec,
-                        expires: None,
-                    })
+                    .map(|spec| Timed::new(spec, None))
                     .collect(),
             ),
-            local: Mutex::new(Vec::new()),
-            security_keys: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
             extensions: Mutex::new(Vec::new()),
             key_types: Mutex::new(KeyRegistry::builtin()),
             opener,
@@ -244,30 +213,27 @@ impl Agent {
             .register(decoder);
     }
 
-    /// Add a FIDO credential to the served identities, with an optional
-    /// lifetime from `ssh-add -t`.
-    pub fn add_security_key(&self, key: SkKey, lifetime: Option<u32>) {
+    /// Serve a key added with `ssh-add FILE` (a private key held in memory or
+    /// a FIDO credential), with an optional lifetime from `ssh-add -t`. A key
+    /// already served is replaced, so a fresh lifetime takes effect.
+    pub fn add_key(&self, key: HeldKey, lifetime: Option<u32>) {
         self.purge_expired();
         let blob = key.key_blob();
         let comment = key.public_key().comment().to_owned();
-        let expires = expiry(lifetime);
-        let mut keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
-        keys.retain(|e| e.key.key_blob() != blob);
-        keys.push(SkEntry {
-            key: Arc::new(key),
-            expires,
-        });
-        drop(keys);
-        tracing::info!(comment, "serving security key");
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        held.retain(|e| e.item.key_blob() != blob);
+        held.push(Timed::new(Arc::new(key), lifetime));
+        drop(held);
+        tracing::info!(comment, "serving added key");
     }
 
-    /// Remove every FIDO credential with this public key blob. Returns whether
-    /// anything was removed.
-    pub fn remove_security_key(&self, key_blob: &[u8]) -> bool {
-        let mut keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
-        let before = keys.len();
-        keys.retain(|e| e.key.key_blob() != key_blob);
-        keys.len() != before
+    /// Stop serving the key added with `ssh-add FILE` whose public key blob is
+    /// `key_blob`. Returns whether anything was removed.
+    pub fn remove_key(&self, key_blob: &[u8]) -> bool {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let before = held.len();
+        held.retain(|e| e.item.key_blob() != key_blob);
+        held.len() != before
     }
 
     /// Whether `ssh-add -x` has locked the agent.
@@ -314,7 +280,7 @@ impl Agent {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .map(|e| e.spec.clone())
+            .map(|e| e.item.clone())
             .collect()
     }
 
@@ -337,7 +303,7 @@ impl Agent {
     pub fn remove(&self, spec: &KeySpec) -> bool {
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let before = entries.len();
-        entries.retain(|e| &e.spec != spec);
+        entries.retain(|e| &e.item != spec);
         let removed = entries.len() != before;
         drop(entries);
         if removed {
@@ -352,10 +318,9 @@ impl Agent {
     /// Record `spec` in the entry list, replacing any existing entry so a
     /// fresh lifetime takes effect.
     fn remember(&self, spec: KeySpec, lifetime: Option<u32>) {
-        let expires = expiry(lifetime);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        entries.retain(|e| e.spec != spec);
-        entries.push(ServedKey { spec, expires });
+        entries.retain(|e| e.item != spec);
+        entries.push(Timed::new(spec, lifetime));
     }
 
     /// Drop entries whose lifetime has elapsed, along with their cached keys.
@@ -365,7 +330,7 @@ impl Agent {
         entries.retain(|e| {
             let alive = !e.expired();
             if !alive {
-                expired.push(e.spec.clone());
+                expired.push(e.item.clone());
             }
             alive
         });
@@ -376,10 +341,10 @@ impl Agent {
                 cache.remove(&spec);
             }
         }
-        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
-        local.retain(|e| !e.expired());
-        let mut security_keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
-        security_keys.retain(|e| !e.expired());
+        self.held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|e| !e.expired());
     }
 
     /// Seed the key cache from previously exported public keys, matched by
@@ -443,18 +408,11 @@ impl Agent {
                 .collect()
         };
         keys.extend(
-            self.local
+            self.held
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .iter()
-                .map(|e| e.key.public_key().clone()),
-        );
-        keys.extend(
-            self.security_keys
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .map(|e| e.key.public_key().clone()),
+                .map(|e| e.item.public_key().clone()),
         );
         keys
     }
@@ -575,15 +533,7 @@ impl Agent {
                 wire::failure()
             }
             Ok(Request::AddIdentity { key, lifetime }) => {
-                self.add_local(key, lifetime);
-                wire::success()
-            }
-            Ok(Request::AddSecurityKey { .. }) if self.is_locked() => {
-                tracing::warn!("add key refused: agent is locked");
-                wire::failure()
-            }
-            Ok(Request::AddSecurityKey { key, lifetime }) => {
-                self.add_security_key(key, lifetime);
+                self.add_key(key, lifetime);
                 wire::success()
             }
             Ok(Request::RemoveIdentity { .. }) if self.is_locked() => {
@@ -591,11 +541,8 @@ impl Agent {
                 wire::failure()
             }
             Ok(Request::RemoveIdentity { key_blob }) => {
-                if self.remove_local(&key_blob) {
-                    tracing::info!("removed local key");
-                    wire::success()
-                } else if self.remove_security_key(&key_blob) {
-                    tracing::info!("removed security key");
+                if self.remove_key(&key_blob) {
+                    tracing::info!("removed added key");
                     wire::success()
                 } else if let Some((spec, _)) = self.device_key(&key_blob)
                     && self.remove(&spec)
@@ -692,53 +639,22 @@ impl Agent {
         }
     }
 
-    /// Add a private key held in memory, replacing any of the same public key
-    /// so a fresh lifetime takes effect.
-    fn add_local(&self, key: LocalKeyRef, lifetime: Option<u32>) {
-        self.purge_expired();
-        let blob = key.key_blob();
-        let comment = key.comment().to_owned();
-        let expires = expiry(lifetime);
-        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
-        local.retain(|e| e.key.key_blob() != blob);
-        local.push(LocalEntry {
-            key: Arc::from(key.into_inner()),
-            expires,
-        });
-        drop(local);
-        tracing::info!(comment, "serving local key");
-    }
-
-    /// Remove every in-memory key with this public key blob. Returns whether
-    /// anything was removed.
-    fn remove_local(&self, key_blob: &[u8]) -> bool {
-        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
-        let before = local.len();
-        local.retain(|e| e.key.key_blob() != key_blob);
-        local.len() != before
-    }
-
     /// Drop every identity: token-backed entries, their cached keys, and the
-    /// in-memory private keys. Backs `ssh-add -D`.
+    /// keys added with `ssh-add FILE`. Backs `ssh-add -D`.
     fn remove_all(&self) {
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.local.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.security_keys
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
+        self.held.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
         let target = self.lookup(key_blob)?;
         let is_rsa = match &target {
-            Target::Local(key) => key.public_key().algorithm().is_rsa(),
             Target::Device(entry, _) => entry.kind.is_rsa(),
-            Target::SecurityKey(_) => false,
+            Target::Held(key) => key.public_key().algorithm().is_rsa(),
         };
         let hash = match wire::rsa_hash(flags) {
             Some(hash) => hash,
@@ -746,15 +662,10 @@ impl Agent {
             None => HashAlg::default(),
         };
         match target {
-            Target::Local(key) => {
-                let sig = key.sign(data, hash)?;
-                keys::verify(key.public_key(), data, &sig)?;
-                tracing::info!(
-                    comment = key.public_key().comment(),
-                    "signed with local key"
-                );
-                Ok(wire::sign_response(&sig))
-            }
+            Target::Held(held) => match held.as_ref() {
+                HeldKey::Local(key) => self.sign_local(key, data, hash),
+                HeldKey::SecurityKey(key) => self.sign_security_key(key, data),
+            },
             Target::Device(entry, key) => {
                 let subject = wire::describe_data(data);
                 let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -766,26 +677,44 @@ impl Agent {
                 tracing::info!(identity = %entry.identity, key = %entry.kind, algorithm = %sig.algorithm(), "signed");
                 Ok(wire::sign_response(&sig))
             }
-            Target::SecurityKey(key) => {
-                let _guard = self.sk_lock.lock().unwrap_or_else(|p| p.into_inner());
-                let transport = (self.sk_opener)()?;
-                let request = TouchRequest {
-                    identity: key.public_key().comment().to_owned(),
-                    subject: wire::describe_data(data),
-                };
-                let sig = key.sign(transport, data, &|| {
-                    tracing::info!("security key is waiting for a touch");
-                    self.sink.present_touch(&request);
-                })?;
-                keys::verify(key.public_key(), data, &sig)?;
-                tracing::info!(
-                    comment = key.public_key().comment(),
-                    algorithm = %sig.algorithm(),
-                    "signed with security key"
-                );
-                Ok(wire::sign_response(&sig))
-            }
         }
+    }
+
+    /// Sign in software with a private key held in memory.
+    fn sign_local(
+        &self,
+        key: &LocalKeyRef,
+        data: &[u8],
+        hash: HashAlg,
+    ) -> Result<Vec<u8>, AgentError> {
+        let sig = key.sign(data, hash)?;
+        keys::verify(key.public_key(), data, &sig)?;
+        tracing::info!(
+            comment = key.public_key().comment(),
+            "signed with local key"
+        );
+        Ok(wire::sign_response(&sig))
+    }
+
+    /// Sign with a FIDO credential, waiting for the authenticator's touch.
+    fn sign_security_key(&self, key: &SkKey, data: &[u8]) -> Result<Vec<u8>, AgentError> {
+        let _guard = self.sk_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let transport = (self.sk_opener)()?;
+        let request = TouchRequest {
+            identity: key.public_key().comment().to_owned(),
+            subject: wire::describe_data(data),
+        };
+        let sig = key.sign(transport, data, &|| {
+            tracing::info!("security key is waiting for a touch");
+            self.sink.present_touch(&request);
+        })?;
+        keys::verify(key.public_key(), data, &sig)?;
+        tracing::info!(
+            comment = key.public_key().comment(),
+            algorithm = %sig.algorithm(),
+            "signed with security key"
+        );
+        Ok(wire::sign_response(&sig))
     }
 
     /// The served token key whose public key blob is `key_blob`, if its
@@ -801,18 +730,12 @@ impl Agent {
     fn lookup(&self, key_blob: &[u8]) -> Result<Target, AgentError> {
         self.purge_expired();
         if let Some((spec, key)) = self.device_key(key_blob) {
-            return Ok(Target::Device(spec, key));
+            return Ok(Target::Device(spec, Box::new(key)));
         }
-        let local = self.local.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = local.iter().find(|e| e.key.key_blob() == key_blob) {
-            return Ok(Target::Local(Arc::clone(&entry.key)));
-        }
-        drop(local);
-        let security_keys = self.security_keys.lock().unwrap_or_else(|p| p.into_inner());
-        security_keys
-            .iter()
-            .find(|e| e.key.key_blob() == key_blob)
-            .map(|e| Target::SecurityKey(Arc::clone(&e.key)))
+        let held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        held.iter()
+            .find(|e| e.item.key_blob() == key_blob)
+            .map(|e| Target::Held(Arc::clone(&e.item)))
             .ok_or(AgentError::UnknownKey)
     }
 
@@ -1562,7 +1485,7 @@ mod tests {
                 &self,
                 _key_type: &str,
                 reader: &mut &[u8],
-            ) -> Result<crate::agent::HeldKey, LocalKeyError> {
+            ) -> Result<crate::agent::HeldKey, crate::agent::KeyDecodeError> {
                 crate::agent::local::decode("ssh-ed25519", reader).map(crate::agent::HeldKey::Local)
             }
         }
@@ -1777,7 +1700,7 @@ mod tests {
         assert_eq!(agent.public_keys().len(), 1);
 
         // Pretend the lifetime elapsed.
-        agent.local.lock().unwrap()[0].expires = Some(Instant::now());
+        agent.held.lock().unwrap()[0].expires = Some(Instant::now());
         assert!(agent.public_keys().is_empty());
     }
 

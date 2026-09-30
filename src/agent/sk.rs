@@ -6,7 +6,7 @@
 //! `SSH2_AGENTC_ADD_IDENTITY`, decoded here; signing goes through
 //! [`crate::fido`].
 
-use super::local::LocalKeyError;
+use super::keytype::KeyDecodeError;
 use crate::fido;
 use crate::fido::ctaphid::CtapHid;
 use crate::transport::HidTransport;
@@ -40,7 +40,7 @@ pub struct SkKey {
 
 /// Decode the type-specific fields of an `ADD_IDENTITY` request body for a
 /// security key, plus the trailing comment.
-pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<SkKey, LocalKeyError> {
+pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<SkKey, KeyDecodeError> {
     match key_type {
         SK_SSH_ED25519 => {
             let key = SkEd25519::decode(reader).map_err(|_| malformed(SK_SSH_ED25519))?;
@@ -67,12 +67,12 @@ pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<SkKey, LocalKe
                 public,
             })
         }
-        other => Err(LocalKeyError::UnsupportedType(other.to_owned())),
+        other => Err(KeyDecodeError::UnsupportedType(other.to_owned())),
     }
 }
 
-fn malformed(key_type: &'static str) -> LocalKeyError {
-    LocalKeyError::Malformed(key_type)
+fn malformed(key_type: &'static str) -> KeyDecodeError {
+    KeyDecodeError::Malformed(key_type)
 }
 
 impl SkKey {

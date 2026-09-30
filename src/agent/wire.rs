@@ -1,9 +1,8 @@
 //! SSH agent wire protocol: framing, the requests this agent serves, and
 //! their replies (draft-miller-ssh-agent).
 
+use super::keytype::KeyDecodeError;
 use super::keytype::{HeldKey, KeyRegistry};
-use super::local::{LocalKeyError, LocalKeyRef};
-use super::sk::SkKey;
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{Algorithm, HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
@@ -69,7 +68,7 @@ pub enum WireError {
     #[error("malformed request: {0}")]
     Malformed(#[from] ssh_encoding::Error),
     #[error(transparent)]
-    LocalKey(#[from] LocalKeyError),
+    Key(#[from] KeyDecodeError),
     #[error("unexpected trailing bytes in request")]
     TrailingData,
     #[error("unsupported key constraint {0:#04x}")]
@@ -91,16 +90,11 @@ pub enum Request {
         data: Vec<u8>,
         flags: u32,
     },
-    /// `ssh-add FILE`: add the private key held in memory. `lifetime` is the
-    /// constraint from `ssh-add -t` (seconds), if any.
+    /// `ssh-add FILE`: add a private key held in memory, or a FIDO credential
+    /// signed by the device. `lifetime` is the constraint from `ssh-add -t`
+    /// (seconds), if any.
     AddIdentity {
-        key: LocalKeyRef,
-        lifetime: Option<u32>,
-    },
-    /// `ssh-add FILE` of an `sk-` key: a FIDO credential signed by the device.
-    /// `lifetime` is the constraint from `ssh-add -t` (seconds), if any.
-    AddSecurityKey {
-        key: SkKey,
+        key: HeldKey,
         lifetime: Option<u32>,
     },
     /// `ssh-add -d FILE`: remove the identity with this public key blob.
@@ -156,13 +150,16 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
             if !rest.is_empty() {
                 return Err(WireError::TrailingData);
             }
-            Ok(add_request(key, None))
+            Ok(Request::AddIdentity {
+                key,
+                lifetime: None,
+            })
         }
         SSH2_AGENTC_ADD_ID_CONSTRAINED => {
             let key_type = String::decode(&mut rest)?;
             let key = key_types.decode(&key_type, &mut rest)?;
             let lifetime = parse_constraints(&mut rest)?;
-            Ok(add_request(key, lifetime))
+            Ok(Request::AddIdentity { key, lifetime })
         }
         SSH2_AGENTC_REMOVE_IDENTITY => {
             let key_blob = Vec::<u8>::decode(&mut rest)?;
@@ -217,17 +214,6 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
             })
         }
         other => Ok(Request::Unsupported(other)),
-    }
-}
-
-/// Wrap a decoded key in the `Request` variant for its signing capability.
-fn add_request(key: HeldKey, lifetime: Option<u32>) -> Request {
-    match key {
-        HeldKey::Local(key) => Request::AddIdentity { key, lifetime },
-        HeldKey::SecurityKey(key) => Request::AddSecurityKey {
-            key: *key,
-            lifetime,
-        },
     }
 }
 
@@ -558,7 +544,7 @@ mod tests {
         "ferris@example.com".encode(&mut add).unwrap();
         match parse_request(&add).unwrap() {
             Request::AddIdentity { key, lifetime } => {
-                assert_eq!(key.comment(), "ferris@example.com");
+                assert_eq!(key.public_key().comment(), "ferris@example.com");
                 assert_eq!(key.key_blob(), blob);
                 assert_eq!(lifetime, None);
             }
@@ -604,7 +590,10 @@ mod tests {
         sk_pair.encode(&mut sk).unwrap();
         "ferris@example.com".encode(&mut sk).unwrap();
         match parse_request(&sk).unwrap() {
-            Request::AddSecurityKey { key, lifetime } => {
+            Request::AddIdentity {
+                key: key @ HeldKey::SecurityKey(_),
+                lifetime,
+            } => {
                 assert_eq!(key.public_key().comment(), "ferris@example.com");
                 assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519);
                 assert_eq!(lifetime, None);
@@ -624,7 +613,10 @@ mod tests {
             .unwrap();
         "internal".encode(&mut sk_constrained).unwrap();
         match parse_request(&sk_constrained).unwrap() {
-            Request::AddSecurityKey { key, .. } => {
+            Request::AddIdentity {
+                key: key @ HeldKey::SecurityKey(_),
+                ..
+            } => {
                 assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519)
             }
             other => panic!("unexpected request {other:?}"),
@@ -635,7 +627,7 @@ mod tests {
         "sk-ssh-ed25519@openssh.com".encode(&mut truncated).unwrap();
         assert!(matches!(
             parse_request(&truncated),
-            Err(WireError::LocalKey(LocalKeyError::Malformed(_)))
+            Err(WireError::Key(KeyDecodeError::Malformed(_)))
         ));
 
         // A supported type with a malformed body is likewise a local-key
@@ -644,7 +636,7 @@ mod tests {
         "ssh-dss".encode(&mut dss).unwrap();
         assert!(matches!(
             parse_request(&dss),
-            Err(WireError::LocalKey(LocalKeyError::Malformed("ssh-dss")))
+            Err(WireError::Key(KeyDecodeError::Malformed("ssh-dss")))
         ));
 
         // An `ssh-rsa` add is decoded into a local key.
@@ -657,7 +649,7 @@ mod tests {
         "old@example.com".encode(&mut rsa).unwrap();
         match parse_request(&rsa).unwrap() {
             Request::AddIdentity { key, lifetime } => {
-                assert_eq!(key.comment(), "old@example.com");
+                assert_eq!(key.public_key().comment(), "old@example.com");
                 assert_eq!(
                     key.public_key().algorithm(),
                     ssh_key::Algorithm::Rsa { hash: None }

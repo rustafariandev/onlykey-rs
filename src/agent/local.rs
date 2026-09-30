@@ -7,8 +7,10 @@
 //! and a [`KeyDecoder`](super::keytype::KeyDecoder) registered on the agent,
 //! without touching the server.
 
-use sha2::{Sha256, Sha512};
-use signature::{SignatureEncoding, Signer};
+use super::keytype::KeyDecodeError;
+use rsa::Pkcs1v15Sign;
+use sha2::{Digest, Sha256, Sha512};
+use signature::Signer;
 use ssh_encoding::{Decode, Encode, Reader};
 use ssh_key::private::{DsaKeypair, EcdsaKeypair, Ed25519Keypair, RsaKeypair};
 use ssh_key::public::{DsaPublicKey, EcdsaPublicKey, KeyData};
@@ -16,16 +18,15 @@ use ssh_key::{Algorithm, EcdsaCurve, HashAlg, Mpint, PublicKey, Signature};
 use std::fmt;
 use thiserror::Error;
 
+/// Why a local key could not sign.
 #[derive(Debug, Error)]
 pub enum LocalKeyError {
-    #[error("unsupported local key type {0:?}")]
-    UnsupportedType(String),
-    #[error("malformed {0} private key")]
-    Malformed(&'static str),
     #[error("signing with a local key failed: {0}")]
     Sign(#[from] signature::Error),
     #[error("cannot encode the signature: {0}")]
     Signature(#[from] ssh_key::Error),
+    #[error("RSA signing failed: {0}")]
+    Rsa(#[from] rsa::Error),
     #[error("cannot sign with an unsupported RSA digest")]
     UnsupportedHash,
 }
@@ -145,7 +146,7 @@ pub struct RsaLocalKey {
 }
 
 impl RsaLocalKey {
-    fn from_pair(pair: RsaKeypair, comment: &str) -> Result<Self, LocalKeyError> {
+    fn from_pair(pair: RsaKeypair, comment: &str) -> Result<Self, KeyDecodeError> {
         let key = rsa_private_key(&pair)?;
         let public = PublicKey::new(KeyData::Rsa(pair.public), comment);
         Ok(RsaLocalKey { key, public })
@@ -155,7 +156,7 @@ impl RsaLocalKey {
 /// Rebuild an [`rsa::RsaPrivateKey`] from the SSH fields, with `p` and `q` in
 /// the order the wire gives them (`ssh-key`'s own conversion passes `p` twice,
 /// so it is not used).
-fn rsa_private_key(pair: &RsaKeypair) -> Result<rsa::RsaPrivateKey, LocalKeyError> {
+fn rsa_private_key(pair: &RsaKeypair) -> Result<rsa::RsaPrivateKey, KeyDecodeError> {
     let mpint = |m: &Mpint| {
         m.as_positive_bytes()
             .map(rsa::BigUint::from_bytes_be)
@@ -170,8 +171,8 @@ fn rsa_private_key(pair: &RsaKeypair) -> Result<rsa::RsaPrivateKey, LocalKeyErro
     .map_err(|_| malformed_rsa())
 }
 
-fn malformed_rsa() -> LocalKeyError {
-    LocalKeyError::Malformed("ssh-rsa")
+fn malformed_rsa() -> KeyDecodeError {
+    KeyDecodeError::Malformed("ssh-rsa")
 }
 
 impl LocalKey for RsaLocalKey {
@@ -180,22 +181,13 @@ impl LocalKey for RsaLocalKey {
     }
 
     fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, LocalKeyError> {
-        let (algorithm, raw) = match hash {
-            HashAlg::Sha256 => (
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256),
-                },
-                rsa::pkcs1v15::SigningKey::<Sha256>::new(self.key.clone()).try_sign(data)?,
-            ),
-            HashAlg::Sha512 => (
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha512),
-                },
-                rsa::pkcs1v15::SigningKey::<Sha512>::new(self.key.clone()).try_sign(data)?,
-            ),
+        let (scheme, digest) = match hash {
+            HashAlg::Sha256 => (Pkcs1v15Sign::new::<Sha256>(), Sha256::digest(data).to_vec()),
+            HashAlg::Sha512 => (Pkcs1v15Sign::new::<Sha512>(), Sha512::digest(data).to_vec()),
             _ => return Err(LocalKeyError::UnsupportedHash),
         };
-        Ok(Signature::new(algorithm, raw.to_vec())?)
+        let raw = self.key.sign(scheme, &digest)?;
+        Ok(Signature::new(Algorithm::Rsa { hash: Some(hash) }, raw)?)
     }
 }
 
@@ -286,7 +278,7 @@ impl fmt::Debug for DsaLocalKey {
 ///
 /// These are the built-in key types. A caller can add or replace a key type
 /// with a [`KeyDecoder`](super::keytype::KeyDecoder) registered on the agent.
-pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<LocalKeyRef, LocalKeyError> {
+pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<LocalKeyRef, KeyDecodeError> {
     match key_type {
         "ssh-ed25519" => {
             // The agent's private fields are the public key followed by the
@@ -322,7 +314,7 @@ pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<LocalKeyRef, L
             let comment = String::decode(reader).map_err(|_| malformed_dsa())?;
             Ok(LocalKeyRef::new(DsaLocalKey::from_pair(pair, &comment)))
         }
-        other => Err(LocalKeyError::UnsupportedType(other.to_owned())),
+        other => Err(KeyDecodeError::UnsupportedType(other.to_owned())),
     }
 }
 
@@ -364,22 +356,22 @@ fn ecdsa_keypair(reader: &mut impl Reader, field_size: usize) -> Option<EcdsaKey
     EcdsaKeypair::decode(&mut body.as_slice()).ok()
 }
 
-fn malformed_ed25519() -> LocalKeyError {
-    LocalKeyError::Malformed("ssh-ed25519")
+fn malformed_ed25519() -> KeyDecodeError {
+    KeyDecodeError::Malformed("ssh-ed25519")
 }
 
 /// The malformed-body error for an `ecdsa-sha2-*` key type, named by curve.
-fn malformed_ecdsa(curve: EcdsaCurve) -> LocalKeyError {
+fn malformed_ecdsa(curve: EcdsaCurve) -> KeyDecodeError {
     let key_type = match curve {
         EcdsaCurve::NistP256 => "ecdsa-sha2-nistp256",
         EcdsaCurve::NistP384 => "ecdsa-sha2-nistp384",
         EcdsaCurve::NistP521 => "ecdsa-sha2-nistp521",
     };
-    LocalKeyError::Malformed(key_type)
+    KeyDecodeError::Malformed(key_type)
 }
 
-fn malformed_dsa() -> LocalKeyError {
-    LocalKeyError::Malformed("ssh-dss")
+fn malformed_dsa() -> KeyDecodeError {
+    KeyDecodeError::Malformed("ssh-dss")
 }
 
 #[cfg(test)]
@@ -421,29 +413,29 @@ mod tests {
         let mut empty: &[u8] = &[];
         assert!(matches!(
             decode("sk-ssh-ed25519@openssh.com", &mut empty),
-            Err(LocalKeyError::UnsupportedType(t)) if t == "sk-ssh-ed25519@openssh.com"
+            Err(KeyDecodeError::UnsupportedType(t)) if t == "sk-ssh-ed25519@openssh.com"
         ));
         let pair = keypair();
         let mut body = encoded_body(&pair, "c");
         body.truncate(10);
         assert!(matches!(
             decode("ssh-ed25519", &mut body.as_slice()),
-            Err(LocalKeyError::Malformed(_))
+            Err(KeyDecodeError::Malformed(_))
         ));
         let mut rsa: &[u8] = &[];
         assert!(matches!(
             decode("ssh-rsa", &mut rsa),
-            Err(LocalKeyError::Malformed("ssh-rsa"))
+            Err(KeyDecodeError::Malformed("ssh-rsa"))
         ));
         let mut ecdsa: &[u8] = &[];
         assert!(matches!(
             decode("ecdsa-sha2-nistp384", &mut ecdsa),
-            Err(LocalKeyError::Malformed("ecdsa-sha2-nistp384"))
+            Err(KeyDecodeError::Malformed("ecdsa-sha2-nistp384"))
         ));
         let mut dsa: &[u8] = &[];
         assert!(matches!(
             decode("ssh-dss", &mut dsa),
-            Err(LocalKeyError::Malformed("ssh-dss"))
+            Err(KeyDecodeError::Malformed("ssh-dss"))
         ));
     }
 
@@ -533,7 +525,7 @@ mod tests {
         "ferris@example.com".encode(&mut body).unwrap();
         assert!(matches!(
             decode("ecdsa-sha2-nistp256", &mut body.as_slice()),
-            Err(LocalKeyError::Malformed("ecdsa-sha2-nistp256"))
+            Err(KeyDecodeError::Malformed("ecdsa-sha2-nistp256"))
         ));
     }
 

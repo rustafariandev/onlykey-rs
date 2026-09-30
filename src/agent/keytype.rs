@@ -13,9 +13,19 @@
 //! authenticator signs for ([`SkKey`]). Register a decoder with
 //! [`Agent::register_key_type`](super::server::Agent::register_key_type).
 
-use super::local::{self, LocalKeyError, LocalKeyRef};
+use super::local::{self, LocalKeyRef};
 use super::sk::{self, SkKey};
 use ssh_key::PublicKey;
+use thiserror::Error;
+
+/// Why an `ADD_IDENTITY` request's key could not be decoded.
+#[derive(Debug, Error)]
+pub enum KeyDecodeError {
+    #[error("unsupported key type {0:?}")]
+    UnsupportedType(String),
+    #[error("malformed {0} private key")]
+    Malformed(&'static str),
+}
 
 /// A private key decoded from an `ADD_IDENTITY` request.
 ///
@@ -59,7 +69,7 @@ pub trait KeyDecoder: Send + Sync {
 
     /// Decode the body after the key type name, including the trailing
     /// comment. `key_type` is the name from [`Self::key_types`] that matched.
-    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, LocalKeyError>;
+    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, KeyDecodeError>;
 }
 
 /// A local (in-memory) private key type, decoded by [`local::decode`].
@@ -70,7 +80,7 @@ impl KeyDecoder for LocalDecoder {
         self.0
     }
 
-    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, LocalKeyError> {
+    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, KeyDecodeError> {
         local::decode(key_type, reader).map(HeldKey::Local)
     }
 }
@@ -83,7 +93,7 @@ impl KeyDecoder for SkDecoder {
         &[sk::SK_SSH_ED25519, sk::SK_ECDSA_P256]
     }
 
-    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, LocalKeyError> {
+    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, KeyDecodeError> {
         sk::decode(key_type, reader).map(|key| HeldKey::SecurityKey(Box::new(key)))
     }
 }
@@ -119,13 +129,13 @@ impl KeyRegistry {
     }
 
     /// Decode an `ADD_IDENTITY` body's key by name, including the trailing
-    /// comment. An unregistered name is [`LocalKeyError::UnsupportedType`].
-    pub fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, LocalKeyError> {
+    /// comment. An unregistered name is [`KeyDecodeError::UnsupportedType`].
+    pub fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<HeldKey, KeyDecodeError> {
         self.decoders
             .iter()
             .rev()
             .find(|decoder| decoder.key_types().contains(&key_type))
-            .ok_or_else(|| LocalKeyError::UnsupportedType(key_type.to_owned()))?
+            .ok_or_else(|| KeyDecodeError::UnsupportedType(key_type.to_owned()))?
             .decode(key_type, reader)
     }
 }
@@ -163,17 +173,17 @@ mod tests {
             other => panic!("expected a local key, got {other:?}"),
         }
 
-        // A malformed security-key body is reported as a local-key error.
+        // A malformed security-key body is a decode error like any other.
         let mut sk: &[u8] = &[];
         assert!(matches!(
             registry.decode("sk-ssh-ed25519@openssh.com", &mut sk),
-            Err(LocalKeyError::Malformed(_))
+            Err(KeyDecodeError::Malformed(_))
         ));
 
         let mut unknown: &[u8] = &[];
         assert!(matches!(
             registry.decode("ssh-future@example.com", &mut unknown),
-            Err(LocalKeyError::UnsupportedType(t)) if t == "ssh-future@example.com"
+            Err(KeyDecodeError::UnsupportedType(t)) if t == "ssh-future@example.com"
         ));
     }
 
@@ -191,7 +201,7 @@ mod tests {
                 &self,
                 _key_type: &str,
                 reader: &mut &[u8],
-            ) -> Result<HeldKey, LocalKeyError> {
+            ) -> Result<HeldKey, KeyDecodeError> {
                 // Reuse the ed25519 body: the point is that this decoder was
                 // reached for a name the built-ins do not know.
                 local::decode("ssh-ed25519", reader).map(HeldKey::Local)
@@ -224,8 +234,8 @@ mod tests {
                 &self,
                 _key_type: &str,
                 _reader: &mut &[u8],
-            ) -> Result<HeldKey, LocalKeyError> {
-                Err(LocalKeyError::Malformed("overridden"))
+            ) -> Result<HeldKey, KeyDecodeError> {
+                Err(KeyDecodeError::Malformed("overridden"))
             }
         }
 
@@ -234,7 +244,7 @@ mod tests {
         let body = ed25519_body("ferris@example.com");
         assert!(matches!(
             registry.decode("ssh-ed25519", &mut body.as_slice()),
-            Err(LocalKeyError::Malformed("overridden"))
+            Err(KeyDecodeError::Malformed("overridden"))
         ));
     }
 }
