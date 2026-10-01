@@ -187,7 +187,15 @@ The lifetime constraint of
 is honoured and the PIN is ignored. The confirm constraint
 .RB ( "ssh-add \-c" )
 is refused, since the agent cannot ask before each signature, as are
-destination or certificate constraints.
+destination constraints.
+.BI "ssh-add \-s " "provider certificate" \fR...
+also serves the given OpenSSH certificates of the key, each as an identity
+of its own that the token signs for; certificates of other keys are skipped.
+With
+.B \-C
+only the certificates are served, not the plain key.
+.BR "ssh-add \-e " provider
+removes the key and its certificates.
 A private key file given directly to
 .B ssh-add
 .RB ( SSH2_AGENTC_ADD_IDENTITY )
@@ -235,6 +243,17 @@ may be a web credential, so, as with OpenSSH's agent, it signs only SSH
 login requests and
 .B ssh-keygen \-Y sign
 blobs; any other data is refused.
+When a certificate
+.IB file \-cert.pub
+sits next to the key,
+.B ssh-add
+sends it too, and the agent serves it as an identity of its own signed by
+the same key (with
+.BR "ssh-add \-C " file ,
+only the certificate).
+Every certificate's CA signature is checked when it is loaded; whether the
+CA is trusted is up to the server.
+An expired certificate is no longer listed.
 .BR "ssh-add \-d " file
 removes only that key again (given the public key of a token-backed identity,
 it removes that identity) and
@@ -244,8 +263,8 @@ configuration, until the agent restarts or they are added back with
 .BR "ssh-add \-s" .
 The lifetime constraint of
 .B ssh-add \-t
-is honoured; the confirm constraint and destination or certificate
-constraints are refused, as with
+is honoured; the confirm constraint and destination constraints are
+refused, as with
 .BR "ssh-add \-s" .
 Anything else not listed here is refused.
 .B ssh-add \-x
@@ -567,6 +586,21 @@ The same value can be set with the
 .B pin-cache
 config key.
 .TP
+.BI \-\-cert\-file " file"
+A file of OpenSSH certificates, one per line as
+.B ssh-keygen \-s
+writes them, for OnlyKey keys.
+Each certificate is served next to whichever of the agent's keys it
+certifies, listed under the file's comment, until it expires; one for a key
+the agent does not serve is ignored.
+.BR "okagent ssh" " and " "okagent mosh"
+also hand
+.B ssh
+the primary key's certificate.
+Repeat the option for several files; they add to the
+.B cert-file
+config key.
+.TP
 .BR \-v ", " \-\-verbose
 Log more.
 Once for informational messages, twice for debug output, three times for
@@ -805,6 +839,10 @@ See
 See
 .BR \-\-pin\-cache .
 .TP
+.BI cert-file " = [\(dq" file \(dq ", ...]"
+See
+.BR \-\-cert\-file .
+.TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
 line.
@@ -842,6 +880,7 @@ notify-command = "notify-send OnlyKey"
 # fido-device = "/dev/hidraw5"
 # askpass = "/usr/libexec/openssh/ssh-askpass"
 # pin-cache = 300
+# cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]
 
 [[identity]]
 name = "ferris@example.com"

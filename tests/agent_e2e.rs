@@ -169,6 +169,11 @@ fn ssh_add_locks_and_unlocks_the_agent() {
 /// with an empty passphrase so no terminal is needed. Also works on OpenSSH
 /// versions without `-P`.
 fn ssh_add_card(h: &Harness, dir: &Path, flag: &str, provider: &str) -> bool {
+    ssh_add_card_args(h, dir, &[flag, provider])
+}
+
+/// Run `ssh-add` with `args`, answering any prompt with an empty passphrase.
+fn ssh_add_card_args(h: &Harness, dir: &Path, args: &[&str]) -> bool {
     let askpass = dir.join("askpass.sh");
     std::fs::write(&askpass, "#!/bin/sh\necho\n").unwrap();
     std::fs::set_permissions(
@@ -177,8 +182,7 @@ fn ssh_add_card(h: &Harness, dir: &Path, flag: &str, provider: &str) -> bool {
     )
     .unwrap();
     h.cmd("ssh-add")
-        .arg(flag)
-        .arg(provider)
+        .args(args)
         .env("SSH_ASKPASS", &askpass)
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env("DISPLAY", ":0")
@@ -735,4 +739,175 @@ fn registered_extension_answers_over_the_socket() {
         roundtrip(&h.socket, &unknown),
         vec![wire::SSH_AGENT_EXTENSION_FAILURE]
     );
+}
+
+/// Sign `pub_path` (a public key file) as user certificate `name-cert.pub`
+/// with a fresh CA in `dir`, returning the certificate line.
+fn certify(dir: &Path, pub_path: &Path) -> String {
+    certify_valid(dir, pub_path, "-5m:+1h")
+}
+
+/// Like [`certify`], valid for `validity` (`ssh-keygen -V`; `always:forever`
+/// is what ssh-keygen writes without `-V`).
+fn certify_valid(dir: &Path, pub_path: &Path, validity: &str) -> String {
+    let ca = dir.join("ca");
+    if !ca.exists() {
+        let made = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "ca", "-f"])
+            .arg(&ca)
+            .status()
+            .unwrap();
+        assert!(made.success(), "ssh-keygen (CA) failed");
+    }
+    let signed = Command::new("ssh-keygen")
+        .args(["-q", "-s"])
+        .arg(&ca)
+        .args(["-I", "okagent-test", "-n", "ferris", "-V", validity])
+        .arg(pub_path)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(signed.success(), "ssh-keygen -s failed");
+    let stem = pub_path.to_str().unwrap().strip_suffix(".pub").unwrap();
+    std::fs::read_to_string(format!("{stem}-cert.pub"))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+fn listing(h: &Harness) -> Vec<String> {
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("ssh-") || l.starts_with("ecdsa-"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `ssh-add FILE` sends the key's `-cert.pub` too: the certificate is listed
+/// as an identity of its own and signs with the key, for each key type (each
+/// leaves different public fields out of the add). `-C` loads only the
+/// certificate, and `-d` removes both.
+#[test]
+fn ssh_add_loads_a_key_with_its_certificate() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    for (kind, bits, validity) in [
+        ("ed25519", None, "always:forever"),
+        ("rsa", Some("2048"), "-5m:+1h"),
+        ("ecdsa", Some("384"), "-5m:+1h"),
+    ] {
+        let key_path = dir.path().join(format!("id_{kind}"));
+        let mut keygen = Command::new("ssh-keygen");
+        keygen.args(["-q", "-t", kind, "-N", "", "-C", "cert@example.com"]);
+        if let Some(bits) = bits {
+            keygen.args(["-b", bits]);
+        }
+        assert!(keygen.arg("-f").arg(&key_path).status().unwrap().success());
+        let cert_line = certify_valid(dir.path(), &key_path.with_extension("pub"), validity);
+
+        assert!(ssh_add_file(&h, &key_path), "ssh-add {kind} key and cert");
+        let lines = listing(&h);
+        assert_eq!(lines.len(), 2, "{kind}: {lines:?}");
+        let listed_cert = lines
+            .iter()
+            .find(|l| l.contains("-cert-v01@openssh.com "))
+            .expect("certificate is listed");
+        assert_eq!(
+            listed_cert.split_whitespace().nth(1),
+            cert_line.split_whitespace().nth(1),
+            "{kind}: listed unchanged"
+        );
+        sign_and_check(&h, dir.path(), &cert_line, &format!("{kind}-cert"));
+
+        assert!(
+            h.cmd("ssh-add")
+                .arg("-d")
+                .arg(&key_path)
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(listed_keys(&h), 0, "{kind}: -d removes key and cert");
+
+        // ssh-add exits 1 after `-C` even with OpenSSH's agent, since the
+        // plain key it skipped counts as not added; the listing tells.
+        h.cmd("ssh-add")
+            .arg("-C")
+            .arg(&key_path)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        let lines = listing(&h);
+        assert_eq!(lines.len(), 1, "{kind}: {lines:?}");
+        assert!(lines[0].contains("-cert-v01@openssh.com "));
+        assert!(h.cmd("ssh-add").arg("-D").status().unwrap().success());
+    }
+    assert_eq!(h.challenges(), 0, "local keys must not touch the token");
+}
+
+/// A certificate for a token key, attached with `ssh-add -s IDENTITY CERT`
+/// or loaded at startup (`--cert-file`), signs through the token.
+#[test]
+fn token_keys_serve_certificates() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    assert!(ssh_add_card(&h, dir.path(), "-s", "ferris@example.com"));
+    let key_line = listing(&h).pop().unwrap();
+    let pub_path = dir.path().join("token.pub");
+    std::fs::write(&pub_path, format!("{key_line}\n")).unwrap();
+    let cert_line = certify(dir.path(), &pub_path);
+    let cert_path = dir.path().join("token-cert.pub");
+    assert!(ssh_add_card(&h, dir.path(), "-e", "ferris@example.com"));
+
+    // `-C`: just the certificate. ssh-add exits 1 after `-C` even with
+    // OpenSSH's agent; the listing tells.
+    let cert_arg = cert_path.to_str().unwrap();
+    ssh_add_card_args(
+        &h,
+        dir.path(),
+        &["-C", "-s", "ferris@example.com", cert_arg],
+    );
+    let lines = listing(&h);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("ssh-ed25519-cert-v01@openssh.com "));
+    let before = h.challenges();
+    sign_and_check(&h, dir.path(), &cert_line, "token-cert");
+    assert_eq!(
+        h.challenges(),
+        before + 1,
+        "the token signs for the certificate"
+    );
+
+    // Without `-C`, key and certificate; `-e` takes both away.
+    assert!(ssh_add_card_args(
+        &h,
+        dir.path(),
+        &["-s", "ferris@example.com", cert_arg]
+    ));
+    assert_eq!(listed_keys(&h), 2);
+    assert!(ssh_add_card(&h, dir.path(), "-e", "ferris@example.com"));
+    assert_eq!(listed_keys(&h), 0);
+
+    // At startup, a certificate file goes with the key it certifies.
+    let sink = Arc::new(RecordingSink::default());
+    let opener: Opener = Arc::new(|| Ok(SigningFake::open()));
+    let certs = agent::CertKey::read_file(&cert_path).unwrap();
+    let agent = Agent::new(entries(), opener, sink.clone()).with_certificates(certs);
+    let h = Harness::serve(agent, sink);
+    let lines = listing(&h);
+    assert_eq!(lines.len(), 3, "two keys and a certificate: {lines:?}");
+    assert!(lines[2].starts_with("ssh-ed25519-cert-v01@openssh.com "));
+    sign_and_check(&h, dir.path(), &cert_line, "startup-cert");
 }

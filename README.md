@@ -185,6 +185,33 @@ okagent serve --pubkey-file ~/.ssh/onlykey.pub ferris@example.com &
 ssh-add -s git@github.com                       # no device needed
 ```
 
+### Certificates
+
+OpenSSH certificates work for every kind of key the agent serves. Each is
+listed as an identity of its own and signs with the key it certifies:
+
+- `ssh-add FILE` also loads `FILE-cert.pub` when it exists, as with
+  OpenSSH's agent (`ssh-add -C FILE` loads only the certificate). This works
+  for plain keys and `sk-` keys alike.
+- `ssh-add -s IDENTITY CERT…` attaches certificates to an OnlyKey key in a
+  running agent (`-C` serves the certificates without the plain key);
+  `ssh-add -e IDENTITY` removes the key and its certificates.
+- `--cert-file FILE` (repeatable; `cert-file = [...]` in the config) loads
+  certificates at startup. Each one is served with whichever OnlyKey key it
+  certifies, so no identity needs naming.
+
+```sh
+okagent pubkey ferris@example.com > ~/.ssh/onlykey.pub
+ssh-keygen -s ca -I ferris -n ferris ~/.ssh/onlykey.pub   # writes onlykey-cert.pub
+okagent serve --cert-file ~/.ssh/onlykey-cert.pub ferris@example.com &
+okagent ssh ferris@example.com     # offers the certificate as well
+```
+
+The agent checks each certificate's CA signature when it is loaded;
+whether that CA is trusted is up to the server. An expired certificate is
+no longer listed, and `ssh-add` gives an added one a lifetime that ends
+with its validity.
+
 ```sh
 okagent pubkey ferris@example.com >> authorized_keys   # copy to the server
 okagent ssh-copy-id ferris@example.com                 # ...or let ssh-copy-id do it
@@ -223,6 +250,7 @@ notify-command = "notify-send OnlyKey"  # optional
 # fido-device = "/dev/hidraw5"          # optional, for several FIDO keys
 # askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs
 # pin-cache = 300                       # seconds to reuse a PIN; 0 asks every time
+# cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]  # certificates for token keys
 
 [[identity]]
 name = "ferris@example.com"
@@ -428,14 +456,15 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   provider string to a running agent; `SSH_AGENTC_REMOVE_SMARTCARD_KEY`
   backs `ssh-add -e`. The key is derived and verified against the token when
   it is added, so an absent device, an empty slot or a bad provider is
-  reported as `SSH_AGENT_FAILURE`. Only the lifetime constraint of
-  `ssh-add -t` is honoured, for `ssh-add -s` and `ssh-add FILE` alike; the
-  provider's PIN is ignored, and the confirm constraint (`ssh-add -c`, which
-  the agent cannot honour) and destination or certificate constraints are
-  refused.
+  reported as `SSH_AGENT_FAILURE`. The lifetime constraint of
+  `ssh-add -t` is honoured, for `ssh-add -s` and `ssh-add FILE` alike, as
+  are the certificates of `ssh-add -s IDENTITY CERT…`
+  (`associated-certs-v00@openssh.com`). The provider's PIN is ignored, and
+  the confirm constraint (`ssh-add -c`, which the agent cannot honour) and
+  destination constraints are refused.
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
   which loads a plain ed25519, RSA or ECDSA (or, with the `dsa` feature, DSA)
-  private key into the agent;
+  private key into the agent, and its `*-cert-v01@openssh.com` certificate;
   the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
   / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The key
   types the agent can load are pluggable: implement

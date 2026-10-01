@@ -1,5 +1,6 @@
 //! SSH agent protocol handling and the unix-socket server.
 
+pub mod cert;
 pub mod client;
 pub mod extension;
 pub mod keytype;
@@ -8,6 +9,7 @@ pub mod server;
 pub mod sk;
 pub mod wire;
 
+pub use cert::{AssociatedCerts, CertError, CertKey};
 pub use extension::{Extension, ExtensionContext, ExtensionReply};
 pub use keytype::{HeldKey, KeyDecodeError, KeyDecoder, KeyRegistry};
 #[cfg(feature = "dsa")]

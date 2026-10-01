@@ -31,7 +31,7 @@ dsa = ["ssh-key/dsa"]
 
 [dependencies]
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
-ssh-encoding = "0.2"
+ssh-encoding = { version = "0.2", features = ["base64"] }
 signature = "2"
 sha2 = { version = "0.10", features = ["oid"] }
 rsa = "0.9"

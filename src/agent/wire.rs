@@ -1,6 +1,7 @@
 //! SSH agent wire protocol: framing, the requests this agent serves, and
 //! their replies (draft-miller-ssh-agent).
 
+use super::cert::{self, AssociatedCerts, CertKey};
 use super::keytype::KeyDecodeError;
 use super::keytype::{HeldKey, KeyRegistry};
 use ssh_encoding::{Decode, Encode};
@@ -39,7 +40,8 @@ pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 pub const SSH_AGENT_CONSTRAIN_LIFETIME: u8 = 1;
 /// Constraint on `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED`: confirm each use.
 pub const SSH_AGENT_CONSTRAIN_CONFIRM: u8 = 2;
-/// Constraint carrying a named extension (destination constraints, certs).
+/// Constraint carrying a named extension (destination constraints,
+/// associated certificates).
 pub const SSH_AGENT_CONSTRAIN_EXTENSION: u8 = 255;
 /// Sign request flags asking for `rsa-sha2-256` / `rsa-sha2-512`.
 pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
@@ -91,10 +93,12 @@ pub enum Request {
         flags: u32,
     },
     /// `ssh-add FILE`: add a private key held in memory, or a FIDO credential
-    /// signed by the device. `lifetime` is the constraint from `ssh-add -t`
-    /// (seconds), if any.
+    /// signed by the device. `cert` is set when the add is for the key's
+    /// certificate (`-cert.pub`) rather than the plain key. `lifetime` is the
+    /// constraint from `ssh-add -t` (seconds), if any.
     AddIdentity {
         key: HeldKey,
+        cert: Option<Box<CertKey>>,
         lifetime: Option<u32>,
     },
     /// `ssh-add -d FILE`: remove the identity with this public key blob.
@@ -109,11 +113,13 @@ pub enum Request {
     Unlock(Vec<u8>),
     /// `ssh-add -s`: add the key named by `provider`. `lifetime` is the
     /// constraint from `ssh-add -t` (seconds), if any; `pin` is accepted but
-    /// unused.
+    /// unused. `certs` are the certificates given after the provider
+    /// (`ssh-add -s PROVIDER CERT…`).
     AddSmartcardKey {
         provider: Vec<u8>,
         pin: Vec<u8>,
         lifetime: Option<u32>,
+        certs: Option<AssociatedCerts>,
     },
     /// `ssh-add -e`: remove the key named by `provider`.
     RemoveSmartcardKey {
@@ -166,21 +172,31 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
         SSH_AGENTC_REQUEST_RSA_IDENTITIES => Ok(Request::RequestRsaIdentities),
         SSH2_AGENTC_REQUEST_IDENTITIES => Ok(Request::RequestIdentities),
         SSH2_AGENTC_ADD_IDENTITY => {
-            let key_type = String::decode(&mut rest)?;
-            let key = key_types.decode(&key_type, &mut rest)?;
+            let (key, cert) = decode_key(key_types, &mut rest)?;
             if !rest.is_empty() {
                 return Err(WireError::TrailingData);
             }
             Ok(Request::AddIdentity {
                 key,
+                cert,
                 lifetime: None,
             })
         }
         SSH2_AGENTC_ADD_ID_CONSTRAINED => {
-            let key_type = String::decode(&mut rest)?;
-            let key = key_types.decode(&key_type, &mut rest)?;
-            let lifetime = parse_constraints(&mut rest)?;
-            Ok(Request::AddIdentity { key, lifetime })
+            let (key, cert) = decode_key(key_types, &mut rest)?;
+            let constraints = parse_constraints(&mut rest)?;
+            // As in OpenSSH, certificates are associated only with a
+            // provider's keys; a private key brings its own.
+            if constraints.certs.is_some() {
+                return Err(WireError::UnsupportedExtension(
+                    cert::ASSOCIATED_CERTS.to_owned(),
+                ));
+            }
+            Ok(Request::AddIdentity {
+                key,
+                cert,
+                lifetime: constraints.lifetime,
+            })
         }
         SSH2_AGENTC_REMOVE_IDENTITY => {
             let key_blob = Vec::<u8>::decode(&mut rest)?;
@@ -194,16 +210,18 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
                 provider,
                 pin,
                 lifetime: None,
+                certs: None,
             })
         }
         SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => {
             let provider = Vec::<u8>::decode(&mut rest)?;
             let pin = Vec::<u8>::decode(&mut rest)?;
-            let lifetime = parse_constraints(&mut rest)?;
+            let constraints = parse_constraints(&mut rest)?;
             Ok(Request::AddSmartcardKey {
                 provider,
                 pin,
-                lifetime,
+                lifetime: constraints.lifetime,
+                certs: constraints.certs,
             })
         }
         SSH_AGENTC_REMOVE_SMARTCARD_KEY => {
@@ -238,24 +256,48 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
     }
 }
 
-/// Decode the constraint list that follows the provider and PIN of a
-/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` request, returning the lifetime.
-/// The lifetime constraint is understood, as is the `sk-provider@openssh.com`
-/// extension `ssh-add` always attaches to a FIDO key (whose value names the
-/// middleware library; this agent has its own, so it is ignored). Anything
-/// else is rejected so it is not silently dropped: the confirm constraint
-/// (`ssh-add -c`), since the agent has no way to ask before each signature,
-/// and destination constraints or associated certificates.
-fn parse_constraints(rest: &mut &[u8]) -> Result<Option<u32>, WireError> {
-    let mut lifetime = None;
+/// Decode the key of an add request: its type name, then the body, which
+/// for a certificate type starts with the certificate.
+fn decode_key(
+    key_types: &KeyRegistry,
+    rest: &mut &[u8],
+) -> Result<(HeldKey, Option<Box<CertKey>>), WireError> {
+    let key_type = String::decode(rest)?;
+    if key_type.ends_with(cert::CERT_SUFFIX) {
+        let (key, cert) = cert::decode_cert_add(key_types, &key_type, rest)?;
+        Ok((key, Some(Box::new(cert))))
+    } else {
+        Ok((key_types.decode(&key_type, rest)?, None))
+    }
+}
+
+/// The constraints of a constrained add.
+#[derive(Debug, Default)]
+struct Constraints {
+    lifetime: Option<u32>,
+    certs: Option<AssociatedCerts>,
+}
+
+/// Decode the constraint list that ends a constrained add. The lifetime
+/// constraint is understood, as are the `sk-provider@openssh.com` extension
+/// `ssh-add` always attaches to a FIDO key (whose value names the middleware
+/// library; this agent has its own, so it is ignored) and the
+/// `associated-certs-v00@openssh.com` extension of `ssh-add -s PROVIDER
+/// CERT…`. Anything else is rejected so it is not silently dropped: the
+/// confirm constraint (`ssh-add -c`), since the agent has no way to ask before
+/// each signature, and destination constraints.
+fn parse_constraints(rest: &mut &[u8]) -> Result<Constraints, WireError> {
+    let mut constraints = Constraints::default();
     while !rest.is_empty() {
         let kind = u8::decode(rest)?;
         match kind {
-            SSH_AGENT_CONSTRAIN_LIFETIME => lifetime = Some(u32::decode(rest)?),
+            SSH_AGENT_CONSTRAIN_LIFETIME => constraints.lifetime = Some(u32::decode(rest)?),
             SSH_AGENT_CONSTRAIN_EXTENSION => {
                 let name = String::decode(rest)?;
                 if name == "sk-provider@openssh.com" {
                     let _provider = String::decode(rest)?;
+                } else if name == cert::ASSOCIATED_CERTS {
+                    constraints.certs = Some(cert::parse_associated_certs(rest)?);
                 } else {
                     return Err(WireError::UnsupportedExtension(name));
                 }
@@ -263,19 +305,28 @@ fn parse_constraints(rest: &mut &[u8]) -> Result<Option<u32>, WireError> {
             other => return Err(WireError::UnsupportedConstraint(other)),
         }
     }
-    Ok(lifetime)
+    Ok(constraints)
 }
 
-/// `SSH2_AGENT_IDENTITIES_ANSWER` listing `keys` with their comments.
-pub fn identities_answer(keys: &[PublicKey]) -> Vec<u8> {
+/// One listed identity: a key or certificate blob and its comment.
+pub type Listed = (Vec<u8>, String);
+
+/// `SSH2_AGENT_IDENTITIES_ANSWER` listing `identities`.
+pub fn identities_answer(identities: &[Listed]) -> Vec<u8> {
     let mut out = vec![SSH2_AGENT_IDENTITIES_ANSWER];
-    (keys.len() as u32).encode(&mut out).expect("vec write");
-    for key in keys {
-        let blob = key.to_bytes().expect("vec write");
+    (identities.len() as u32)
+        .encode(&mut out)
+        .expect("vec write");
+    for (blob, comment) in identities {
         blob.encode(&mut out).expect("vec write");
-        key.comment().encode(&mut out).expect("vec write");
+        comment.encode(&mut out).expect("vec write");
     }
     out
+}
+
+/// The listing entry for a plain public key.
+pub fn listed(key: &PublicKey) -> Listed {
+    (key.to_bytes().expect("vec write"), key.comment().to_owned())
 }
 
 /// `SSH2_AGENT_SIGN_RESPONSE` carrying `sig`.
@@ -511,6 +562,7 @@ mod tests {
                 provider: b"ferris@example.com".to_vec(),
                 pin: b"pin".to_vec(),
                 lifetime: None,
+                certs: None,
             }
         );
 
@@ -526,6 +578,7 @@ mod tests {
                 provider: b"ferris@example.com".to_vec(),
                 pin: b"pin".to_vec(),
                 lifetime: Some(60),
+                certs: None,
             }
         );
 
@@ -590,9 +643,14 @@ mod tests {
         pair.encode(&mut add).unwrap();
         "ferris@example.com".encode(&mut add).unwrap();
         match parse_request(&add).unwrap() {
-            Request::AddIdentity { key, lifetime } => {
+            Request::AddIdentity {
+                key,
+                cert,
+                lifetime,
+            } => {
                 assert_eq!(key.public_key().comment(), "ferris@example.com");
                 assert_eq!(key.key_blob(), blob);
+                assert_eq!(cert, None);
                 assert_eq!(lifetime, None);
             }
             other => panic!("unexpected request {other:?}"),
@@ -640,6 +698,7 @@ mod tests {
             Request::AddIdentity {
                 key: key @ HeldKey::SecurityKey(_),
                 lifetime,
+                ..
             } => {
                 assert_eq!(key.public_key().comment(), "ferris@example.com");
                 assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519);
@@ -711,7 +770,7 @@ mod tests {
         rsa_pair.encode(&mut rsa).unwrap();
         "old@example.com".encode(&mut rsa).unwrap();
         match parse_request(&rsa).unwrap() {
-            Request::AddIdentity { key, lifetime } => {
+            Request::AddIdentity { key, lifetime, .. } => {
                 assert_eq!(key.public_key().comment(), "old@example.com");
                 assert_eq!(
                     key.public_key().algorithm(),
@@ -732,6 +791,64 @@ mod tests {
             parse_request(&[SSH_AGENTC_REMOVE_ALL_IDENTITIES]).unwrap(),
             Request::RemoveAllIdentities
         );
+    }
+
+    #[test]
+    fn certificate_adds_and_associated_certs() {
+        use crate::agent::cert::tests::{cert_body, certify};
+        use ssh_key::private::Ed25519Keypair;
+
+        let pair = Ed25519Keypair::from_seed(&[0x11; 32]);
+        let cert = certify(&KeyData::Ed25519(pair.public));
+        let mut private = Vec::new();
+        pair.encode(&mut private).unwrap();
+        let mut add = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-ed25519-cert-v01@openssh.com".encode(&mut add).unwrap();
+        add.extend(cert_body(&cert, &private, "ferris@example.com"));
+        match parse_request(&add).unwrap() {
+            Request::AddIdentity {
+                key,
+                cert: Some(got),
+                lifetime: None,
+            } => {
+                assert_eq!(*got, cert);
+                assert_eq!(key.public_key().comment(), "ferris@example.com");
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        let mut associated = Vec::new();
+        SSH_AGENT_CONSTRAIN_EXTENSION
+            .encode(&mut associated)
+            .unwrap();
+        cert::ASSOCIATED_CERTS.encode(&mut associated).unwrap();
+        0u8.encode(&mut associated).unwrap();
+        let mut list = Vec::new();
+        cert.blob().encode(&mut list).unwrap();
+        list.encode(&mut associated).unwrap();
+
+        let mut card = vec![SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED];
+        b"ferris@example.com".as_slice().encode(&mut card).unwrap();
+        b"".as_slice().encode(&mut card).unwrap();
+        card.extend_from_slice(&associated);
+        match parse_request(&card).unwrap() {
+            Request::AddSmartcardKey {
+                certs: Some(certs), ..
+            } => {
+                assert!(!certs.certs_only);
+                assert_eq!(certs.certs, vec![cert.clone()]);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        // A private key add cannot carry associated certificates.
+        let mut constrained = add;
+        constrained[0] = SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        constrained.extend_from_slice(&associated);
+        assert!(matches!(
+            parse_request(&constrained),
+            Err(WireError::UnsupportedExtension(name)) if name == cert::ASSOCIATED_CERTS
+        ));
     }
 
     #[test]
@@ -760,7 +877,7 @@ mod tests {
     #[test]
     fn identities_answer_layout() {
         let keys = [key(1, "one"), key(2, "two")];
-        let out = identities_answer(&keys);
+        let out = identities_answer(&keys.iter().map(listed).collect::<Vec<_>>());
         assert_eq!(out[0], 12);
         assert_eq!(&out[1..5], &2u32.to_be_bytes());
         let mut r = &out[5..];

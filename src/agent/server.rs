@@ -1,6 +1,7 @@
 //! The agent itself: identity bookkeeping, request handling and the unix
 //! socket server.
 
+use super::cert::{AssociatedCerts, CertKey};
 use super::extension::{Extension, ExtensionContext};
 use super::keytype::{HeldKey, KeyDecoder, KeyRegistry};
 use super::local::{LocalKeyError, LocalKeyRef};
@@ -80,6 +81,8 @@ pub enum AgentError {
     Sha1Requested,
     #[error(transparent)]
     Wire(#[from] wire::WireError),
+    #[error("none of the certificates certifies the key")]
+    NoMatchingCertificate,
 }
 
 /// Agent state shared between connections. Each [`KeySpec`] it serves is
@@ -89,6 +92,8 @@ pub struct Agent {
     /// Keys added at runtime with `ssh-add FILE`: private keys held in memory
     /// and FIDO credentials signed by the authenticator.
     held: Mutex<Vec<Timed<Arc<HeldKey>>>>,
+    /// Certificates, each served as an identity of its own.
+    certs: Mutex<Vec<Timed<CertIdentity>>>,
     /// Protocol extension handlers, matched by name.
     extensions: Mutex<Vec<Arc<dyn Extension>>>,
     /// Key-type decoders for `ssh-add FILE`, matched by the request's key type.
@@ -150,6 +155,23 @@ impl<T> Timed<T> {
     }
 }
 
+/// A certificate the agent lists, and the key that signs for it.
+#[derive(Clone)]
+struct CertIdentity {
+    cert: CertKey,
+    comment: String,
+    signer: CertSigner,
+}
+
+#[derive(Clone)]
+enum CertSigner {
+    /// The private key `ssh-add FILE` sent with the certificate.
+    Held(Arc<HeldKey>),
+    /// A token key: the one `ssh-add -s` named, or, for a certificate loaded
+    /// with `--cert-file`, whichever served key the certificate certifies.
+    Token(Option<KeySpec>),
+}
+
 /// What a sign request named, once looked up.
 enum Target {
     /// A key the token holds.
@@ -203,6 +225,7 @@ impl Agent {
                     .collect(),
             ),
             held: Mutex::new(Vec::new()),
+            certs: Mutex::new(Vec::new()),
             extensions: Mutex::new(Vec::new()),
             key_types: Mutex::new(KeyRegistry::builtin()),
             opener,
@@ -290,6 +313,102 @@ impl Agent {
         tracing::info!(comment, "serving added key");
     }
 
+    /// Serve certificates for token keys, loaded with `--cert-file`. Each is
+    /// listed, under its file's comment (else its key id), while a served key
+    /// it certifies is known and it has not expired.
+    pub fn with_certificates(self, certs: impl IntoIterator<Item = CertKey>) -> Self {
+        lock(&self.certs).extend(certs.into_iter().map(|cert| {
+            let comment = match cert.comment() {
+                "" => cert.certificate().key_id().to_owned(),
+                comment => comment.to_owned(),
+            };
+            Timed::new(
+                CertIdentity {
+                    cert,
+                    comment,
+                    signer: CertSigner::Token(None),
+                },
+                None,
+            )
+        }));
+        self
+    }
+
+    /// Serve the certificate `ssh-add FILE` sent with its private key, with
+    /// an optional lifetime from `ssh-add -t` (which ssh-add sets to the
+    /// certificate's expiry on its own). The certificate is listed under the
+    /// key's comment, and a certificate already served is replaced.
+    pub fn add_cert_key(&self, key: HeldKey, cert: CertKey, lifetime: Option<u32>) {
+        let comment = key.public_key().comment().to_owned();
+        tracing::info!(
+            comment,
+            key_id = cert.certificate().key_id(),
+            "serving added certificate"
+        );
+        self.push_cert(
+            CertIdentity {
+                cert,
+                comment,
+                signer: CertSigner::Held(Arc::new(key)),
+            },
+            lifetime,
+        );
+    }
+
+    fn push_cert(&self, identity: CertIdentity, lifetime: Option<u32>) {
+        self.purge_expired();
+        let mut certs = lock(&self.certs);
+        certs.retain(|e| e.item.cert.blob() != identity.cert.blob());
+        certs.push(Timed::new(identity, lifetime));
+    }
+
+    /// `ssh-add -s PROVIDER CERT…`: serve `spec` (unless `certs_only`, from
+    /// `ssh-add -C`) and the given certificates that certify its key; the
+    /// others are skipped. Fails when only certificates were asked for and
+    /// none certifies the key.
+    pub fn add_with_certs(
+        &self,
+        spec: KeySpec,
+        lifetime: Option<u32>,
+        certs: AssociatedCerts,
+    ) -> Result<PublicKey, AgentError> {
+        let key = if certs.certs_only {
+            self.purge_expired();
+            self.derive_one(&spec)?
+        } else {
+            self.add(spec.clone(), lifetime)?
+        };
+        let (matching, others): (Vec<_>, Vec<_>) =
+            certs.certs.into_iter().partition(|c| c.certifies(&key));
+        if !others.is_empty() {
+            tracing::warn!(identity = %spec.identity, skipped = others.len(), "certificates for another key skipped");
+        }
+        if matching.is_empty() && certs.certs_only {
+            return Err(AgentError::NoMatchingCertificate);
+        }
+        for cert in matching {
+            tracing::info!(identity = %spec.identity, key_id = cert.certificate().key_id(), "serving certificate");
+            self.push_cert(
+                CertIdentity {
+                    cert,
+                    comment: spec.label(),
+                    signer: CertSigner::Token(Some(spec.clone())),
+                },
+                lifetime,
+            );
+        }
+        Ok(key)
+    }
+
+    /// Stop serving the certificate whose blob is `blob`. Returns whether
+    /// anything was removed.
+    pub fn remove_cert(&self, blob: &[u8]) -> bool {
+        let mut certs = lock(&self.certs);
+        let before = certs.len();
+        certs.retain(|e| e.item.cert.blob() != blob);
+        certs.len() != before
+    }
+
     /// Stop serving the key added with `ssh-add FILE` whose public key blob is
     /// `key_blob`. Returns whether anything was removed.
     pub fn remove_key(&self, key_blob: &[u8]) -> bool {
@@ -357,13 +476,19 @@ impl Agent {
     }
 
     /// Remove every entry matching `spec` (from the config or added at
-    /// runtime). Returns whether anything was removed.
+    /// runtime), along with the certificates `ssh-add -s` attached to it.
+    /// Returns whether anything was removed.
     pub fn remove(&self, spec: &KeySpec) -> bool {
         let mut entries = lock(&self.entries);
         let before = entries.len();
         entries.retain(|e| &e.item != spec);
-        let removed = entries.len() != before;
+        let mut removed = entries.len() != before;
         drop(entries);
+        let mut certs = lock(&self.certs);
+        let before = certs.len();
+        certs.retain(|e| !matches!(&e.item.signer, CertSigner::Token(Some(s)) if s == spec));
+        removed |= certs.len() != before;
+        drop(certs);
         if removed {
             lock(&self.cache).remove(spec);
         }
@@ -397,6 +522,7 @@ impl Agent {
             }
         }
         lock(&self.held).retain(|e| !e.expired());
+        lock(&self.certs).retain(|e| !e.expired());
     }
 
     /// Seed the key cache from previously exported public keys, matched by
@@ -458,6 +584,56 @@ impl Agent {
         };
         keys.extend(lock(&self.held).iter().map(|e| e.item.public_key().clone()));
         keys
+    }
+
+    /// Every identity the agent lists: the public keys of [`Self::public_keys`]
+    /// followed by the certificates whose key is served. A certificate past
+    /// its validity is left out.
+    pub fn identities(&self) -> Vec<wire::Listed> {
+        let mut out: Vec<_> = self.public_keys().iter().map(wire::listed).collect();
+        let certs: Vec<CertIdentity> = lock(&self.certs).iter().map(|e| e.item.clone()).collect();
+        for identity in certs {
+            if identity.cert.expired() {
+                tracing::debug!(
+                    key_id = identity.cert.certificate().key_id(),
+                    "certificate has expired; not listed"
+                );
+                continue;
+            }
+            if self.cert_signer(&identity).is_some() {
+                out.push((identity.cert.blob().to_vec(), identity.comment));
+            }
+        }
+        out
+    }
+
+    /// Certificates served for `key`, a token or added key.
+    pub fn certificates_for(&self, key: &PublicKey) -> Vec<CertKey> {
+        lock(&self.certs)
+            .iter()
+            .filter(|e| e.item.cert.certifies(key) && !e.item.cert.expired())
+            .map(|e| e.item.cert.clone())
+            .collect()
+    }
+
+    /// The key that signs for a certificate, if it is served.
+    fn cert_signer(&self, identity: &CertIdentity) -> Option<Target> {
+        let spec = match &identity.signer {
+            CertSigner::Held(key) => return Some(Target::Held(Arc::clone(key))),
+            CertSigner::Token(spec) => spec,
+        };
+        let entries = match spec {
+            Some(spec) => vec![spec.clone()],
+            None => self.entries(),
+        };
+        let cache = lock(&self.cache);
+        entries.into_iter().find_map(|spec| {
+            let key = cache
+                .get(&spec)
+                .filter(|k| identity.cert.certifies(k))?
+                .clone();
+            Some(Target::Device(spec, Box::new(key)))
+        })
     }
 
     /// Fetch every key now; fails on the first problem. Used by commands that
@@ -557,9 +733,9 @@ impl Agent {
     fn handle_unlocked(&self, request: Request) -> Vec<u8> {
         match request {
             Request::RequestIdentities => {
-                let keys = self.public_keys();
-                tracing::debug!(count = keys.len(), "listing identities");
-                wire::identities_answer(&keys)
+                let identities = self.identities();
+                tracing::debug!(count = identities.len(), "listing identities");
+                wire::identities_answer(&identities)
             }
             Request::RequestRsaIdentities => {
                 tracing::debug!("SSH v1 identities request: answering with none");
@@ -589,13 +765,23 @@ impl Agent {
                 }
             }
             Request::Unlock(passphrase) => self.handle_unlock(&passphrase),
-            Request::AddIdentity { key, lifetime } => {
-                self.add_key(key, lifetime);
+            Request::AddIdentity {
+                key,
+                cert,
+                lifetime,
+            } => {
+                match cert {
+                    Some(cert) => self.add_cert_key(key, *cert, lifetime),
+                    None => self.add_key(key, lifetime),
+                }
                 wire::success()
             }
             Request::RemoveIdentity { key_blob } => {
                 if self.remove_key(&key_blob) {
                     tracing::info!("removed added key");
+                    wire::success()
+                } else if self.remove_cert(&key_blob) {
+                    tracing::info!("removed certificate");
                     wire::success()
                 } else if let Some((spec, _)) = self.device_key(&key_blob)
                     && self.remove(&spec)
@@ -613,11 +799,18 @@ impl Agent {
                 wire::success()
             }
             Request::AddSmartcardKey {
-                provider, lifetime, ..
+                provider,
+                lifetime,
+                certs,
+                ..
             } => match self.provider_spec(&provider) {
                 Ok(spec) => {
                     let identity = spec.identity.to_string();
-                    match self.add(spec, lifetime) {
+                    let added = match certs {
+                        Some(certs) => self.add_with_certs(spec, lifetime, certs),
+                        None => self.add(spec, lifetime),
+                    };
+                    match added {
                         Ok(_) => wire::success(),
                         Err(e) => {
                             tracing::warn!(identity, error = %e, "cannot add key");
@@ -707,6 +900,7 @@ impl Agent {
         lock(&self.entries).clear();
         lock(&self.cache).clear();
         lock(&self.held).clear();
+        lock(&self.certs).clear();
         lock(&self.pin_tokens).clear();
     }
 
@@ -904,11 +1098,14 @@ impl Agent {
     }
 
     /// The served token key whose public key blob is `key_blob`, if its
-    /// public key is known.
+    /// public key is known. A key fetched only for its certificates
+    /// (`ssh-add -s -C`) is not served itself.
     fn device_key(&self, key_blob: &[u8]) -> Option<(KeySpec, PublicKey)> {
+        let entries = self.entries();
         let cache = lock(&self.cache);
         cache
             .iter()
+            .filter(|(spec, _)| entries.contains(spec))
             .find(|(_, key)| key.to_bytes().is_ok_and(|b| b == key_blob))
             .map(|(spec, key)| (spec.clone(), key.clone()))
     }
@@ -918,11 +1115,28 @@ impl Agent {
         if let Some((spec, key)) = self.device_key(key_blob) {
             return Ok(Target::Device(spec, Box::new(key)));
         }
-        let held = lock(&self.held);
-        held.iter()
+        let held = lock(&self.held)
+            .iter()
             .find(|e| e.item.key_blob() == key_blob)
-            .map(|e| Target::Held(Arc::clone(&e.item)))
-            .ok_or(AgentError::UnknownKey)
+            .map(|e| Target::Held(Arc::clone(&e.item)));
+        if let Some(target) = held {
+            return Ok(target);
+        }
+        let cert = lock(&self.certs)
+            .iter()
+            .find(|e| e.item.cert.blob() == key_blob)
+            .map(|e| e.item.clone());
+        match cert {
+            Some(identity) if identity.cert.expired() => {
+                tracing::warn!(
+                    key_id = identity.cert.certificate().key_id(),
+                    "certificate has expired"
+                );
+                Err(AgentError::UnknownKey)
+            }
+            Some(identity) => self.cert_signer(&identity).ok_or(AgentError::UnknownKey),
+            None => Err(AgentError::UnknownKey),
+        }
     }
 
     /// Turn an `ssh-add -s`/`-e` provider string into a key: a full label
@@ -1919,6 +2133,212 @@ mod tests {
             assert_eq!(agent.handle(&remove), wire::success());
         }
         assert!(agent.public_keys().is_empty());
+    }
+
+    /// The identities a listing reply carries, as (blob, comment).
+    fn listing(agent: &Agent) -> Vec<wire::Listed> {
+        let reply = agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
+        assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
+        let mut r = &reply[1..];
+        let count = u32::decode(&mut r).unwrap();
+        let out = (0..count)
+            .map(|_| {
+                (
+                    Vec::<u8>::decode(&mut r).unwrap(),
+                    String::decode(&mut r).unwrap(),
+                )
+            })
+            .collect();
+        assert!(r.is_empty());
+        out
+    }
+
+    fn sign_body(blob: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        blob.encode(&mut sign).unwrap();
+        data.encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        sign
+    }
+
+    #[test]
+    fn an_added_certificate_is_listed_signs_and_is_removed() {
+        use crate::agent::cert::tests::{cert_body, certify};
+        use ssh_key::private::Ed25519Keypair;
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let (add, public) = local_key(0x11, "ferris@example.com");
+        let cert = certify(public.key_data());
+        let mut private = Vec::new();
+        Ed25519Keypair::from_seed(&[0x11; 32])
+            .encode(&mut private)
+            .unwrap();
+        let mut add_cert = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-ed25519-cert-v01@openssh.com"
+            .encode(&mut add_cert)
+            .unwrap();
+        add_cert.extend(cert_body(&cert, &private, "ferris@example.com"));
+
+        // ssh-add sends the key, then its certificate: both are listed.
+        assert_eq!(agent.handle(&add), wire::success());
+        assert_eq!(agent.handle(&add_cert), wire::success());
+        assert_eq!(agent.handle(&add_cert), wire::success());
+        let key_blob = public.to_bytes().unwrap();
+        assert_eq!(
+            listing(&agent),
+            vec![
+                (key_blob.clone(), "ferris@example.com".to_owned()),
+                (cert.blob().to_vec(), "ferris@example.com".to_owned()),
+            ]
+        );
+        assert_eq!(agent.certificates_for(&public), vec![cert.clone()]);
+
+        // Signing for the certificate signs with the certified key.
+        let reply = agent.handle(&sign_body(cert.blob(), b"data"));
+        assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+        let mut r = &reply[1..];
+        let sig =
+            ssh_key::Signature::try_from(Vec::<u8>::decode(&mut r).unwrap().as_slice()).unwrap();
+        keys::verify(&public, b"data", &sig).unwrap();
+
+        // Removing the plain key leaves the certificate, which still signs.
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        key_blob.encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert_eq!(listing(&agent).len(), 1);
+        assert_eq!(agent.handle(&sign_body(cert.blob(), b"data"))[0], 14);
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        cert.blob().encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert_eq!(agent.handle(&remove), wire::failure());
+        assert!(listing(&agent).is_empty());
+        assert_eq!(
+            agent.handle(&sign_body(cert.blob(), b"data")),
+            wire::failure()
+        );
+
+        // `ssh-add -D` takes certificates too.
+        assert_eq!(agent.handle(&add_cert), wire::success());
+        assert_eq!(
+            agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]),
+            wire::success()
+        );
+        assert!(listing(&agent).is_empty());
+    }
+
+    /// A token key whose public key is known without the device.
+    fn preloaded_agent(entries: Vec<KeySpec>) -> (Agent, PublicKey) {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(entries, opener, Arc::new(RecordingSink::default()));
+        let raw = protocol::RawPublicKey::Ed25519([0x22; 32]);
+        let key = keys::public_key(&raw, &entry().label()).unwrap();
+        (agent, key)
+    }
+
+    /// `ssh-add -s PROVIDER [-C] CERT…` with `certs`.
+    fn add_card_with_certs(certs_only: bool, certs: &[&CertKey]) -> Vec<u8> {
+        let mut add = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED];
+        b"ferris@example.com".as_slice().encode(&mut add).unwrap();
+        b"".as_slice().encode(&mut add).unwrap();
+        wire::SSH_AGENT_CONSTRAIN_EXTENSION
+            .encode(&mut add)
+            .unwrap();
+        crate::agent::cert::ASSOCIATED_CERTS
+            .encode(&mut add)
+            .unwrap();
+        u8::from(certs_only).encode(&mut add).unwrap();
+        let mut list = Vec::new();
+        for cert in certs {
+            cert.blob().encode(&mut list).unwrap();
+        }
+        list.encode(&mut add).unwrap();
+        add
+    }
+
+    #[test]
+    fn smartcard_certificates_attach_to_the_token_key() {
+        use crate::agent::cert::tests::certify;
+        let (agent, key) = preloaded_agent(Vec::new());
+        // Seed the cache as an earlier fetch would.
+        lock(&agent.cache).insert(entry(), key.clone());
+        let cert = certify(key.key_data());
+        let other = certify(&ssh_key::public::KeyData::Ed25519(
+            ssh_key::public::Ed25519PublicKey([0x99; 32]),
+        ));
+
+        // `-C`: only the certificate is served, and it resolves to the token.
+        assert_eq!(
+            agent.handle(&add_card_with_certs(true, &[&cert, &other])),
+            wire::success()
+        );
+        assert_eq!(
+            listing(&agent),
+            vec![(cert.blob().to_vec(), entry().label())]
+        );
+        assert!(matches!(
+            agent.lookup(cert.blob()),
+            Ok(Target::Device(spec, _)) if spec == entry()
+        ));
+        // The plain key, fetched only for its certificate, does not sign.
+        assert!(matches!(
+            agent.lookup(&key.to_bytes().unwrap()),
+            Err(AgentError::UnknownKey)
+        ));
+        // Only certificates for another key: nothing to serve.
+        assert_eq!(
+            agent.handle(&add_card_with_certs(true, &[&other])),
+            wire::failure()
+        );
+
+        // Without `-C` the key is served too.
+        assert_eq!(
+            agent.handle(&add_card_with_certs(false, &[&cert])),
+            wire::success()
+        );
+        assert_eq!(listing(&agent).len(), 2);
+
+        // `ssh-add -e` takes the key and its certificate away.
+        let mut remove = vec![wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY];
+        b"ferris@example.com"
+            .as_slice()
+            .encode(&mut remove)
+            .unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert!(listing(&agent).is_empty());
+    }
+
+    #[test]
+    fn certificate_files_match_served_keys() {
+        use crate::agent::cert::tests::{certify, certify_until};
+        let (agent, key) = preloaded_agent(vec![entry()]);
+        let cert = certify(key.key_data());
+        let line = cert.to_openssh("ferris-cert");
+        let from_file = CertKey::from_openssh_line(&line).unwrap();
+        let expired = certify_until(key.key_data(), 1);
+        let unserved = certify(&ssh_key::public::KeyData::Ed25519(
+            ssh_key::public::Ed25519PublicKey([0x99; 32]),
+        ));
+        let agent = agent.with_certificates([from_file, expired.clone(), unserved.clone()]);
+        assert_eq!(agent.preload([key.clone()]), 1);
+        assert_eq!(
+            listing(&agent),
+            vec![
+                wire::listed(&key),
+                (cert.blob().to_vec(), "ferris-cert".to_owned())
+            ]
+        );
+        assert!(matches!(
+            agent.lookup(cert.blob()),
+            Ok(Target::Device(spec, _)) if spec == entry()
+        ));
+        assert!(agent.lookup(expired.blob()).is_err());
+        assert!(agent.lookup(unserved.blob()).is_err());
+        assert_eq!(agent.certificates_for(&key).len(), 1);
+
+        // Once the key is no longer served, neither is its certificate.
+        assert!(agent.remove(&entry()));
+        assert!(listing(&agent).is_empty());
+        assert!(agent.lookup(cert.blob()).is_err());
     }
 
     #[test]
