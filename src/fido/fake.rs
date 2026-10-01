@@ -5,12 +5,22 @@
 //! Ed25519 assertion over `authData || clientDataHash`. That lets the whole
 //! agent path — CTAPHID framing, CBOR, signature assembly and verification —
 //! run against a device that actually signs, with no hardware.
+//!
+//! With [`FakeFido::with_pin`] it also answers `authenticatorGetInfo` and the
+//! `authenticatorClientPIN` subcommands the agent uses, under both PIN/UV
+//! auth protocols, and checks `pinUvAuthParam` on getAssertion.
 
 use super::ctap::AUTHENTICATOR_GET_ASSERTION;
 use super::ctaphid::{CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_INIT, CTAPHID_KEEPALIVE};
+use super::pin::{
+    self, AUTHENTICATOR_CLIENT_PIN, AUTHENTICATOR_GET_INFO, GET_KEY_AGREEMENT, GET_PIN_TOKEN,
+    GET_RETRIES, PinProtocol,
+};
 use crate::protocol::Report;
 use crate::transport::{HidTransport, TransportError};
 use minicbor::{Decoder, Encoder};
+use p256::SecretKey;
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use signature::Signer;
 use ssh_key::private::Ed25519Keypair;
@@ -19,6 +29,25 @@ use std::time::Duration;
 
 /// The channel id a [`FakeFido`] allocates.
 const FAKE_CID: u32 = 0x0A0B_0C0D;
+
+/// The `authenticatorData` flag set when the user was verified.
+const FLAG_UV: u8 = 0x04;
+/// Tries a PIN gets back after a correct entry.
+const PIN_RETRIES: u8 = 8;
+/// Wrong PINs in a row after which the device wants to be replugged.
+const WRONG_PINS_BEFORE_REPLUG: u8 = 3;
+
+/// The PIN state of a [`FakeFido`] built with [`FakeFido::with_pin`].
+struct PinState {
+    pin: String,
+    retries: u8,
+    wrong_in_a_row: u8,
+    protocols: Vec<u8>,
+    key_agreement: SecretKey,
+    /// The token handed out by the last good getPINToken.
+    token: Option<(PinProtocol, Vec<u8>)>,
+    token_requests: u32,
+}
 
 /// A fake Ed25519 FIDO2 authenticator holding one credential.
 pub struct FakeFido {
@@ -39,6 +68,8 @@ pub struct FakeFido {
     /// A request is outstanding and waiting for a touch that never comes.
     waiting: bool,
     cancelled: bool,
+    pin: Option<PinState>,
+    id: Option<String>,
 }
 
 impl FakeFido {
@@ -59,6 +90,49 @@ impl FakeFido {
             never_touched: false,
             waiting: false,
             cancelled: false,
+            pin: None,
+            id: None,
+        }
+    }
+
+    /// Give the authenticator a PIN with `retries` tries left, spoken over
+    /// PIN/UV auth `protocols` (as getInfo lists them). A getAssertion
+    /// carrying a valid `pinUvAuthParam` reports the user verified.
+    pub fn with_pin(mut self, pin: &str, retries: u8, protocols: &[u8]) -> Self {
+        self.pin = Some(PinState {
+            pin: pin.to_owned(),
+            retries,
+            wrong_in_a_row: 0,
+            protocols: protocols.to_vec(),
+            key_agreement: SecretKey::random(&mut OsRng),
+            token: None,
+            token_requests: 0,
+        });
+        self
+    }
+
+    /// Report `id` as the transport's identity, as a device path would be.
+    pub fn with_id(mut self, id: &str) -> Self {
+        self.id = Some(id.to_owned());
+        self
+    }
+
+    /// PIN tries left, if the device has a PIN.
+    pub fn pin_retries(&self) -> Option<u8> {
+        self.pin.as_ref().map(|p| p.retries)
+    }
+
+    /// How many getPINToken requests the device received.
+    pub fn pin_token_requests(&self) -> u32 {
+        self.pin.as_ref().map_or(0, |p| p.token_requests)
+    }
+
+    /// Forget the PIN token, as a device does when it is replugged.
+    pub fn power_cycle(&mut self) {
+        if let Some(state) = &mut self.pin {
+            state.token = None;
+            state.wrong_in_a_row = 0;
+            state.key_agreement = SecretKey::random(&mut OsRng);
         }
     }
 
@@ -153,10 +227,118 @@ impl FakeFido {
 
     fn process(&mut self, cmd: u8, message: &[u8]) {
         // A CTAP2 message is a command byte, then that command's CBOR.
-        let Some((&AUTHENTICATOR_GET_ASSERTION, params)) = message.split_first() else {
-            self.push_message(self.cid, cmd, &[0x01]); // CTAP1_ERR_INVALID_COMMAND
-            return;
+        match message.split_first() {
+            Some((&AUTHENTICATOR_GET_ASSERTION, params)) => self.get_assertion(cmd, params),
+            Some((&AUTHENTICATOR_GET_INFO, _)) => {
+                let reply = self.get_info();
+                self.push_message(self.cid, cmd, &reply);
+            }
+            Some((&AUTHENTICATOR_CLIENT_PIN, params)) if self.pin.is_some() => {
+                let reply = self.client_pin(params);
+                self.push_message(self.cid, cmd, &reply);
+            }
+            _ => self.push_message(self.cid, cmd, &[0x01]), // CTAP1_ERR_INVALID_COMMAND
+        }
+    }
+
+    /// `authenticatorGetInfo`: the version, the `clientPin` option and the
+    /// PIN protocols.
+    fn get_info(&self) -> Vec<u8> {
+        let mut reply = vec![0x00];
+        let mut e = Encoder::new(&mut reply);
+        let entries = if self.pin.is_some() { 3 } else { 1 };
+        e.map(entries)
+            .and_then(|e| e.u8(1))
+            .and_then(|e| e.array(1))
+            .and_then(|e| e.str("FIDO_2_0"))
+            .expect("vec write");
+        if let Some(state) = &self.pin {
+            e.u8(4)
+                .and_then(|e| e.map(1))
+                .and_then(|e| e.str("clientPin"))
+                .and_then(|e| e.bool(true))
+                .and_then(|e| e.u8(6))
+                .and_then(|e| e.array(state.protocols.len() as u64))
+                .expect("vec write");
+            for &protocol in &state.protocols {
+                e.u8(protocol).expect("vec write");
+            }
+        }
+        reply
+    }
+
+    /// `authenticatorClientPIN`: getRetries, getKeyAgreement and getPINToken.
+    fn client_pin(&mut self, params: &[u8]) -> Vec<u8> {
+        let Some(request) = parse_client_pin(params) else {
+            return vec![0x12]; // CTAP2_ERR_INVALID_CBOR
         };
+        let state = self.pin.as_mut().expect("checked by the caller");
+        let protocol = match request.protocol {
+            1 if state.protocols.contains(&1) => PinProtocol::V1,
+            2 if state.protocols.contains(&2) => PinProtocol::V2,
+            _ => return vec![0x02], // CTAP1_ERR_INVALID_PARAMETER
+        };
+        let mut reply = vec![0x00];
+        let mut e = Encoder::new(&mut reply);
+        match request.sub_command {
+            GET_RETRIES => {
+                e.map(1)
+                    .and_then(|e| e.u8(3))
+                    .and_then(|e| e.u8(state.retries))
+                    .expect("vec write");
+            }
+            GET_KEY_AGREEMENT => {
+                e.map(1).and_then(|e| e.u8(1)).expect("vec write");
+                pin::encode_cose_key(&mut e, &state.key_agreement.public_key()).expect("vec write");
+            }
+            GET_PIN_TOKEN => {
+                state.token_requests += 1;
+                if state.retries == 0 {
+                    return vec![0x32]; // CTAP2_ERR_PIN_BLOCKED
+                }
+                if state.wrong_in_a_row >= WRONG_PINS_BEFORE_REPLUG {
+                    return vec![0x34]; // CTAP2_ERR_PIN_AUTH_BLOCKED
+                }
+                let (Some(platform), Some(pin_hash_enc)) =
+                    (request.key_agreement, request.pin_hash_enc)
+                else {
+                    return vec![0x14]; // CTAP2_ERR_MISSING_PARAMETER
+                };
+                let secret = pin::shared_secret(protocol, &state.key_agreement, &platform);
+                // A device makes a fresh key agreement key after each try.
+                state.key_agreement = SecretKey::random(&mut OsRng);
+                let expected = &Sha256::digest(state.pin.as_bytes())[..16];
+                let matches = protocol
+                    .decrypt(&secret, &pin_hash_enc)
+                    .is_ok_and(|given| given.as_slice() == expected);
+                if !matches {
+                    state.retries -= 1;
+                    state.wrong_in_a_row += 1;
+                    return if state.retries == 0 {
+                        vec![0x32] // CTAP2_ERR_PIN_BLOCKED
+                    } else if state.wrong_in_a_row >= WRONG_PINS_BEFORE_REPLUG {
+                        vec![0x34] // CTAP2_ERR_PIN_AUTH_BLOCKED
+                    } else {
+                        vec![0x31] // CTAP2_ERR_PIN_INVALID
+                    };
+                }
+                state.retries = PIN_RETRIES;
+                state.wrong_in_a_row = 0;
+                let mut token = vec![0u8; 32];
+                OsRng.fill_bytes(&mut token);
+                let encrypted = protocol.encrypt(&secret, &token).expect("whole blocks");
+                state.token = Some((protocol, token));
+                e.map(1)
+                    .and_then(|e| e.u8(2))
+                    .and_then(|e| e.bytes(&encrypted))
+                    .expect("vec write");
+            }
+            _ => return vec![0x3e], // CTAP2_ERR_INVALID_SUBCOMMAND
+        }
+        reply
+    }
+
+    fn get_assertion(&mut self, cmd: u8, params: &[u8]) {
         let Some(request) = parse_request(params) else {
             self.push_message(self.cid, cmd, &[0x12]); // CTAP2_ERR_INVALID_CBOR
             return;
@@ -165,12 +347,34 @@ impl FakeFido {
             self.push_message(self.cid, cmd, &[0x2e]); // CTAP2_ERR_NO_CREDENTIALS
             return;
         }
+        // A valid pinUvAuthParam verifies the user; a bad one is refused.
+        let mut verified = false;
+        if let Some((param, protocol)) = &request.pin_auth {
+            let token = self.pin.as_ref().and_then(|p| p.token.as_ref());
+            match token {
+                Some((p, token))
+                    if p.number() == *protocol
+                        && p.authenticate(token, &request.client_data_hash) == *param =>
+                {
+                    verified = true;
+                }
+                _ => {
+                    self.push_message(self.cid, cmd, &[0x33]); // CTAP2_ERR_PIN_AUTH_INVALID
+                    return;
+                }
+            }
+        }
         let mut auth_data = Sha256::digest(request.rp_id.as_bytes()).to_vec();
         // Without `up`, the device answers at once and reports no presence.
-        let flags = if request.up {
+        let mut flags = if request.up {
             self.flags
         } else {
             self.flags & !0x01
+        };
+        flags = if verified {
+            flags | FLAG_UV
+        } else {
+            flags & !FLAG_UV
         };
         auth_data.push(flags);
         auth_data.extend_from_slice(&self.counter.to_be_bytes());
@@ -231,6 +435,39 @@ struct Request {
     client_data_hash: Vec<u8>,
     key_handles: Vec<Vec<u8>>,
     up: bool,
+    /// `pinUvAuthParam` and `pinUvAuthProtocol`, when both are given.
+    pin_auth: Option<(Vec<u8>, u8)>,
+}
+
+/// The parts of an `authenticatorClientPIN` request the fake acts on.
+struct ClientPinRequest {
+    protocol: u8,
+    sub_command: u8,
+    key_agreement: Option<p256::PublicKey>,
+    pin_hash_enc: Option<Vec<u8>>,
+}
+
+fn parse_client_pin(message: &[u8]) -> Option<ClientPinRequest> {
+    let mut d = Decoder::new(message);
+    let mut protocol = None;
+    let mut sub_command = None;
+    let mut key_agreement = None;
+    let mut pin_hash_enc = None;
+    for _ in 0..d.map().ok()?? {
+        match d.u8().ok()? {
+            1 => protocol = Some(d.u8().ok()?),
+            2 => sub_command = Some(d.u8().ok()?),
+            3 => key_agreement = Some(pin::decode_cose_key(&mut d).ok()?),
+            6 => pin_hash_enc = Some(d.bytes().ok()?.to_vec()),
+            _ => d.skip().ok()?,
+        }
+    }
+    Some(ClientPinRequest {
+        protocol: protocol?,
+        sub_command: sub_command?,
+        key_agreement,
+        pin_hash_enc,
+    })
 }
 
 /// Decode a getAssertion request: `rpId` (1), `clientDataHash` (2), the
@@ -244,6 +481,8 @@ fn parse_request(message: &[u8]) -> Option<Request> {
     let mut client_data_hash = None;
     let mut key_handles = Vec::new();
     let mut up = true;
+    let mut pin_param = None;
+    let mut pin_protocol = None;
     for _ in 0..pairs {
         match d.u8().ok()? {
             1 => rp_id = Some(d.str().ok()?.to_owned()),
@@ -272,6 +511,8 @@ fn parse_request(message: &[u8]) -> Option<Request> {
                     }
                 }
             }
+            6 => pin_param = Some(d.bytes().ok()?.to_vec()),
+            7 => pin_protocol = Some(d.u8().ok()?),
             _ => d.skip().ok()?,
         }
     }
@@ -280,10 +521,15 @@ fn parse_request(message: &[u8]) -> Option<Request> {
         client_data_hash: client_data_hash?,
         key_handles,
         up,
+        pin_auth: pin_param.zip(pin_protocol),
     })
 }
 
 impl HidTransport for FakeFido {
+    fn id(&self) -> Option<String> {
+        self.id.clone()
+    }
+
     fn write_report(&mut self, report: &Report) -> Result<(), TransportError> {
         self.handle(report);
         Ok(())
@@ -299,6 +545,23 @@ impl HidTransport for FakeFido {
             return Ok(self.out.pop_front());
         }
         Ok(None)
+    }
+}
+
+/// A [`FakeFido`] shared between openings, so that its state (retries, a
+/// PIN token) carries over from one signature to the next as a real
+/// device's does.
+impl HidTransport for std::sync::Arc<std::sync::Mutex<FakeFido>> {
+    fn id(&self) -> Option<String> {
+        self.lock().unwrap().id()
+    }
+
+    fn write_report(&mut self, report: &Report) -> Result<(), TransportError> {
+        self.lock().unwrap().write_report(report)
+    }
+
+    fn read_report(&mut self, timeout: Duration) -> Result<Option<Report>, TransportError> {
+        self.lock().unwrap().read_report(timeout)
     }
 }
 
@@ -327,6 +590,106 @@ mod tests {
         signed.extend_from_slice(&hash);
         let sig = ed25519_dalek::Signature::from_slice(&assertion.signature).unwrap();
         key.verify(&signed, &sig).unwrap();
+    }
+
+    /// The PIN client and the fake agree under both protocols: the token
+    /// authorises a getAssertion, which then reports the user verified.
+    #[test]
+    fn a_pin_token_verifies_the_user() {
+        use crate::fido::ctap::{PinAuth, get_assertion_with_pin};
+        use crate::fido::pin;
+        for protocols in [&[1u8][..], &[1, 2], &[2]] {
+            let device = FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3, 4], 0x01)
+                .with_pin("1234", 8, protocols);
+            let mut hid = CtapHid::new(device);
+            let info = pin::get_info(&mut hid).unwrap();
+            assert_eq!(info.client_pin, Some(true));
+            let protocol = info.protocol().unwrap();
+            assert_eq!(protocol.number(), *protocols.iter().max().unwrap());
+            assert_eq!(pin::retries(&mut hid, protocol).unwrap(), 8);
+            let token = pin::pin_token(&mut hid, protocol, "1234").unwrap();
+            let hash: [u8; 32] = Sha256::digest(b"hello").into();
+            let auth = PinAuth {
+                protocol,
+                token: &token,
+            };
+            let assertion = get_assertion_with_pin(
+                &mut hid,
+                "ssh:",
+                &hash,
+                &[1, 2, 3, 4],
+                true,
+                Some(auth),
+                &|| {},
+            )
+            .unwrap();
+            assert_eq!(assertion.flags, 0x01 | FLAG_UV);
+            // Without the token the user is not verified.
+            let assertion =
+                get_assertion(&mut hid, "ssh:", &hash, &[1, 2, 3, 4], true, &|| {}).unwrap();
+            assert_eq!(assertion.flags, 0x01);
+        }
+    }
+
+    /// Wrong PINs cost tries; three in a row want a replug, and a stale
+    /// token is refused.
+    #[test]
+    fn wrong_pins_count_down_and_stale_tokens_are_refused() {
+        use crate::fido::ctap::{PinAuth, get_assertion_with_pin};
+        use crate::fido::{FidoError, pin};
+        let device =
+            FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3, 4], 0x01).with_pin("1234", 8, &[1]);
+        let mut hid = CtapHid::new(device);
+        let v1 = PinProtocol::V1;
+        assert!(matches!(
+            pin::pin_token(&mut hid, v1, "0000"),
+            Err(FidoError::PinInvalid)
+        ));
+        assert_eq!(pin::retries(&mut hid, v1).unwrap(), 7);
+        // Too short never reaches the device.
+        assert!(matches!(
+            pin::pin_token(&mut hid, v1, "12"),
+            Err(FidoError::PinLength)
+        ));
+        assert_eq!(pin::retries(&mut hid, v1).unwrap(), 7);
+        let token = pin::pin_token(&mut hid, v1, "1234").unwrap();
+        assert_eq!(pin::retries(&mut hid, v1).unwrap(), 8);
+
+        hid.transport_mut().power_cycle();
+        let hash = [0u8; 32];
+        let auth = PinAuth {
+            protocol: v1,
+            token: &token,
+        };
+        let stale = get_assertion_with_pin(
+            &mut hid,
+            "ssh:",
+            &hash,
+            &[1, 2, 3, 4],
+            true,
+            Some(auth),
+            &|| {},
+        );
+        assert!(matches!(stale, Err(FidoError::PinAuthInvalid)), "{stale:?}");
+
+        assert!(matches!(
+            pin::pin_token(&mut hid, v1, "0000"),
+            Err(FidoError::PinInvalid)
+        ));
+        assert!(matches!(
+            pin::pin_token(&mut hid, v1, "0000"),
+            Err(FidoError::PinInvalid)
+        ));
+        assert!(matches!(
+            pin::pin_token(&mut hid, v1, "0000"),
+            Err(FidoError::PinAuthBlocked)
+        ));
+        // Even the right PIN waits for a replug.
+        assert!(matches!(
+            pin::pin_token(&mut hid, v1, "1234"),
+            Err(FidoError::PinAuthBlocked)
+        ));
+        assert_eq!(hid.transport().pin_retries(), Some(5));
     }
 
     /// A key that is never touched is asked once, cancelled when the touch

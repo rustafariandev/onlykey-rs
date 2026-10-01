@@ -61,6 +61,13 @@ pub trait HidTransport: Send {
     /// Wait up to `timeout` for one report. `None` on timeout or on a report
     /// that is not exactly 64 bytes.
     fn read_report(&mut self, timeout: Duration) -> Result<Option<Report>, TransportError>;
+
+    /// A name that stays the same while the device stays attached, such as
+    /// its HID path; `None` when there is none. It keys state kept per
+    /// device, such as a cached PIN token.
+    fn id(&self) -> Option<String> {
+        None
+    }
 }
 
 impl HidTransport for Box<dyn HidTransport> {
@@ -70,6 +77,10 @@ impl HidTransport for Box<dyn HidTransport> {
 
     fn read_report(&mut self, timeout: Duration) -> Result<Option<Report>, TransportError> {
         (**self).read_report(timeout)
+    }
+
+    fn id(&self) -> Option<String> {
+        (**self).id()
     }
 }
 
@@ -278,6 +289,10 @@ impl HidapiTransport {
 }
 
 impl HidTransport for HidapiTransport {
+    fn id(&self) -> Option<String> {
+        Some(self.path.clone())
+    }
+
     fn write_report(&mut self, report: &Report) -> Result<(), TransportError> {
         let written = self.device.write(report)?;
         if written != REPORT_SIZE {

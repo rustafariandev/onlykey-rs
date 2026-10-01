@@ -23,7 +23,8 @@ pub const SK_ECDSA_P256: &str = "sk-ecdsa-sha2-nistp256@openssh.com";
 
 /// `SSH_SK_USER_PRESENCE_REQD`: the key must be touched to sign.
 const USER_PRESENCE: u8 = 0x01;
-/// `SSH_SK_USER_VERIFICATION_REQD`: the key needs a PIN as well.
+/// `SSH_SK_USER_VERIFICATION_REQD`: the key needs a PIN as well. The
+/// assertion reports a verified user with the same bit of its flags.
 const USER_VERIFICATION: u8 = 0x04;
 
 /// A FIDO security key credential held by the agent.
@@ -135,30 +136,43 @@ impl SkKey {
         data: &[u8],
         on_presence: &dyn Fn(),
     ) -> Result<Signature, fido::FidoError> {
-        self.sign_with(&mut CtapHid::new(transport), data, on_presence)
+        self.sign_with(&mut CtapHid::new(transport), data, None, on_presence)
     }
 
     /// [`Self::sign`] over a CTAPHID channel already in use, such as one
     /// [`Self::is_held_by`] just probed.
+    ///
+    /// A key that [needs verification](Self::needs_verification) signs only
+    /// with a PIN token in `pin`, and only if the authenticator reports the
+    /// user verified; without one it fails with
+    /// [`FidoError::UvRequired`](fido::FidoError::UvRequired) before the
+    /// device is asked.
     pub fn sign_with<T: HidTransport>(
         &self,
         hid: &mut CtapHid<T>,
         data: &[u8],
+        pin: Option<fido::PinAuth>,
         on_presence: &dyn Fn(),
     ) -> Result<Signature, fido::FidoError> {
-        if self.needs_verification() {
+        if self.needs_verification() && pin.is_none() {
             return Err(fido::FidoError::UvRequired);
         }
         let client_data_hash: [u8; 32] = Sha256::digest(data).into();
         let up = self.flags & USER_PRESENCE != 0;
-        let assertion = fido::get_assertion(
+        let assertion = fido::get_assertion_with_pin(
             hid,
             &self.application,
             &client_data_hash,
             &self.key_handle,
             up,
+            pin,
             on_presence,
         )?;
+        if self.needs_verification() && assertion.flags & USER_VERIFICATION == 0 {
+            return Err(fido::FidoError::Protocol(
+                "the security key signed without verifying the user",
+            ));
+        }
 
         let mut payload = match self.algorithm {
             Algorithm::SkEd25519 => {
@@ -252,8 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn verification_required_keys_are_refused_for_now() {
-        let device = FakeFido::new(&[0x43; 32], "ssh:", &[1], 0x05);
+    fn verification_required_keys_need_a_pin_token() {
+        let device = FakeFido::new(&[0x43; 32], "ssh:", &[1], 0x05).with_pin("1234", 8, &[2]);
         let public = ssh_key::public::SkEd25519::new(
             ssh_key::public::Ed25519PublicKey(device.public()),
             "ssh:",
@@ -264,9 +278,22 @@ mod tests {
         "ferris@example.com".encode(&mut body).unwrap();
         let key = decode(SK_SSH_ED25519, &mut body.as_slice()).unwrap();
         assert!(key.needs_verification());
+        let mut hid = CtapHid::new(device);
         assert!(matches!(
-            key.sign(device, b"hello", &|| {}),
+            key.sign_with(&mut hid, b"hello", None, &|| {}),
             Err(fido::FidoError::UvRequired)
         ));
+        let protocol = fido::PinProtocol::V2;
+        let token = fido::pin::pin_token(&mut hid, protocol, "1234").unwrap();
+        let auth = fido::PinAuth {
+            protocol,
+            token: &token,
+        };
+        let sig = key
+            .sign_with(&mut hid, b"hello", Some(auth), &|| {})
+            .unwrap();
+        keys::verify(key.public_key(), b"hello", &sig).unwrap();
+        // The signature carries the UV flag the server checks.
+        assert_eq!(sig.as_bytes()[64] & USER_VERIFICATION, USER_VERIFICATION);
     }
 }

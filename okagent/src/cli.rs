@@ -5,7 +5,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
 use onlykey_agent::agent::{self, Agent, Opener, SkOpener};
-use onlykey_agent::challenge::{ChallengeSink, CommandNotifier, MultiSink, TtyPrompt};
+use onlykey_agent::challenge::{
+    AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt, TtyPin, TtyPrompt,
+};
 use onlykey_agent::device::{OnlyKey, Timeouts};
 use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use onlykey_agent::protocol::DeviceStatus;
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 /// SSH agent backed by an OnlyKey hardware token.
@@ -56,6 +59,17 @@ pub struct Cli {
     /// holds the key.
     #[arg(long, global = true, value_name = "PATH")]
     pub fido_device: Option<String>,
+
+    /// Program that asks for a security key's PIN, for `sk-` keys enrolled
+    /// with verify-required (default: the config's `askpass`, then
+    /// $SSH_ASKPASS). Without one, the PIN is read from the terminal.
+    #[arg(long, global = true, value_name = "PROGRAM")]
+    pub askpass: Option<String>,
+
+    /// Seconds to reuse a security key's PIN before asking again; 0 (the
+    /// default) asks for every signature.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub pin_cache: Option<u64>,
 
     #[command(subcommand)]
     pub command: Cmd,
@@ -237,6 +251,9 @@ struct Context_ {
     timeouts: Timeouts,
     /// Optional FIDO device path for `sk-` keys.
     fido_device: Option<String>,
+    /// Asks for security key PINs.
+    pin_prompt: Arc<dyn PinPrompt>,
+    pin_cache: Duration,
 }
 
 impl Context_ {
@@ -322,7 +339,10 @@ impl Context_ {
                 .map(|t| Box::new(t) as Box<dyn HidTransport>)
                 .collect())
         });
-        let agent = Agent::new(entries, opener, Arc::clone(&self.sink)).with_sk_opener(sk_opener);
+        let agent = Agent::new(entries, opener, Arc::clone(&self.sink))
+            .with_sk_opener(sk_opener)
+            .with_pin_prompt(Arc::clone(&self.pin_prompt))
+            .with_pin_cache(self.pin_cache);
         if let Some(path) = pubkey_file {
             let matched = agent.preload(keys);
             tracing::info!(matched, path = %path.display(), "preloaded public keys");
@@ -428,7 +448,16 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         .fido_device
         .clone()
         .or_else(|| config.fido_device.clone());
+    let askpass = cli
+        .askpass
+        .clone()
+        .or_else(|| config.askpass.clone())
+        .or_else(|| std::env::var("SSH_ASKPASS").ok())
+        .filter(|program| !program.is_empty());
+    let pin_cache = Duration::from_secs(cli.pin_cache.or(config.pin_cache).unwrap_or(0));
     let ctx = Context_ {
+        pin_prompt: Arc::new(pin_prompt(askpass)),
+        pin_cache,
         config,
         curve,
         curve_given: cli.curve.is_some(),
@@ -454,6 +483,17 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         Cmd::DebugSign(args) => debug_sign(&ctx, args),
         Cmd::Completions(args) => completions(&args),
     }
+}
+
+/// Ask for PINs with the askpass program when there is one, else on the
+/// terminal.
+fn pin_prompt(askpass: Option<String>) -> ChainPin {
+    let mut prompts: Vec<Box<dyn PinPrompt>> = Vec::new();
+    if let Some(program) = askpass {
+        prompts.push(Box::new(AskpassPin::new(program)));
+    }
+    prompts.push(Box::new(TtyPin));
+    ChainPin(prompts)
 }
 
 fn completions(args: &CompletionsArgs) -> Result<ExitCode> {
@@ -952,6 +992,8 @@ mod tests {
             sink: Arc::new(TtyPrompt),
             timeouts: Timeouts::default(),
             fido_device: None,
+            pin_prompt: Arc::new(ChainPin::default()),
+            pin_cache: Duration::ZERO,
         }
     }
 

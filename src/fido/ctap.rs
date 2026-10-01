@@ -8,6 +8,7 @@
 use super::FidoError;
 use super::ctap_status;
 use super::ctaphid::{CTAPHID_CBOR, CtapHid};
+use super::pin::PinProtocol;
 use crate::transport::HidTransport;
 use minicbor::{Decoder, Encoder};
 
@@ -28,6 +29,14 @@ pub struct Assertion {
     pub counter: u32,
 }
 
+/// A PIN token from [`super::pin::pin_token`] authorising a getAssertion,
+/// with the protocol it was obtained under.
+#[derive(Debug, Clone, Copy)]
+pub struct PinAuth<'a> {
+    pub protocol: PinProtocol,
+    pub token: &'a [u8],
+}
+
 /// Ask the authenticator to sign `client_data_hash` with `key_handle`.
 ///
 /// `up` sets the `up` option, so a key enrolled with user presence required
@@ -40,7 +49,29 @@ pub fn get_assertion<T: HidTransport>(
     up: bool,
     on_presence: &dyn Fn(),
 ) -> Result<Assertion, FidoError> {
-    let request = encode_request(rp_id, client_data_hash, key_handle, up)?;
+    get_assertion_with_pin(
+        hid,
+        rp_id,
+        client_data_hash,
+        key_handle,
+        up,
+        None,
+        on_presence,
+    )
+}
+
+/// [`get_assertion`], authorised by a PIN token when `pin` is given, as a
+/// credential enrolled with user verification required needs.
+pub fn get_assertion_with_pin<T: HidTransport>(
+    hid: &mut CtapHid<T>,
+    rp_id: &str,
+    client_data_hash: &[u8; 32],
+    key_handle: &[u8],
+    up: bool,
+    pin: Option<PinAuth>,
+    on_presence: &dyn Fn(),
+) -> Result<Assertion, FidoError> {
+    let request = encode_request_with_pin(rp_id, client_data_hash, key_handle, up, pin)?;
     let reply = hid.transact(CTAPHID_CBOR, &request, on_presence)?;
     let (&status, cbor) = reply
         .split_first()
@@ -51,15 +82,29 @@ pub fn get_assertion<T: HidTransport>(
     parse_assertion(cbor)
 }
 
+#[cfg(test)]
 fn encode_request(
     rp_id: &str,
     client_data_hash: &[u8; 32],
     key_handle: &[u8],
     up: bool,
 ) -> Result<Vec<u8>, FidoError> {
+    encode_request_with_pin(rp_id, client_data_hash, key_handle, up, None)
+}
+
+/// The request: `rpId` (1), `clientDataHash` (2), `allowList` (3), options
+/// (5) and, with a PIN token, `pinUvAuthParam` (6) and `pinUvAuthProtocol`
+/// (7), in CTAP2 canonical key order.
+fn encode_request_with_pin(
+    rp_id: &str,
+    client_data_hash: &[u8; 32],
+    key_handle: &[u8],
+    up: bool,
+    pin: Option<PinAuth>,
+) -> Result<Vec<u8>, FidoError> {
     let mut buffer = vec![AUTHENTICATOR_GET_ASSERTION];
     let mut e = Encoder::new(&mut buffer);
-    e.map(4)
+    e.map(if pin.is_some() { 6 } else { 4 })
         .and_then(|e| e.u8(1))
         .and_then(|e| e.str(rp_id))
         .and_then(|e| e.u8(2))
@@ -78,6 +123,14 @@ fn encode_request(
         .and_then(|e| e.str("up"))
         .and_then(|e| e.bool(up))
         .map_err(|e| FidoError::Cbor(e.to_string()))?;
+    if let Some(pin) = pin {
+        let param = pin.protocol.authenticate(pin.token, client_data_hash);
+        e.u8(6)
+            .and_then(|e| e.bytes(&param))
+            .and_then(|e| e.u8(7))
+            .and_then(|e| e.u8(pin.protocol.number()))
+            .map_err(|e| FidoError::Cbor(e.to_string()))?;
+    }
     Ok(buffer)
 }
 
@@ -218,6 +271,47 @@ mod tests {
         ]
         .concat();
         assert_eq!(hex::encode(&request), expected);
+    }
+
+    /// With a PIN token, `pinUvAuthParam` (6) and `pinUvAuthProtocol` (7)
+    /// follow the options. The HMACs were computed with Python's `hmac`.
+    #[test]
+    fn request_with_pin_appends_auth_param_and_protocol() {
+        let plain = encode_request("ssh:", &[0xAB; 32], &[0x01, 0x02], true).unwrap();
+        let v1 = PinAuth {
+            protocol: PinProtocol::V1,
+            token: &[0x44; 16],
+        };
+        let request =
+            encode_request_with_pin("ssh:", &[0xAB; 32], &[0x01, 0x02], true, Some(v1)).unwrap();
+        let tail = [
+            "06",                               // 6: pinUvAuthParam
+            "50",                               // bytes(16)
+            "a141371d466c448a797ed904ee2bed1f", // LEFT(HMAC(token, hash), 16)
+            "07",                               // 7: pinUvAuthProtocol
+            "01",                               // 1
+        ]
+        .concat();
+        // Same request but for map(6) and the two entries at the end.
+        assert_eq!(request[1], 0xa6);
+        assert_eq!(request[2..plain.len()], plain[2..]);
+        assert_eq!(hex::encode(&request[plain.len()..]), tail);
+
+        let v2 = PinAuth {
+            protocol: PinProtocol::V2,
+            token: &[0x44; 32],
+        };
+        let request =
+            encode_request_with_pin("ssh:", &[0xAB; 32], &[0x01, 0x02], true, Some(v2)).unwrap();
+        let tail = [
+            "06",
+            "5820", // bytes(32)
+            "cab2b06cb2b912ce02d7fbb852e77c73b660d27a2329dced213ad32e11de0a6f",
+            "07",
+            "02",
+        ]
+        .concat();
+        assert_eq!(hex::encode(&request[plain.len()..]), tail);
     }
 
     #[test]

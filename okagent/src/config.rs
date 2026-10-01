@@ -6,6 +6,8 @@
 //! socket = "/run/user/1000/okagent/agent.sock"
 //! log-file = "/home/ferris/.local/state/okagent.log"
 //! fido-device = "/dev/hidraw5"  # optional, when several FIDO keys are attached
+//! askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs
+//! pin-cache = 300              # seconds to reuse a security key's PIN; 0 = ask every time
 //!
 //! [[identity]]
 //! name = "ferris@example.com"
@@ -40,6 +42,10 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     /// FIDO security key path substring for `sk-` keys.
     pub fido_device: Option<String>,
+    /// Program asked for security key PINs, as `SSH_ASKPASS` is.
+    pub askpass: Option<String>,
+    /// Seconds a security key's PIN token is reused; 0 asks every time.
+    pub pin_cache: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +147,8 @@ mod tests {
             notify-command = "notify-send OnlyKey"
             socket = "/tmp/x.sock"
             log-file = "/tmp/okagent.log"
+            askpass = "/usr/libexec/openssh/ssh-askpass"
+            pin-cache = 300
             [[identity]]
             name = "ferris@example.com"
             [[identity]]
@@ -162,6 +170,11 @@ mod tests {
         assert_eq!(cfg.curve, Some(Curve::NistP256));
         assert_eq!(cfg.notify_command.as_deref(), Some("notify-send OnlyKey"));
         assert_eq!(cfg.log_file.as_deref(), Some(Path::new("/tmp/okagent.log")));
+        assert_eq!(
+            cfg.askpass.as_deref(),
+            Some("/usr/libexec/openssh/ssh-askpass")
+        );
+        assert_eq!(cfg.pin_cache, Some(300));
         let entries = cfg.entries(cfg.curve.unwrap_or_default()).unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].kind, KeyKind::Derived(Curve::NistP256));

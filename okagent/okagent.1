@@ -207,7 +207,14 @@ attached authenticator, which must be touched. See
 .BR \-\-fido\-device .
 Keys enrolled with
 .B ssh-keygen \-O verify-required
-need a PIN, which is not supported yet and is refused.
+also need the authenticator's PIN, which is asked for with
+.B \-\-askpass
+(or
+.BR SSH_ASKPASS ),
+or else on the terminal, before the touch.
+A wrong PIN is asked for again, showing the tries left; after three wrong
+PINs in a row the authenticator must be unplugged and plugged back in.
+With no askpass program and no terminal such a key is refused.
 A security key whose application does not start with
 .B ssh:
 may be a web credential, so, as with OpenSSH's agent, it signs only SSH
@@ -485,6 +492,41 @@ The same value can be set with the
 .B fido-device
 config key.
 .TP
+.BI \-\-askpass " program"
+Ask for a security key's PIN, for
+.B sk-
+keys enrolled with
+.BR "ssh-keygen \-O verify-required" ,
+by running
+.I program
+with the prompt as its only argument and reading the PIN from its standard
+output, as
+.BR ssh (1)
+does with
+.BR SSH_ASKPASS ;
+a non-zero exit cancels.
+Defaults to the
+.B askpass
+config key, then
+.BR SSH_ASKPASS .
+Without any, or when the program cannot be run, the PIN is read from the
+terminal with echo off.
+.TP
+.BI \-\-pin\-cache " seconds"
+Reuse a security key's PIN for this many seconds after it is entered, so
+signatures in that time ask only for a touch.
+The default, 0, asks for the PIN at every signature.
+While a PIN is cached, anything that can use the agent's socket can sign
+with the key after a touch alone.
+The cache is per device and is cleared when the agent is locked with
+.BR "ssh-add \-x" ,
+when
+.B ssh-add \-D
+removes every identity; a device that was replugged asks for the PIN again.
+The same value can be set with the
+.B pin-cache
+config key.
+.TP
 .BR \-v ", " \-\-verbose
 Log more.
 Once for informational messages, twice for debug output, three times for
@@ -715,6 +757,14 @@ See
 See
 .BR \-\-fido\-device .
 .TP
+.BI askpass " = \(dq" program \(dq
+See
+.BR \-\-askpass .
+.TP
+.BI pin-cache " = " seconds
+See
+.BR \-\-pin\-cache .
+.TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
 line.
@@ -750,6 +800,8 @@ notify-command = "notify-send OnlyKey"
 # pubkey-file = "/home/ferris/.ssh/onlykey.pub"
 # log-file = "/home/ferris/.local/state/okagent.log"
 # fido-device = "/dev/hidraw5"
+# askpass = "/usr/libexec/openssh/ssh-askpass"
+# pin-cache = 300
 
 [[identity]]
 name = "ferris@example.com"
@@ -768,6 +820,12 @@ slot = "RSA1"
 .EE
 .RE
 .SH ENVIRONMENT
+.TP
+.B SSH_ASKPASS
+Program that asks for security key PINs when
+.B \-\-askpass
+is not given; see
+.BR \-\-askpass .
 .TP
 .B OKAGENT_CONFIG
 Configuration file to read; same as

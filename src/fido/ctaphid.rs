@@ -73,6 +73,16 @@ impl<T: HidTransport> CtapHid<T> {
         self
     }
 
+    /// The transport, for its [`HidTransport::id`].
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// The transport, mutably; for tests that change a fake device.
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
     /// Take the transport back.
     pub fn into_transport(self) -> T {
         self.transport

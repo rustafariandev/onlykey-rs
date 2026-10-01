@@ -152,8 +152,12 @@ pure-Rust CTAP2 client, so it works with any FIDO2 key (a YubiKey, the
 OnlyKey's own FIDO applet, and so on) and needs no C library. Older U2F-only
 (CTAP1) keys are not supported. A key made with
 `ssh-keygen -t ed25519-sk` or `-t ecdsa-sk` must be touched to sign; a key
-made with `-O verify-required` needs a PIN, which is not supported yet and is
-refused with a clear error. With several authenticators attached, okagent
+made with `-O verify-required` also needs the authenticator's PIN: okagent
+asks for it with `--askpass` (default `$SSH_ASKPASS`, e.g.
+`/usr/libexec/openssh/ssh-askpass`), or on the terminal when there is no
+askpass program, then waits for the touch. `--pin-cache SECONDS` (or
+`pin-cache` in the config) reuses the PIN for that long; by default it is
+asked for at every signature. With several authenticators attached, okagent
 asks each one silently which holds the credential, so only that one asks
 for a touch. The OnlyKey's own FIDO applet is left out; to sign with it, or
 to pin one device, pass `--fido-device /dev/hidrawN` (or set `fido-device`
@@ -213,6 +217,8 @@ notify-command = "notify-send OnlyKey"  # optional
 # pubkey-file = "/home/ferris/.ssh/onlykey.pub"
 # log-file = "/home/ferris/.local/state/okagent.log"
 # fido-device = "/dev/hidraw5"          # optional, for several FIDO keys
+# askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs
+# pin-cache = 300                       # seconds to reuse a PIN; 0 asks every time
 
 [[identity]]
 name = "ferris@example.com"
