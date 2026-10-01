@@ -88,6 +88,19 @@ impl SkKey {
         &self.application
     }
 
+    /// How prompts name the key: its comment, or, for a key loaded with
+    /// `ssh-add -K` (which sends none), its application and fingerprint.
+    pub fn display_name(&self) -> String {
+        match self.public.comment() {
+            "" => format!(
+                "{} {}",
+                self.application,
+                self.public.fingerprint(ssh_key::HashAlg::Sha256)
+            ),
+            comment => comment.to_owned(),
+        }
+    }
+
     /// Whether the credential belongs to SSH. Any other application may be a
     /// web credential, so the agent only signs SSH data with it.
     pub fn is_ssh_application(&self) -> bool {
@@ -234,6 +247,26 @@ mod tests {
         assert_eq!(sig.algorithm(), Algorithm::SkEd25519);
         keys::verify(key.public_key(), b"hello", &sig).unwrap();
         assert!(keys::verify(key.public_key(), b"other", &sig).is_err());
+    }
+
+    /// A key loaded with `ssh-add -K` has no comment, so prompts name it by
+    /// application and fingerprint instead.
+    #[test]
+    fn a_key_without_a_comment_is_named_by_application_and_fingerprint() {
+        let device = FakeFido::new(&[0x42; 32], "ssh:okagent-test", &[9, 8, 7], 0x01);
+        let key = decode(SK_SSH_ED25519, &mut add_body(&device, "").as_slice()).unwrap();
+        let fingerprint = key.public_key().fingerprint(ssh_key::HashAlg::Sha256);
+        assert_eq!(
+            key.display_name(),
+            format!("ssh:okagent-test {fingerprint}")
+        );
+        assert!(key.display_name().contains(" SHA256:"));
+        let key = decode(
+            SK_SSH_ED25519,
+            &mut add_body(&device, "ferris@laptop").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(key.display_name(), "ferris@laptop");
     }
 
     /// An `sk-ecdsa-sha2-nistp256` key decodes, keeping its application and

@@ -776,7 +776,7 @@ impl Agent {
         }
         let mut hid = self.authenticator_for(key)?;
         let request = TouchRequest {
-            identity: key.public_key().comment().to_owned(),
+            identity: key.display_name(),
             subject: wire::describe_data(data),
         };
         let on_presence = || {
