@@ -8,6 +8,12 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .YS
 .SY okagent
 .RI [ options ]
+.B devices
+.RB [ \-\-onlykey ]
+.RB [ \-\-fido ]
+.YS
+.SY okagent
+.RI [ options ]
 .B pubkey
 .RB [ \-\-pubkey\-file
 .IR file ]
@@ -237,6 +243,25 @@ itself does.
 .B status
 Print the firmware version and lock state of the attached OnlyKey.
 .TP
+.B devices
+List the attached OnlyKeys and FIDO security keys, one interface per line:
+.B onlykey
+or
+.BR fido ,
+the HID path, the USB vendor and product ids, and the device's name.
+The OnlyKey's own FIDO interface is listed as a
+.B fido
+line marked as such.
+Devices are only enumerated, not opened, so no permission is needed.
+.B \-\-onlykey
+or
+.B \-\-fido
+limits the list to one kind.
+Exits with status 1 when no device is listed.
+The path is what
+.B \-\-fido\-device
+expects.
+.TP
 .BI pubkey " " [ identity \fR.\|.\|.]
 Print the public key of each identity, one per line, in
 .I authorized_keys
@@ -454,6 +479,8 @@ By default every attached authenticator other than the OnlyKey is asked,
 without a touch, whether it holds the key, and the first that does signs;
 give the OnlyKey's own FIDO interface here to sign with it instead.
 U2F-only (CTAP1) authenticators are not supported.
+.B okagent devices \-\-fido
+lists the paths.
 The same value can be set with the
 .B fido-device
 config key.

@@ -59,6 +59,7 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | Command | What it does |
 | --- | --- |
 | `okagent status` | Firmware version and lock state of the attached token. |
+| `okagent devices` | Attached OnlyKeys and FIDO security keys, with the paths `--fido-device` takes. |
 | `okagent pubkey ID...` | Public keys in `authorized_keys` format. |
 | `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK` (and `SSH_AGENT_PID`). |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |

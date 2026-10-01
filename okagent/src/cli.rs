@@ -11,7 +11,9 @@ use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use onlykey_agent::protocol::DeviceStatus;
 use onlykey_agent::ssh_key::HashAlg;
 use onlykey_agent::ssh_key::PublicKey;
-use onlykey_agent::transport::{HidTransport, HidapiTransport};
+use onlykey_agent::transport::{
+    DeviceEntry, DeviceKind, HidTransport, HidapiTransport, list_devices,
+};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -63,6 +65,8 @@ pub struct Cli {
 pub enum Cmd {
     /// Show firmware version and lock state of the attached OnlyKey.
     Status,
+    /// List attached OnlyKeys and FIDO security keys.
+    Devices(DevicesArgs),
     /// Print public keys in authorized_keys format.
     Pubkey(IdentityArgs),
     /// Run the agent on a unix socket.
@@ -201,6 +205,17 @@ pub struct DebugSignArgs {
     /// Digest for an RSA key: sha256 or sha512.
     #[arg(long, default_value = "sha512")]
     pub hash: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DevicesArgs {
+    /// List only OnlyKeys.
+    #[arg(long)]
+    pub onlykey: bool,
+
+    /// List only FIDO security keys (including the OnlyKey's FIDO interface).
+    #[arg(long)]
+    pub fido: bool,
 }
 
 #[derive(Debug, Args)]
@@ -425,6 +440,7 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
 
     match cli.command {
         Cmd::Status => status(&ctx),
+        Cmd::Devices(args) => devices(&args),
         Cmd::Pubkey(args) => pubkey(&ctx, &args),
         Cmd::Serve(args) => serve(&ctx, args),
         Cmd::Run(args) => run(&ctx, &args.identities, args.command),
@@ -463,6 +479,59 @@ fn status(ctx: &Context_) -> Result<ExitCode> {
         DeviceStatus::Uninitialized => println!("OnlyKey has no PIN set"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// List the attached devices, one per line; fails when none matches.
+fn devices(args: &DevicesArgs) -> Result<ExitCode> {
+    let all = !args.onlykey && !args.fido;
+    let entries: Vec<DeviceEntry> = list_devices()?
+        .into_iter()
+        .filter(|e| match e.kind {
+            DeviceKind::OnlyKey => all || args.onlykey,
+            DeviceKind::Fido => all || args.fido,
+        })
+        .collect();
+    if entries.is_empty() {
+        eprintln!("okagent: no devices found");
+        return Ok(ExitCode::FAILURE);
+    }
+    let width = entries.iter().map(|e| e.path.len()).max().unwrap_or(0);
+    let text: String = entries
+        .iter()
+        .map(|e| format!("{}\n", format_entry(e, width)))
+        .collect();
+    match std::io::stdout().write_all(text.as_bytes()) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// One `devices` line: kind, path padded to `width`, USB ids and names.
+fn format_entry(entry: &DeviceEntry, width: usize) -> String {
+    let kind = match entry.kind {
+        DeviceKind::OnlyKey => "onlykey",
+        DeviceKind::Fido => "fido",
+    };
+    let name = [entry.manufacturer.as_deref(), entry.product.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut line = format!(
+        "{kind:<7}  {:<width$}  {:04x}:{:04x}",
+        entry.path, entry.vendor_id, entry.product_id
+    );
+    if !name.is_empty() {
+        line.push_str("  ");
+        line.push_str(&name);
+    }
+    if entry.kind == DeviceKind::Fido && entry.is_onlykey {
+        line.push_str(" (OnlyKey FIDO interface)");
+    }
+    line
 }
 
 fn pubkey(ctx: &Context_, args: &IdentityArgs) -> Result<ExitCode> {
@@ -982,6 +1051,54 @@ mod tests {
             assert_eq!(base.identity, ["base@example.com"]);
             assert_eq!(additional, ["extra@example.com"]);
         }
+    }
+
+    #[test]
+    fn devices_parses_filters() {
+        let cli = Cli::try_parse_from(["okagent", "devices", "--fido"]).unwrap();
+        let Cmd::Devices(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(args.fido && !args.onlykey);
+    }
+
+    #[test]
+    fn device_lines_show_kind_path_ids_and_name() {
+        let solo = DeviceEntry {
+            kind: DeviceKind::Fido,
+            path: "/dev/hidraw7".into(),
+            vendor_id: 0x1209,
+            product_id: 0xbeee,
+            manufacturer: Some("SoloKeys".into()),
+            product: Some("Solo 4".into()),
+            is_onlykey: false,
+        };
+        assert_eq!(
+            format_entry(&solo, 13),
+            "fido     /dev/hidraw7   1209:beee  SoloKeys Solo 4"
+        );
+        let onlykey_fido = DeviceEntry {
+            path: "/dev/hidraw5".into(),
+            vendor_id: 0x1d50,
+            product_id: 0x60fc,
+            manufacturer: None,
+            product: None,
+            is_onlykey: true,
+            ..solo.clone()
+        };
+        assert_eq!(
+            format_entry(&onlykey_fido, 12),
+            "fido     /dev/hidraw5  1d50:60fc (OnlyKey FIDO interface)"
+        );
+        let onlykey = DeviceEntry {
+            kind: DeviceKind::OnlyKey,
+            product: Some("ONLYKEY".into()),
+            ..onlykey_fido
+        };
+        assert_eq!(
+            format_entry(&onlykey, 12),
+            "onlykey  /dev/hidraw5  1d50:60fc  ONLYKEY"
+        );
     }
 
     #[test]

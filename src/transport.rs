@@ -78,11 +78,85 @@ fn hid_api() -> &'static Mutex<HidApi> {
     API.get_or_init(|| Mutex::new(HidApi::new().expect("hidapi initialises")))
 }
 
+/// What an enumerated HID interface is to okagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// An original OnlyKey's command interface.
+    OnlyKey,
+    /// A FIDO authenticator's CTAPHID interface (the OnlyKey has one too).
+    Fido,
+}
+
+/// An attached interface found by [`list_devices`], described from the
+/// enumeration alone: nothing is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry {
+    pub kind: DeviceKind,
+    pub path: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    /// Whether the interface belongs to an OnlyKey (by USB vendor/product).
+    pub is_onlykey: bool,
+}
+
+/// Classify an interface from its USB ids, serial string, top-level usage
+/// and interface number; `None` for interfaces okagent does not use.
+fn classify(
+    usb_id: (u16, u16),
+    serial: Option<&str>,
+    (usage_page, usage): (u16, u16),
+    interface: i32,
+) -> Option<DeviceKind> {
+    if USB_IDS.contains(&usb_id)
+        && serial == Some(ORIGINAL_SERIAL)
+        && (usage_page == COMMAND_USAGE_PAGE || interface == COMMAND_INTERFACE)
+    {
+        Some(DeviceKind::OnlyKey)
+    } else if usage_page == FIDO_USAGE_PAGE && usage == FIDO_USAGE {
+        Some(DeviceKind::Fido)
+    } else {
+        None
+    }
+}
+
+fn classify_info(info: &DeviceInfo) -> Option<DeviceKind> {
+    classify(
+        (info.vendor_id(), info.product_id()),
+        info.serial_number(),
+        (info.usage_page(), info.usage()),
+        info.interface_number(),
+    )
+}
+
 /// Whether an enumerated HID interface is an original OnlyKey's command channel.
 fn is_command_interface(info: &DeviceInfo) -> bool {
-    USB_IDS.contains(&(info.vendor_id(), info.product_id()))
-        && info.serial_number() == Some(ORIGINAL_SERIAL)
-        && (info.usage_page() == COMMAND_USAGE_PAGE || info.interface_number() == COMMAND_INTERFACE)
+    classify_info(info) == Some(DeviceKind::OnlyKey)
+}
+
+/// Every attached OnlyKey command interface and FIDO authenticator, in path
+/// order. Devices are only enumerated, never opened, so this works without
+/// permission to use them.
+pub fn list_devices() -> Result<Vec<DeviceEntry>, TransportError> {
+    let api = HidapiTransport::refreshed_api()?;
+    let entries = HidapiTransport::candidates(&api, |d| classify_info(d).is_some())
+        .into_iter()
+        .filter_map(|info| {
+            let kind = classify_info(info)?;
+            let usb_id = (info.vendor_id(), info.product_id());
+            Some(DeviceEntry {
+                kind,
+                path: info.path().to_string_lossy().into_owned(),
+                vendor_id: usb_id.0,
+                product_id: usb_id.1,
+                manufacturer: info.manufacturer_string().map(str::to_owned),
+                product: info.product_string().map(str::to_owned),
+                is_onlykey: USB_IDS.contains(&usb_id),
+            })
+        })
+        .collect();
+    Ok(entries)
 }
 
 /// Whether an enumerated HID interface is a FIDO authenticator to sign with:
@@ -341,5 +415,33 @@ mod tests {
         // Other interfaces are never FIDO candidates.
         let keyboard = (0x0001, 0x0006);
         assert!(!is_fido_candidate(yubikey, keyboard, "/dev/hidraw3", None));
+    }
+
+    #[test]
+    fn classify_finds_onlykeys_and_fido_keys() {
+        let fido = (FIDO_USAGE_PAGE, FIDO_USAGE);
+        let command = (COMMAND_USAGE_PAGE, 0x01);
+        let keyboard = (0x0001, 0x0006);
+        let onlykey = USB_IDS[0];
+        let serial = Some(ORIGINAL_SERIAL);
+        assert_eq!(
+            classify(onlykey, serial, command, 0),
+            Some(DeviceKind::OnlyKey)
+        );
+        // Without a usage page the interface number identifies it.
+        assert_eq!(
+            classify(onlykey, serial, (0, 0), COMMAND_INTERFACE),
+            Some(DeviceKind::OnlyKey)
+        );
+        // The DUO reports another serial and is not supported.
+        assert_eq!(classify(onlykey, Some("1000000001"), command, 0), None);
+        // The OnlyKey's own FIDO interface is a FIDO key like any other.
+        assert_eq!(classify(onlykey, serial, fido, 1), Some(DeviceKind::Fido));
+        assert_eq!(
+            classify((0x1050, 0x0407), None, fido, 0),
+            Some(DeviceKind::Fido)
+        );
+        assert_eq!(classify((0x1050, 0x0407), None, keyboard, 0), None);
+        assert_eq!(classify(onlykey, serial, keyboard, 0), None);
     }
 }
