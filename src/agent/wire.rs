@@ -130,6 +130,27 @@ pub enum Request {
     Unsupported(u8),
 }
 
+impl Request {
+    /// A short label for logs. `Debug` is not used for that, since it would
+    /// print a lock passphrase.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Request::RequestRsaIdentities => "request-rsa-identities",
+            Request::RequestIdentities => "request-identities",
+            Request::Sign { .. } => "sign",
+            Request::AddIdentity { .. } => "add-identity",
+            Request::RemoveIdentity { .. } => "remove-identity",
+            Request::RemoveAllIdentities => "remove-all-identities",
+            Request::Lock(_) => "lock",
+            Request::Unlock(_) => "unlock",
+            Request::AddSmartcardKey { .. } => "add-smartcard-key",
+            Request::RemoveSmartcardKey { .. } => "remove-smartcard-key",
+            Request::Extension { .. } => "extension",
+            Request::Unsupported(_) => "unsupported",
+        }
+    }
+}
+
 /// Decode one request body (without its length prefix), resolving key types
 /// through the built-in [`KeyRegistry`] only. Use [`parse_request_with`] to
 /// honour key types registered by a caller.
@@ -685,6 +706,15 @@ mod tests {
             parse_request(&[SSH_AGENTC_REMOVE_ALL_IDENTITIES]).unwrap(),
             Request::RemoveAllIdentities
         );
+    }
+
+    #[test]
+    fn request_names_do_not_leak_secrets() {
+        let lock = Request::Lock(b"hunter2".to_vec());
+        assert_eq!(lock.name(), "lock");
+        assert_eq!(Request::Unlock(b"hunter2".to_vec()).name(), "unlock");
+        assert_eq!(Request::RemoveAllIdentities.name(), "remove-all-identities");
+        assert_eq!(Request::Unsupported(200).name(), "unsupported");
     }
 
     #[test]

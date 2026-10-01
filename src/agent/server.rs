@@ -22,9 +22,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+/// Lock `mutex`, carrying on if a thread panicked while holding it: each
+/// value guarded here is left consistent between statements, so a poisoned
+/// lock still holds usable state.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// A device the agent can open on demand.
 pub type Device = OnlyKey<Box<dyn HidTransport>>;
@@ -190,7 +197,7 @@ impl Agent {
     /// registration under the same name wins.
     pub fn register_extension(&self, extension: impl Extension + 'static) {
         let name = extension.name().to_owned();
-        let mut extensions = self.extensions.lock().unwrap_or_else(|p| p.into_inner());
+        let mut extensions = lock(&self.extensions);
         extensions.retain(|e| e.name() != name);
         extensions.push(Arc::new(extension));
     }
@@ -207,10 +214,7 @@ impl Agent {
     /// requests whose key type it answers. A later registration under a name
     /// wins.
     pub fn register_key_type(&self, decoder: impl KeyDecoder + 'static) {
-        self.key_types
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .register(decoder);
+        lock(&self.key_types).register(decoder);
     }
 
     /// Serve a key added with `ssh-add FILE` (a private key held in memory or
@@ -220,7 +224,7 @@ impl Agent {
         self.purge_expired();
         let blob = key.key_blob();
         let comment = key.public_key().comment().to_owned();
-        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let mut held = lock(&self.held);
         held.retain(|e| e.item.key_blob() != blob);
         held.push(Timed::new(Arc::new(key), lifetime));
         drop(held);
@@ -230,7 +234,7 @@ impl Agent {
     /// Stop serving the key added with `ssh-add FILE` whose public key blob is
     /// `key_blob`. Returns whether anything was removed.
     pub fn remove_key(&self, key_blob: &[u8]) -> bool {
-        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let mut held = lock(&self.held);
         let before = held.len();
         held.retain(|e| e.item.key_blob() != key_blob);
         held.len() != before
@@ -238,34 +242,25 @@ impl Agent {
 
     /// Whether `ssh-add -x` has locked the agent.
     pub fn is_locked(&self) -> bool {
-        self.passphrase_lock
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some()
+        lock(&self.passphrase_lock).is_some()
     }
 
     /// Lock with `passphrase`; fails if already locked, as in OpenSSH.
     pub fn lock(&self, passphrase: &[u8]) -> bool {
-        let mut lock = self
-            .passphrase_lock
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if lock.is_some() {
+        let mut state = lock(&self.passphrase_lock);
+        if state.is_some() {
             return false;
         }
-        *lock = Some(PassphraseHash::new(passphrase));
+        *state = Some(PassphraseHash::new(passphrase));
         true
     }
 
     /// Unlock if `passphrase` is the one the agent was locked with.
     pub fn unlock(&self, passphrase: &[u8]) -> bool {
-        let mut lock = self
-            .passphrase_lock
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        match lock.as_ref() {
+        let mut state = lock(&self.passphrase_lock);
+        match state.as_ref() {
             Some(hash) if hash.matches(passphrase) => {
-                *lock = None;
+                *state = None;
                 true
             }
             _ => false,
@@ -276,12 +271,7 @@ impl Agent {
     /// can change at runtime through [`Self::add`] and [`Self::remove`].
     pub fn entries(&self) -> Vec<KeySpec> {
         self.purge_expired();
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|e| e.item.clone())
-            .collect()
+        lock(&self.entries).iter().map(|e| e.item.clone()).collect()
     }
 
     /// Add `spec` to the served identities. If its public key is already
@@ -301,16 +291,13 @@ impl Agent {
     /// Remove every entry matching `spec` (from the config or added at
     /// runtime). Returns whether anything was removed.
     pub fn remove(&self, spec: &KeySpec) -> bool {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut entries = lock(&self.entries);
         let before = entries.len();
         entries.retain(|e| &e.item != spec);
         let removed = entries.len() != before;
         drop(entries);
         if removed {
-            self.cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(spec);
+            lock(&self.cache).remove(spec);
         }
         removed
     }
@@ -318,14 +305,14 @@ impl Agent {
     /// Record `spec` in the entry list, replacing any existing entry so a
     /// fresh lifetime takes effect.
     fn remember(&self, spec: KeySpec, lifetime: Option<u32>) {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut entries = lock(&self.entries);
         entries.retain(|e| e.item != spec);
         entries.push(Timed::new(spec, lifetime));
     }
 
     /// Drop entries whose lifetime has elapsed, along with their cached keys.
     fn purge_expired(&self) {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut entries = lock(&self.entries);
         let mut expired = Vec::new();
         entries.retain(|e| {
             let alive = !e.expired();
@@ -336,22 +323,19 @@ impl Agent {
         });
         drop(entries);
         if !expired.is_empty() {
-            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            let mut cache = lock(&self.cache);
             for spec in expired {
                 cache.remove(&spec);
             }
         }
-        self.held
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|e| !e.expired());
+        lock(&self.held).retain(|e| !e.expired());
     }
 
     /// Seed the key cache from previously exported public keys, matched by
     /// their comment (see [`KeySpec::label`]). Returns how many matched.
     pub fn preload(&self, keys: impl IntoIterator<Item = PublicKey>) -> usize {
         let entries = self.entries();
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cache = lock(&self.cache);
         let mut matched = 0;
         for key in keys {
             if let Some(entry) = entries.iter().find(|e| e.label() == key.comment())
@@ -372,7 +356,7 @@ impl Agent {
     pub fn public_keys(&self) -> Vec<PublicKey> {
         let entries = self.entries();
         let missing: Vec<KeySpec> = {
-            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            let cache = lock(&self.cache);
             entries
                 .iter()
                 .filter(|e| !cache.contains_key(*e))
@@ -380,16 +364,13 @@ impl Agent {
                 .collect()
         };
         if !missing.is_empty() {
-            let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _guard = lock(&self.device_lock);
             match (self.opener)() {
                 Ok(mut device) => {
                     for entry in &missing {
                         match self.derive(&mut device, entry) {
                             Ok(key) => {
-                                self.cache
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .insert(entry.clone(), key);
+                                lock(&self.cache).insert(entry.clone(), key);
                             }
                             Err(e) => {
                                 tracing::warn!(identity = %entry.identity, key = %entry.kind, error = %e, "cannot get public key")
@@ -401,19 +382,13 @@ impl Agent {
             }
         }
         let mut keys: Vec<PublicKey> = {
-            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            let cache = lock(&self.cache);
             entries
                 .iter()
                 .filter_map(|e| cache.get(e).cloned())
                 .collect()
         };
-        keys.extend(
-            self.held
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .map(|e| e.item.public_key().clone()),
-        );
+        keys.extend(lock(&self.held).iter().map(|e| e.item.public_key().clone()));
         keys
     }
 
@@ -421,16 +396,11 @@ impl Agent {
     /// need all keys up front.
     pub fn derive_all(&self) -> Result<Vec<PublicKey>, AgentError> {
         let entries = self.entries();
-        let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = lock(&self.device_lock);
         let mut device = None;
         let mut out = Vec::with_capacity(entries.len());
         for entry in &entries {
-            let cached = self
-                .cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(entry)
-                .cloned();
+            let cached = lock(&self.cache).get(entry).cloned();
             let key = match cached {
                 Some(key) => key,
                 None => {
@@ -438,10 +408,7 @@ impl Agent {
                         device = Some((self.opener)()?);
                     }
                     let key = self.derive(device.as_mut().expect("just opened"), entry)?;
-                    self.cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(entry.clone(), key.clone());
+                    lock(&self.cache).insert(entry.clone(), key.clone());
                     key
                 }
             };
@@ -453,22 +420,14 @@ impl Agent {
     /// Fetch one key now; fails if the device is unavailable. Used by
     /// commands that need a single key up front.
     pub fn derive_one(&self, entry: &KeySpec) -> Result<PublicKey, AgentError> {
-        let cached = self
-            .cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(entry)
-            .cloned();
+        let cached = lock(&self.cache).get(entry).cloned();
         if let Some(key) = cached {
             return Ok(key);
         }
-        let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = lock(&self.device_lock);
         let mut device = (self.opener)()?;
         let key = self.derive(&mut device, entry)?;
-        self.cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(entry.clone(), key.clone());
+        lock(&self.cache).insert(entry.clone(), key.clone());
         Ok(key)
     }
 
@@ -477,30 +436,72 @@ impl Agent {
     }
 
     /// Handle one request body and produce the reply body.
+    ///
+    /// The lock is checked once: a locked agent answers through
+    /// [`Self::handle_locked`], an unlocked one through
+    /// [`Self::handle_unlocked`].
     pub fn handle(&self, body: &[u8]) -> Vec<u8> {
         let request = {
-            let key_types = self.key_types.lock().unwrap_or_else(|p| p.into_inner());
+            let key_types = lock(&self.key_types);
             wire::parse_request_with(&key_types, body)
         };
+        let request = match request {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::warn!(error = %e, "bad request");
+                return wire::failure();
+            }
+        };
+        if self.is_locked() {
+            self.handle_locked(request)
+        } else {
+            self.handle_unlocked(request)
+        }
+    }
+
+    /// Answer a request while `ssh-add -x` has locked the agent: no keys are
+    /// listed, unlock and protocol extensions are served, and everything
+    /// else is refused, including request types added later.
+    fn handle_locked(&self, request: Request) -> Vec<u8> {
         match request {
-            Ok(Request::RequestIdentities) if self.is_locked() => {
+            Request::RequestIdentities => {
                 tracing::debug!("listing identities: agent is locked, none");
                 wire::identities_answer(&[])
             }
-            Ok(Request::RequestIdentities) => {
+            Request::RequestRsaIdentities => {
+                tracing::debug!("SSH v1 identities request: answering with none");
+                wire::rsa_identities_answer()
+            }
+            Request::Unlock(passphrase) => self.handle_unlock(&passphrase),
+            Request::Extension { name, data } => self.handle_extension(&name, &data),
+            Request::Unsupported(kind) => {
+                tracing::debug!(kind, "unsupported request");
+                wire::failure()
+            }
+            other => {
+                tracing::warn!(request = other.name(), "refused: agent is locked");
+                wire::failure()
+            }
+        }
+    }
+
+    /// Answer a request while the agent is unlocked.
+    fn handle_unlocked(&self, request: Request) -> Vec<u8> {
+        match request {
+            Request::RequestIdentities => {
                 let keys = self.public_keys();
                 tracing::debug!(count = keys.len(), "listing identities");
                 wire::identities_answer(&keys)
             }
-            Ok(Request::Sign { .. }) if self.is_locked() => {
-                tracing::warn!("sign request refused: agent is locked");
-                wire::failure()
+            Request::RequestRsaIdentities => {
+                tracing::debug!("SSH v1 identities request: answering with none");
+                wire::rsa_identities_answer()
             }
-            Ok(Request::Sign {
+            Request::Sign {
                 key_blob,
                 data,
                 flags,
-            }) => {
+            } => {
                 tracing::debug!(len = data.len(), flags, "sign request");
                 match self.sign(&key_blob, &data, flags) {
                     Ok(reply) => reply,
@@ -510,7 +511,7 @@ impl Agent {
                     }
                 }
             }
-            Ok(Request::Lock(passphrase)) => {
+            Request::Lock(passphrase) => {
                 if self.lock(&passphrase) {
                     tracing::info!("agent locked");
                     wire::success()
@@ -519,28 +520,12 @@ impl Agent {
                     wire::failure()
                 }
             }
-            Ok(Request::Unlock(passphrase)) => {
-                if self.unlock(&passphrase) {
-                    tracing::info!("agent unlocked");
-                    wire::success()
-                } else {
-                    tracing::warn!("unlock request refused: not locked or wrong passphrase");
-                    wire::failure()
-                }
-            }
-            Ok(Request::AddIdentity { .. }) if self.is_locked() => {
-                tracing::warn!("add key refused: agent is locked");
-                wire::failure()
-            }
-            Ok(Request::AddIdentity { key, lifetime }) => {
+            Request::Unlock(passphrase) => self.handle_unlock(&passphrase),
+            Request::AddIdentity { key, lifetime } => {
                 self.add_key(key, lifetime);
                 wire::success()
             }
-            Ok(Request::RemoveIdentity { .. }) if self.is_locked() => {
-                tracing::warn!("remove key refused: agent is locked");
-                wire::failure()
-            }
-            Ok(Request::RemoveIdentity { key_blob }) => {
+            Request::RemoveIdentity { key_blob } => {
                 if self.remove_key(&key_blob) {
                     tracing::info!("removed added key");
                     wire::success()
@@ -554,22 +539,14 @@ impl Agent {
                     wire::failure()
                 }
             }
-            Ok(Request::RemoveAllIdentities) if self.is_locked() => {
-                tracing::warn!("remove all refused: agent is locked");
-                wire::failure()
-            }
-            Ok(Request::RemoveAllIdentities) => {
+            Request::RemoveAllIdentities => {
                 self.remove_all();
                 tracing::info!("removed every identity");
                 wire::success()
             }
-            Ok(Request::AddSmartcardKey { .. }) if self.is_locked() => {
-                tracing::warn!("add key refused: agent is locked");
-                wire::failure()
-            }
-            Ok(Request::AddSmartcardKey {
+            Request::AddSmartcardKey {
                 provider, lifetime, ..
-            }) => match self.provider_spec(&provider) {
+            } => match self.provider_spec(&provider) {
                 Ok(spec) => {
                     let identity = spec.identity.to_string();
                     match self.add(spec, lifetime) {
@@ -585,11 +562,7 @@ impl Agent {
                     wire::failure()
                 }
             },
-            Ok(Request::RemoveSmartcardKey { .. }) if self.is_locked() => {
-                tracing::warn!("remove key refused: agent is locked");
-                wire::failure()
-            }
-            Ok(Request::RemoveSmartcardKey { provider }) => match self.provider_spec(&provider) {
+            Request::RemoveSmartcardKey { provider } => match self.provider_spec(&provider) {
                 Ok(spec) if self.remove(&spec) => {
                     tracing::info!(identity = %spec.identity, key = %spec.kind, "removed key");
                     wire::success()
@@ -603,38 +576,44 @@ impl Agent {
                     wire::failure()
                 }
             },
-            Ok(Request::RequestRsaIdentities) => {
-                tracing::debug!("SSH v1 identities request: answering with none");
-                wire::rsa_identities_answer()
-            }
-            Ok(Request::Extension { name, data }) => {
-                let extension = {
-                    let extensions = self.extensions.lock().unwrap_or_else(|p| p.into_inner());
-                    extensions
-                        .iter()
-                        .rev()
-                        .find(|e| e.name() == name.as_str())
-                        .cloned()
-                };
-                match extension {
-                    Some(extension) => {
-                        tracing::debug!(extension = %name, "extension request");
-                        let ctx = ExtensionContext::new(self.is_locked());
-                        extension.handle(&ctx, &data).into_body()
-                    }
-                    None => {
-                        tracing::debug!(extension = %name, "unsupported extension request");
-                        wire::extension_failure()
-                    }
-                }
-            }
-            Ok(Request::Unsupported(kind)) => {
+            Request::Extension { name, data } => self.handle_extension(&name, &data),
+            Request::Unsupported(kind) => {
                 tracing::debug!(kind, "unsupported request");
                 wire::failure()
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "bad request");
-                wire::failure()
+        }
+    }
+
+    /// `ssh-add -X`: unlock if the passphrase matches. Fails when the agent
+    /// is not locked.
+    fn handle_unlock(&self, passphrase: &[u8]) -> Vec<u8> {
+        if self.unlock(passphrase) {
+            tracing::info!("agent unlocked");
+            wire::success()
+        } else {
+            tracing::warn!("unlock request refused: not locked or wrong passphrase");
+            wire::failure()
+        }
+    }
+
+    /// Answer an `SSH_AGENTC_EXTENSION` request with the handler registered
+    /// under `name`, locked or not; the handler sees the lock state through
+    /// [`ExtensionContext`] and decides for itself.
+    fn handle_extension(&self, name: &str, data: &[u8]) -> Vec<u8> {
+        let extension = lock(&self.extensions)
+            .iter()
+            .rev()
+            .find(|e| e.name() == name)
+            .cloned();
+        match extension {
+            Some(extension) => {
+                tracing::debug!(extension = %name, "extension request");
+                let ctx = ExtensionContext::new(self.is_locked());
+                extension.handle(&ctx, data).into_body()
+            }
+            None => {
+                tracing::debug!(extension = %name, "unsupported extension request");
+                wire::extension_failure()
             }
         }
     }
@@ -642,12 +621,9 @@ impl Agent {
     /// Drop every identity: token-backed entries, their cached keys, and the
     /// keys added with `ssh-add FILE`. Backs `ssh-add -D`.
     fn remove_all(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.held.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        lock(&self.entries).clear();
+        lock(&self.cache).clear();
+        lock(&self.held).clear();
     }
 
     fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>, AgentError> {
@@ -668,7 +644,7 @@ impl Agent {
             },
             Target::Device(entry, key) => {
                 let subject = wire::describe_data(data);
-                let _guard = self.device_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let _guard = lock(&self.device_lock);
                 let mut device = (self.opener)()?;
                 let raw = device.sign(&entry, data, hash, subject, self.sink.as_ref())?;
                 drop(device);
@@ -698,7 +674,7 @@ impl Agent {
 
     /// Sign with a FIDO credential, waiting for the authenticator's touch.
     fn sign_security_key(&self, key: &SkKey, data: &[u8]) -> Result<Vec<u8>, AgentError> {
-        let _guard = self.sk_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = lock(&self.sk_lock);
         let transport = (self.sk_opener)()?;
         let request = TouchRequest {
             identity: key.public_key().comment().to_owned(),
@@ -720,7 +696,7 @@ impl Agent {
     /// The served token key whose public key blob is `key_blob`, if its
     /// public key is known.
     fn device_key(&self, key_blob: &[u8]) -> Option<(KeySpec, PublicKey)> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let cache = lock(&self.cache);
         cache
             .iter()
             .find(|(_, key)| key.to_bytes().is_ok_and(|b| b == key_blob))
@@ -732,7 +708,7 @@ impl Agent {
         if let Some((spec, key)) = self.device_key(key_blob) {
             return Ok(Target::Device(spec, Box::new(key)));
         }
-        let held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let held = lock(&self.held);
         held.iter()
             .find(|e| e.item.key_blob() == key_blob)
             .map(|e| Target::Held(Arc::clone(&e.item)))
@@ -1166,6 +1142,50 @@ mod tests {
         assert!(!agent.is_locked());
         // Unlocking an unlocked agent fails.
         assert_eq!(agent.handle(&unlock), wire::failure());
+        assert_eq!(agent.public_keys(), vec![key]);
+    }
+
+    /// While locked, only listing, unlock and extensions are served: every
+    /// request that would change the served keys is refused and changes
+    /// nothing.
+    #[test]
+    fn a_locked_agent_refuses_every_change() {
+        let e = entry();
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
+        let raw = protocol::RawPublicKey::Ed25519([0x22; 32]);
+        let key = keys::public_key(&raw, &e.label()).unwrap();
+        assert_eq!(agent.preload([key.clone()]), 1);
+        let (add, _) = local_key(0x11, "ferris@example.com");
+
+        let mut lock = vec![wire::SSH_AGENTC_LOCK];
+        b"hunter2".as_slice().encode(&mut lock).unwrap();
+        assert_eq!(agent.handle(&lock), wire::success());
+
+        let provider = |kind: u8| {
+            let mut body = vec![kind];
+            b"ferris@example.com".as_slice().encode(&mut body).unwrap();
+            b"".as_slice().encode(&mut body).unwrap();
+            body
+        };
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        key.to_bytes().unwrap().encode(&mut remove).unwrap();
+        for request in [
+            add,
+            remove,
+            vec![wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES],
+            provider(wire::SSH_AGENTC_ADD_SMARTCARD_KEY),
+            provider(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY),
+            vec![200],
+        ] {
+            assert_eq!(agent.handle(&request), wire::failure(), "{:?}", request[0]);
+        }
+        assert_eq!(agent.handle(&[1]), wire::rsa_identities_answer());
+
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        assert_eq!(agent.handle(&unlock), wire::success());
+        assert_eq!(agent.entries(), vec![e]);
         assert_eq!(agent.public_keys(), vec![key]);
     }
 
