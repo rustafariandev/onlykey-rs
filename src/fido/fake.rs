@@ -151,18 +151,25 @@ impl FakeFido {
     }
 
     fn process(&mut self, cmd: u8, message: &[u8]) {
-        let (rp_id, client_data_hash) = match parse_request(message) {
-            Some(parts) => parts,
-            None => {
-                self.push_message(self.cid, cmd, &[0x12]); // CTAP2_ERR_INVALID_CBOR
-                return;
-            }
+        let Some(request) = parse_request(message) else {
+            self.push_message(self.cid, cmd, &[0x12]); // CTAP2_ERR_INVALID_CBOR
+            return;
         };
-        let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
-        auth_data.push(self.flags);
+        if request.rp_id != self.application || !request.key_handles.contains(&self.key_handle) {
+            self.push_message(self.cid, cmd, &[0x2e]); // CTAP2_ERR_NO_CREDENTIALS
+            return;
+        }
+        let mut auth_data = Sha256::digest(request.rp_id.as_bytes()).to_vec();
+        // Without `up`, the device answers at once and reports no presence.
+        let flags = if request.up {
+            self.flags
+        } else {
+            self.flags & !0x01
+        };
+        auth_data.push(flags);
         auth_data.extend_from_slice(&self.counter.to_be_bytes());
         let mut signed = auth_data.clone();
-        signed.extend_from_slice(&client_data_hash);
+        signed.extend_from_slice(&request.client_data_hash);
         let signature: ssh_key::Signature = self.pair.try_sign(&signed).expect("ed25519 signs");
         self.counter += 1;
 
@@ -177,10 +184,10 @@ impl FakeFido {
 
         let mut reply = vec![0x00]; // CTAP1_ERR_SUCCESS
         reply.extend_from_slice(&cbor);
-        if self.require_touch {
+        if request.up && self.require_touch {
             self.push_message(self.cid, CTAPHID_KEEPALIVE, &[0x02]);
         }
-        if self.never_touched {
+        if request.up && self.never_touched {
             self.waiting = true;
         } else {
             self.push_message(self.cid, CTAPHID_CBOR, &reply);
@@ -212,21 +219,62 @@ impl FakeFido {
     }
 }
 
-/// Pull `rpId` (key 1) and `clientDataHash` (key 2) out of a getAssertion
-/// request.
-fn parse_request(message: &[u8]) -> Option<(String, Vec<u8>)> {
+/// The parts of a getAssertion request the fake acts on.
+struct Request {
+    rp_id: String,
+    client_data_hash: Vec<u8>,
+    key_handles: Vec<Vec<u8>>,
+    up: bool,
+}
+
+/// Decode a getAssertion request: `rpId` (1), `clientDataHash` (2), the
+/// `allowList` (3) of `{"id", "type"}` descriptors, and the `up` option (5),
+/// which defaults to true. Descriptors with any other shape are refused, as a
+/// real authenticator refuses them.
+fn parse_request(message: &[u8]) -> Option<Request> {
     let mut d = Decoder::new(message);
     let pairs = d.map().ok()??;
     let mut rp_id = None;
     let mut client_data_hash = None;
+    let mut key_handles = Vec::new();
+    let mut up = true;
     for _ in 0..pairs {
         match d.u8().ok()? {
             1 => rp_id = Some(d.str().ok()?.to_owned()),
             2 => client_data_hash = Some(d.bytes().ok()?.to_vec()),
+            3 => {
+                for _ in 0..d.array().ok()?? {
+                    let mut id = None;
+                    let mut kind = None;
+                    for _ in 0..d.map().ok()?? {
+                        match d.str().ok()? {
+                            "id" => id = Some(d.bytes().ok()?.to_vec()),
+                            "type" => kind = Some(d.str().ok()?.to_owned()),
+                            _ => d.skip().ok()?,
+                        }
+                    }
+                    if kind? == "public-key" {
+                        key_handles.push(id?);
+                    }
+                }
+            }
+            5 => {
+                for _ in 0..d.map().ok()?? {
+                    match d.str().ok()? {
+                        "up" => up = d.bool().ok()?,
+                        _ => d.skip().ok()?,
+                    }
+                }
+            }
             _ => d.skip().ok()?,
         }
     }
-    Some((rp_id?, client_data_hash?))
+    Some(Request {
+        rp_id: rp_id?,
+        client_data_hash: client_data_hash?,
+        key_handles,
+        up,
+    })
 }
 
 impl HidTransport for FakeFido {

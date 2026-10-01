@@ -62,11 +62,13 @@ fn encode_request(
         .and_then(|e| e.bytes(client_data_hash))
         .and_then(|e| e.u8(3))
         .and_then(|e| e.array(1))
+        // A PublicKeyCredentialDescriptor has text keys, in CTAP2 canonical
+        // order (shorter first): "id", then "type".
         .and_then(|e| e.map(2))
-        .and_then(|e| e.u8(1))
-        .and_then(|e| e.str("public-key"))
-        .and_then(|e| e.u8(2))
+        .and_then(|e| e.str("id"))
         .and_then(|e| e.bytes(key_handle))
+        .and_then(|e| e.str("type"))
+        .and_then(|e| e.str("public-key"))
         .and_then(|e| e.u8(5))
         .and_then(|e| e.map(1))
         .and_then(|e| e.str("up"))
@@ -127,10 +129,10 @@ mod tests {
         assert_eq!(d.u8().unwrap(), 3);
         assert_eq!(d.array().unwrap(), Some(1));
         assert_eq!(d.map().unwrap(), Some(2));
-        assert_eq!(d.u8().unwrap(), 1);
-        assert_eq!(d.str().unwrap(), "public-key");
-        assert_eq!(d.u8().unwrap(), 2);
+        assert_eq!(d.str().unwrap(), "id");
         assert_eq!(d.bytes().unwrap(), &[0x01, 0x02]);
+        assert_eq!(d.str().unwrap(), "type");
+        assert_eq!(d.str().unwrap(), "public-key");
         assert_eq!(d.u8().unwrap(), 5);
         assert_eq!(d.map().unwrap(), Some(1));
         assert_eq!(d.str().unwrap(), "up");
