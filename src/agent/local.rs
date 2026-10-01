@@ -9,6 +9,7 @@
 
 use super::keytype::KeyDecodeError;
 use crate::keys;
+use rand_core::OsRng;
 use rsa::Pkcs1v15Sign;
 use sha2::{Digest, Sha256, Sha512};
 use signature::Signer;
@@ -211,7 +212,8 @@ impl LocalKey for RsaLocalKey {
 
     fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, LocalKeyError> {
         let (scheme, digest) = rsa_scheme(data, hash)?;
-        let raw = self.key.sign(scheme, &digest)?;
+        // Blinded, to keep the private exponent out of the timing.
+        let raw = self.key.sign_with_rng(&mut OsRng, scheme, &digest)?;
         Ok(Signature::new(Algorithm::Rsa { hash: Some(hash) }, raw)?)
     }
 

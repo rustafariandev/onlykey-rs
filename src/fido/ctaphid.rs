@@ -8,6 +8,7 @@
 use super::FidoError;
 use crate::protocol::Report;
 use crate::transport::HidTransport;
+use rand_core::{OsRng, RngCore};
 use std::time::{Duration, Instant};
 
 /// The channel id used before a channel has been allocated.
@@ -87,7 +88,7 @@ impl<T: HidTransport> CtapHid<T> {
     /// [`Self::transact`].
     pub fn init(&mut self) -> Result<(), FidoError> {
         self.cid = CID_BROADCAST;
-        let nonce = nonce();
+        let nonce = nonce()?;
         let packets = self.frame(CTAPHID_INIT, &nonce)?;
         let mut reply = None;
         for _ in 0..RETRIES {
@@ -274,14 +275,13 @@ impl<T: HidTransport> CtapHid<T> {
     }
 }
 
-/// Eight bytes that are unlikely to repeat, echoed back by the device.
-fn nonce() -> [u8; 8] {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let pid = std::process::id() as u64;
-    (nanos ^ pid.rotate_left(32)).to_be_bytes()
+/// Eight random bytes, echoed back by the device, as CTAPHID asks.
+fn nonce() -> Result<[u8; 8], FidoError> {
+    let mut nonce = [0u8; 8];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| FidoError::Protocol("no system randomness for the CTAPHID nonce"))?;
+    Ok(nonce)
 }
 
 #[cfg(test)]

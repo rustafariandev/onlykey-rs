@@ -14,6 +14,7 @@ use crate::identity::KeySpec;
 use crate::keys;
 use crate::transport::{HidTransport, HidapiTransport};
 use nix::sys::stat::{Mode, umask};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use ssh_key::HashAlg;
 use ssh_key::PublicKey;
@@ -150,12 +151,13 @@ struct PassphraseHash {
 }
 
 impl PassphraseHash {
-    fn new(passphrase: &[u8]) -> Self {
+    /// Hash `passphrase` under a fresh random salt; `None` if the system
+    /// has no randomness to give.
+    fn new(passphrase: &[u8]) -> Option<Self> {
         let mut salt = [0u8; 16];
-        let mut file = std::fs::File::open("/dev/urandom").expect("/dev/urandom");
-        std::io::Read::read_exact(&mut file, &mut salt).expect("random salt");
+        OsRng.try_fill_bytes(&mut salt).ok()?;
         let digest = Self::digest(&salt, passphrase);
-        PassphraseHash { salt, digest }
+        Some(PassphraseHash { salt, digest })
     }
 
     fn digest(salt: &[u8; 16], passphrase: &[u8]) -> [u8; 32] {
@@ -274,8 +276,16 @@ impl Agent {
         if state.is_some() {
             return false;
         }
-        *state = Some(PassphraseHash::new(passphrase));
-        true
+        match PassphraseHash::new(passphrase) {
+            Some(hash) => {
+                *state = Some(hash);
+                true
+            }
+            None => {
+                tracing::error!("cannot lock: no system randomness for the salt");
+                false
+            }
+        }
     }
 
     /// Unlock if `passphrase` is the one the agent was locked with.
