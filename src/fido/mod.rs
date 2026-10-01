@@ -71,3 +71,44 @@ pub(crate) fn ctap_status(status: u8) -> Option<FidoError> {
         other => FidoError::Ctap(other),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctap_status_maps_each_code() {
+        assert!(ctap_status(0x00).is_none());
+        for code in [0x31, 0x33, 0x36, 0x37, 0x38] {
+            assert!(
+                matches!(ctap_status(code), Some(FidoError::PinRequired)),
+                "{code:#04x}"
+            );
+        }
+        for code in [0x3f, 0x3c] {
+            assert!(
+                matches!(ctap_status(code), Some(FidoError::UvRequired)),
+                "{code:#04x}"
+            );
+        }
+        for code in [0x27, 0x2f, 0x3a, 0x2d] {
+            assert!(
+                matches!(ctap_status(code), Some(FidoError::Denied)),
+                "{code:#04x}"
+            );
+        }
+        assert!(matches!(ctap_status(0x2e), Some(FidoError::NoCredential)));
+        for code in [0x26, 0x2b, 0x2c] {
+            assert!(
+                matches!(ctap_status(code), Some(FidoError::Unsupported)),
+                "{code:#04x}"
+            );
+        }
+        for code in [0x01, 0x7f] {
+            assert!(
+                matches!(ctap_status(code), Some(FidoError::Ctap(c)) if c == code),
+                "{code:#04x}"
+            );
+        }
+    }
+}

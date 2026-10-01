@@ -119,7 +119,53 @@ fn cbor_error(e: minicbor::decode::Error) -> FidoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fido::ctaphid::CTAPHID_INIT;
+    use crate::fido::fake::FakeFido;
+    use crate::protocol::Report;
+    use crate::transport::TransportError;
     use minicbor::Decoder;
+    use sha2::{Digest, Sha256};
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// `SHA256(rpId) || flags || signCount || extra`, with a dummy hash.
+    fn auth_data(flags: u8, counter: u32, extra: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x11u8; 32];
+        out.push(flags);
+        out.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(extra);
+        out
+    }
+
+    /// One entry of a getAssertion reply map.
+    enum Entry<'a> {
+        Bytes(u8, &'a [u8]),
+        /// A key whose value the parser should skip: a nested map.
+        Skipped(u8),
+    }
+
+    /// Encode a getAssertion reply map from `entries`, in order.
+    fn reply(entries: &[Entry]) -> Vec<u8> {
+        let mut cbor = Vec::new();
+        let mut e = Encoder::new(&mut cbor);
+        e.map(entries.len() as u64).unwrap();
+        for entry in entries {
+            match entry {
+                Entry::Bytes(key, value) => e.u8(*key).unwrap().bytes(value).unwrap(),
+                Entry::Skipped(key) => e
+                    .u8(*key)
+                    .unwrap()
+                    .map(1)
+                    .unwrap()
+                    .str("id")
+                    .unwrap()
+                    .bytes(&[9u8; 4])
+                    .unwrap(),
+            };
+        }
+        cbor
+    }
 
     #[test]
     fn request_has_the_expected_shape() {
@@ -145,52 +191,334 @@ mod tests {
         assert!(d.bool().unwrap());
     }
 
+    /// The request byte for byte: command, CTAP2 canonical key order and
+    /// definite lengths throughout.
+    #[test]
+    fn request_matches_canonical_bytes() {
+        let request = encode_request("ssh:", &[0xAB; 32], &[0x01, 0x02], true).unwrap();
+        let expected = [
+            "02",                     // authenticatorGetAssertion
+            "a4",                     // map(4)
+            "01",                     // 1: rpId
+            "647373683a",             // "ssh:"
+            "02",                     // 2: clientDataHash
+            "5820",                   // bytes(32)
+            &"ab".repeat(32),         //
+            "03",                     // 3: allowList
+            "81",                     // array(1)
+            "a2",                     // map(2)
+            "626964",                 // "id"
+            "420102",                 // h'0102'
+            "6474797065",             // "type"
+            "6a7075626c69632d6b6579", // "public-key"
+            "05",                     // 5: options
+            "a1",                     // map(1)
+            "627570",                 // "up"
+            "f5",                     // true
+        ]
+        .concat();
+        assert_eq!(hex::encode(&request), expected);
+    }
+
+    #[test]
+    fn request_without_up_sets_it_false() {
+        let with = encode_request("ssh:", &[0xAB; 32], &[0x01, 0x02], true).unwrap();
+        let without = encode_request("ssh:", &[0xAB; 32], &[0x01, 0x02], false).unwrap();
+        assert_eq!(without.last(), Some(&0xf4));
+        assert_eq!(with[..with.len() - 1], without[..without.len() - 1]);
+    }
+
+    /// Real key handles are long enough to need a two-byte length.
+    #[test]
+    fn request_carries_a_long_key_handle() {
+        let handle: Vec<u8> = (0..128).map(|i| i as u8).collect();
+        let request = encode_request("ssh:", &[0xAB; 32], &handle, true).unwrap();
+        let mut d = Decoder::new(&request[1..]);
+        d.map().unwrap();
+        d.u8().unwrap();
+        d.str().unwrap();
+        d.u8().unwrap();
+        d.bytes().unwrap();
+        d.u8().unwrap();
+        d.array().unwrap();
+        d.map().unwrap();
+        d.str().unwrap(); // "id"
+        let at = 1 + d.position(); // past the command byte
+        assert_eq!(request[at..at + 2], [0x58, 0x80]);
+        assert_eq!(d.bytes().unwrap(), handle.as_slice());
+    }
+
     #[test]
     fn parses_a_reply_and_extracts_flags_and_counter() {
-        let mut auth_data = vec![0x11u8; 32];
-        auth_data.push(0x05);
-        auth_data.extend_from_slice(&7u32.to_be_bytes());
-        let mut cbor = Vec::new();
-        let mut e = Encoder::new(&mut cbor);
-        e.map(2)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .bytes(&auth_data)
-            .unwrap()
-            .u8(3)
-            .unwrap()
-            .bytes(&[0xDE; 64])
-            .unwrap();
-        let assertion = parse_assertion(&cbor).unwrap();
+        let auth = auth_data(0x05, 7, &[]);
+        let assertion = parse_assertion(&reply(&[
+            Entry::Bytes(2, &auth),
+            Entry::Bytes(3, &[0xDE; 64]),
+        ]))
+        .unwrap();
         assert_eq!(assertion.flags, 0x05);
         assert_eq!(assertion.counter, 7);
+        assert_eq!(assertion.auth_data, auth);
         assert_eq!(assertion.signature, vec![0xDE; 64]);
-        // The credential entry (key 1) is skipped.
-        let mut with_cred = Vec::new();
-        let mut e = Encoder::new(&mut with_cred);
-        e.map(3)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .map(2)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .str("public-key")
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .bytes(&[9u8; 4])
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .bytes(&auth_data)
-            .unwrap()
-            .u8(3)
-            .unwrap()
-            .bytes(&[0xDE; 64])
-            .unwrap();
-        assert_eq!(parse_assertion(&with_cred).unwrap().counter, 7);
+    }
+
+    #[test]
+    fn the_counter_is_big_endian() {
+        let auth = auth_data(0x01, 0x0102_0304, &[]);
+        let assertion =
+            parse_assertion(&reply(&[Entry::Bytes(2, &auth), Entry::Bytes(3, &[1])])).unwrap();
+        assert_eq!(assertion.counter, 0x0102_0304);
+    }
+
+    /// Extension data after the counter is kept as part of what was signed.
+    #[test]
+    fn keeps_authenticator_data_extensions() {
+        let auth = auth_data(0x81, 3, &[0xA0]);
+        let assertion =
+            parse_assertion(&reply(&[Entry::Bytes(2, &auth), Entry::Bytes(3, &[1])])).unwrap();
+        assert_eq!(assertion.flags, 0x81);
+        assert_eq!(assertion.counter, 3);
+        assert_eq!(assertion.auth_data, auth);
+    }
+
+    /// The credential (1), user (4) and numberOfCredentials (5) entries are
+    /// skipped wherever they appear.
+    #[test]
+    fn skips_other_reply_entries() {
+        let auth = auth_data(0x01, 7, &[]);
+        let assertion = parse_assertion(&reply(&[
+            Entry::Skipped(1),
+            Entry::Bytes(2, &auth),
+            Entry::Skipped(4),
+            Entry::Bytes(3, &[0xDE; 64]),
+            Entry::Skipped(5),
+        ]))
+        .unwrap();
+        assert_eq!(assertion.counter, 7);
+        assert_eq!(assertion.signature, vec![0xDE; 64]);
+    }
+
+    #[test]
+    fn rejects_a_reply_missing_a_field() {
+        let auth = auth_data(0x01, 7, &[]);
+        let no_auth = parse_assertion(&reply(&[Entry::Bytes(3, &[1])]));
+        assert!(
+            matches!(
+                no_auth,
+                Err(FidoError::Protocol("assertion without authData"))
+            ),
+            "{no_auth:?}"
+        );
+        let no_sig = parse_assertion(&reply(&[Entry::Bytes(2, &auth)]));
+        assert!(
+            matches!(
+                no_sig,
+                Err(FidoError::Protocol("assertion without signature"))
+            ),
+            "{no_sig:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_short_authenticator_data() {
+        let mut auth = auth_data(0x01, 7, &[]);
+        auth.pop();
+        let result = parse_assertion(&reply(&[Entry::Bytes(2, &auth), Entry::Bytes(3, &[1])]));
+        assert!(
+            matches!(result, Err(FidoError::Protocol("short authenticator data"))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_indefinite_map() {
+        let result = parse_assertion(&[0xbf, 0xff]);
+        assert!(
+            matches!(result, Err(FidoError::Protocol("indefinite CTAP reply"))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_cbor() {
+        let valid = reply(&[
+            Entry::Bytes(2, &auth_data(0x01, 7, &[])),
+            Entry::Bytes(3, &[1]),
+        ]);
+        let cases: [(&str, &[u8]); 4] = [
+            ("empty", &[]),
+            ("not a map", &[0x80]),
+            ("truncated", &valid[..valid.len() - 1]),
+            ("text key", &[0xa1, 0x61, b'x', 0x00]),
+        ];
+        for (name, cbor) in cases {
+            let result = parse_assertion(cbor);
+            assert!(
+                matches!(result, Err(FidoError::Cbor(_))),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    /// The channel id a [`Canned`] device allocates.
+    const CANNED_CID: u32 = 0x0102_0304;
+
+    /// A device that allocates a channel, records the CTAP request it is
+    /// sent, and answers it with a fixed CTAP reply.
+    struct Canned {
+        reply: Vec<u8>,
+        request: Vec<u8>,
+        expected: usize,
+        out: VecDeque<Report>,
+    }
+
+    impl Canned {
+        fn new(reply: &[u8]) -> Self {
+            Canned {
+                reply: reply.to_vec(),
+                request: Vec::new(),
+                expected: 0,
+                out: VecDeque::new(),
+            }
+        }
+
+        fn push(&mut self, cid: u32, cmd: u8, payload: &[u8]) {
+            let mut first = [0u8; 64];
+            first[..4].copy_from_slice(&cid.to_be_bytes());
+            first[4] = cmd;
+            first[5] = (payload.len() >> 8) as u8;
+            first[6] = payload.len() as u8;
+            let head = payload.len().min(57);
+            first[7..7 + head].copy_from_slice(&payload[..head]);
+            self.out.push_back(first);
+            for (seq, chunk) in payload[head..].chunks(59).enumerate() {
+                let mut packet = [0u8; 64];
+                packet[..4].copy_from_slice(&cid.to_be_bytes());
+                packet[4] = seq as u8;
+                packet[5..5 + chunk.len()].copy_from_slice(chunk);
+                self.out.push_back(packet);
+            }
+        }
+    }
+
+    impl HidTransport for Canned {
+        fn write_report(&mut self, report: &Report) -> Result<(), TransportError> {
+            let cid = u32::from_be_bytes(report[..4].try_into().unwrap());
+            match report[4] {
+                CTAPHID_INIT => {
+                    let mut payload = report[7..15].to_vec(); // the nonce
+                    payload.extend_from_slice(&CANNED_CID.to_be_bytes());
+                    payload.extend_from_slice(&[0x02, 0x01, 0x00, 0x00, 0x04]);
+                    self.push(cid, CTAPHID_INIT, &payload);
+                }
+                CTAPHID_CBOR => {
+                    self.expected = ((report[5] as usize) << 8) | report[6] as usize;
+                    let head = self.expected.min(57);
+                    self.request = report[7..7 + head].to_vec();
+                }
+                _ => {
+                    let remaining = self.expected - self.request.len();
+                    self.request
+                        .extend_from_slice(&report[5..5 + remaining.min(59)]);
+                }
+            }
+            if report[4] != CTAPHID_INIT && self.request.len() == self.expected {
+                let reply = self.reply.clone();
+                self.push(CANNED_CID, CTAPHID_CBOR, &reply);
+            }
+            Ok(())
+        }
+
+        fn read_report(&mut self, _timeout: Duration) -> Result<Option<Report>, TransportError> {
+            Ok(self.out.pop_front())
+        }
+    }
+
+    fn assert_with_reply(reply: &[u8]) -> (Result<Assertion, FidoError>, Vec<u8>) {
+        let mut hid = CtapHid::new(Canned::new(reply));
+        let result = get_assertion(&mut hid, "ssh:", &[0xAB; 32], &[7u8; 64], true, &|| {});
+        (result, hid.into_transport().request)
+    }
+
+    /// `get_assertion` sends exactly the encoded request, over several
+    /// packets, and parses a successful reply.
+    #[test]
+    fn get_assertion_sends_the_request_and_parses_the_reply() {
+        let auth = auth_data(0x01, 9, &[]);
+        let mut ok = vec![0x00];
+        ok.extend(reply(&[
+            Entry::Bytes(2, &auth),
+            Entry::Bytes(3, &[0xDE; 70]),
+        ]));
+        let (result, request) = assert_with_reply(&ok);
+        let assertion = result.unwrap();
+        assert_eq!(assertion.counter, 9);
+        assert_eq!(assertion.signature, vec![0xDE; 70]);
+        assert_eq!(
+            request,
+            encode_request("ssh:", &[0xAB; 32], &[7u8; 64], true).unwrap()
+        );
+    }
+
+    #[test]
+    fn get_assertion_rejects_an_empty_reply() {
+        let (result, _) = assert_with_reply(&[]);
+        assert!(
+            matches!(result, Err(FidoError::Protocol("empty CTAP reply"))),
+            "{result:?}"
+        );
+    }
+
+    /// A failure status is reported without looking at what follows it.
+    #[test]
+    fn get_assertion_reports_a_failure_status() {
+        let (result, _) = assert_with_reply(&[0x2e]);
+        assert!(matches!(result, Err(FidoError::NoCredential)), "{result:?}");
+        let (result, _) = assert_with_reply(&[0x27, 0xff]);
+        assert!(matches!(result, Err(FidoError::Denied)), "{result:?}");
+        let (result, _) = assert_with_reply(&[0x36]);
+        assert!(matches!(result, Err(FidoError::PinRequired)), "{result:?}");
+        let (result, _) = assert_with_reply(&[0x7f]);
+        assert!(matches!(result, Err(FidoError::Ctap(0x7f))), "{result:?}");
+    }
+
+    /// Without `up` the authenticator answers at once: no presence prompt,
+    /// and the UP flag is clear.
+    #[test]
+    fn get_assertion_without_up_skips_the_touch() {
+        let device = FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3, 4], 0x01).with_touch();
+        let mut hid = CtapHid::new(device);
+        let hash: [u8; 32] = Sha256::digest(b"hello").into();
+        let prompts = Cell::new(0);
+        let assertion = get_assertion(&mut hid, "ssh:", &hash, &[1, 2, 3, 4], false, &|| {
+            prompts.set(prompts.get() + 1)
+        })
+        .unwrap();
+        assert_eq!(assertion.flags & 0x01, 0);
+        assert_eq!(prompts.get(), 0);
+    }
+
+    #[test]
+    fn get_assertion_needs_the_enrolled_credential() {
+        let hash = [0u8; 32];
+        for (rp_id, handle) in [("ssh:other", &[1u8, 2, 3, 4][..]), ("ssh:", &[1, 2, 3, 5])] {
+            let device = FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3, 4], 0x01);
+            let mut hid = CtapHid::new(device);
+            let result = get_assertion(&mut hid, rp_id, &hash, handle, true, &|| {});
+            assert!(
+                matches!(result, Err(FidoError::NoCredential)),
+                "{rp_id} {handle:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_counter_advances_between_assertions() {
+        let device = FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3, 4], 0x01);
+        let mut hid = CtapHid::new(device);
+        let hash = [0u8; 32];
+        let first = get_assertion(&mut hid, "ssh:", &hash, &[1, 2, 3, 4], true, &|| {}).unwrap();
+        let second = get_assertion(&mut hid, "ssh:", &hash, &[1, 2, 3, 4], true, &|| {}).unwrap();
+        assert_eq!(second.counter, first.counter + 1);
     }
 }
