@@ -23,6 +23,7 @@ use ssh_key::public::{EcdsaPublicKey, KeyData};
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, Mpint, PublicKey, Signature};
 use std::fmt;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Why a local key could not sign.
 #[derive(Debug, Error)]
@@ -393,20 +394,21 @@ fn ecdsa_curve(key_type: &str) -> Option<(EcdsaCurve, usize)> {
 fn ecdsa_keypair(reader: &mut impl Reader, field_size: usize) -> Option<EcdsaKeypair> {
     let name = String::decode(reader).ok()?;
     let point = Vec::<u8>::decode(reader).ok()?;
-    let scalar = Vec::<u8>::decode(reader).ok()?;
-    let padded = match scalar.len() {
-        n if n <= field_size => {
-            let mut padded = vec![0u8; field_size - n];
-            padded.extend_from_slice(&scalar);
-            padded
-        }
-        n if n == field_size + 1 => scalar,
-        _ => return None,
-    };
-    let mut body = Vec::new();
-    name.encode(&mut body).ok()?;
-    point.encode(&mut body).ok()?;
-    padded.encode(&mut body).ok()?;
+    // The scalar is secret: every copy is wiped on drop, and buffers are
+    // sized up front so no reallocation leaves one behind.
+    let scalar = Zeroizing::new(Vec::<u8>::decode(reader).ok()?);
+    if scalar.len() > field_size + 1 {
+        return None;
+    }
+    let mut padded = Zeroizing::new(Vec::with_capacity(field_size + 1));
+    padded.resize(field_size.saturating_sub(scalar.len()), 0);
+    padded.extend_from_slice(&scalar);
+    let mut body = Zeroizing::new(Vec::with_capacity(
+        name.len() + point.len() + padded.len() + 12,
+    ));
+    name.encode(&mut *body).ok()?;
+    point.encode(&mut *body).ok()?;
+    padded.encode(&mut *body).ok()?;
     EcdsaKeypair::decode(&mut body.as_slice()).ok()
 }
 

@@ -43,6 +43,7 @@ nix = { version = "0.30", features = ["fs", "user"] }
 serde = { version = "1", features = ["derive"], optional = true }
 minicbor = { version = "2.3.0", features = ["std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
 
 # hidraw on Linux; hidapi's IOKit backend elsewhere (macOS).
 [target.'cfg(target_os = "linux")'.dependencies]

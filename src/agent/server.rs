@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Lock `mutex`, carrying on if a thread panicked while holding it: each
 /// value guarded here is left consistent between statements, so a poisoned
@@ -808,8 +809,9 @@ pub fn handle_connection(agent: &Agent, mut stream: UnixStream) {
         }
     };
     loop {
+        // A request may carry a private key (`ssh-add FILE`): wipe it after.
         let body = match wire::read_frame(&mut reader) {
-            Ok(Some(body)) => body,
+            Ok(Some(body)) => Zeroizing::new(body),
             Ok(None) => return,
             Err(e) => {
                 tracing::debug!(error = %e, "connection closed");
