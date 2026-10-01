@@ -664,7 +664,7 @@ impl Agent {
         hash: HashAlg,
     ) -> Result<Vec<u8>, AgentError> {
         let sig = key.sign(data, hash)?;
-        keys::verify(key.public_key(), data, &sig)?;
+        key.verify(data, &sig)?;
         tracing::info!(
             comment = key.public_key().comment(),
             "signed with local key"
@@ -1545,9 +1545,12 @@ mod tests {
     }
 
     fn local_rsa_key(comment: &str) -> (Vec<u8>, PublicKey) {
+        local_rsa_key_from(include_str!("../../tests/common/rsa2048.pem"), comment)
+    }
+
+    fn local_rsa_key_from(pem: &str, comment: &str) -> (Vec<u8>, PublicKey) {
         use rsa::pkcs1::DecodeRsaPrivateKey;
-        let sk = rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../../tests/common/rsa2048.pem"))
-            .unwrap();
+        let sk = rsa::RsaPrivateKey::from_pkcs1_pem(pem).unwrap();
         let pair = ssh_key::private::RsaKeypair::try_from(&sk).unwrap();
         let public = PublicKey::new(ssh_key::public::KeyData::Rsa(pair.public.clone()), comment);
         let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
@@ -1589,6 +1592,26 @@ mod tests {
                 ssh_key::Algorithm::Rsa { hash: Some(hash) }
             );
             keys::verify(&public, b"data", &sig).unwrap();
+        }
+    }
+
+    /// A 1024-bit and an 8192-bit RSA key both sign once added, though
+    /// `ssh-key`'s own verifier only takes 2048 to 4096 bits.
+    #[test]
+    fn local_rsa_keys_of_any_accepted_size_sign() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        for pem in [
+            include_str!("../../tests/common/rsa1024.pem"),
+            include_str!("../../tests/common/rsa8192.pem"),
+        ] {
+            let (add, public) = local_rsa_key_from(pem, "old@example.com");
+            assert_eq!(agent.handle(&add), wire::success());
+            let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+            public.to_bytes().unwrap().encode(&mut sign).unwrap();
+            b"data".as_slice().encode(&mut sign).unwrap();
+            wire::SSH_AGENT_RSA_SHA2_256.encode(&mut sign).unwrap();
+            assert_eq!(agent.handle(&sign)[0], wire::SSH2_AGENT_SIGN_RESPONSE);
         }
     }
 

@@ -8,6 +8,7 @@
 //! without touching the server.
 
 use super::keytype::KeyDecodeError;
+use crate::keys;
 use rsa::Pkcs1v15Sign;
 use sha2::{Digest, Sha256, Sha512};
 use signature::Signer;
@@ -33,6 +34,8 @@ pub enum LocalKeyError {
     Rsa(#[from] rsa::Error),
     #[error("cannot sign with an unsupported RSA digest")]
     UnsupportedHash,
+    #[error(transparent)]
+    Verify(#[from] crate::keys::KeyError),
 }
 
 /// A private key held in memory that the agent signs with itself, with no
@@ -47,6 +50,12 @@ pub trait LocalKey: Send + Sync {
     /// selects the RSA digest (`sha2-256` or `sha2-512`); other key types
     /// ignore it.
     fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, LocalKeyError>;
+
+    /// Check `sig` over `data` against [`Self::public_key`]. The agent calls
+    /// this after every [`Self::sign`], so a faulty signature never leaves.
+    fn verify(&self, data: &[u8], sig: &Signature) -> Result<(), LocalKeyError> {
+        Ok(keys::verify(self.public_key(), data, sig)?)
+    }
 
     /// Wire blob used to match sign and remove requests.
     fn key_blob(&self) -> Vec<u8> {
@@ -71,6 +80,10 @@ impl LocalKeyRef {
 
     pub fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, LocalKeyError> {
         self.0.sign(data, hash)
+    }
+
+    pub fn verify(&self, data: &[u8], sig: &Signature) -> Result<(), LocalKeyError> {
+        self.0.verify(data, sig)
     }
 
     pub fn key_blob(&self) -> Vec<u8> {
@@ -197,13 +210,31 @@ impl LocalKey for RsaLocalKey {
     }
 
     fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, LocalKeyError> {
-        let (scheme, digest) = match hash {
-            HashAlg::Sha256 => (Pkcs1v15Sign::new::<Sha256>(), Sha256::digest(data).to_vec()),
-            HashAlg::Sha512 => (Pkcs1v15Sign::new::<Sha512>(), Sha512::digest(data).to_vec()),
-            _ => return Err(LocalKeyError::UnsupportedHash),
-        };
+        let (scheme, digest) = rsa_scheme(data, hash)?;
         let raw = self.key.sign(scheme, &digest)?;
         Ok(Signature::new(Algorithm::Rsa { hash: Some(hash) }, raw)?)
+    }
+
+    /// Verify with the `rsa` crate directly: `ssh-key`'s verifier only takes
+    /// 2048- to 4096-bit moduli, while OpenSSH keys run from 1024 bits up.
+    fn verify(&self, data: &[u8], sig: &Signature) -> Result<(), LocalKeyError> {
+        let Algorithm::Rsa { hash: Some(hash) } = sig.algorithm() else {
+            return Err(keys::KeyError::VerificationFailed.into());
+        };
+        let (scheme, digest) = rsa_scheme(data, hash)?;
+        self.key
+            .to_public_key()
+            .verify(scheme, &digest, sig.as_bytes())
+            .map_err(|_| keys::KeyError::VerificationFailed.into())
+    }
+}
+
+/// The PKCS#1 v1.5 scheme and digest of `data` for an `rsa-sha2-*` signature.
+fn rsa_scheme(data: &[u8], hash: HashAlg) -> Result<(Pkcs1v15Sign, Vec<u8>), LocalKeyError> {
+    match hash {
+        HashAlg::Sha256 => Ok((Pkcs1v15Sign::new::<Sha256>(), Sha256::digest(data).to_vec())),
+        HashAlg::Sha512 => Ok((Pkcs1v15Sign::new::<Sha512>(), Sha512::digest(data).to_vec())),
+        _ => Err(LocalKeyError::UnsupportedHash),
     }
 }
 
@@ -399,7 +430,6 @@ fn malformed_dsa() -> KeyDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys;
     use ssh_encoding::Encode;
 
     fn keypair() -> Ed25519Keypair {
@@ -500,6 +530,31 @@ mod tests {
 
         let debug = format!("{key:?}");
         assert!(debug.contains("LocalKeyRef"), "{debug}");
+    }
+
+    /// RSA keys outside the 2048–4096-bit range `ssh-key` verifies with still
+    /// sign and verify: OpenSSH accepts 1024 bits and up, with no upper bound.
+    #[test]
+    fn signs_and_verifies_small_and_large_rsa_keys() {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+
+        for (pem, bytes) in [
+            (include_str!("../../tests/common/rsa1024.pem"), 128),
+            (include_str!("../../tests/common/rsa8192.pem"), 1024),
+        ] {
+            let sk = rsa::RsaPrivateKey::from_pkcs1_pem(pem).unwrap();
+            let pair = RsaKeypair::try_from(&sk).unwrap();
+            let mut body = Vec::new();
+            pair.encode(&mut body).unwrap();
+            "ferris@example.com".encode(&mut body).unwrap();
+            let key = decode("ssh-rsa", &mut body.as_slice()).unwrap();
+            for hash in [HashAlg::Sha256, HashAlg::Sha512] {
+                let sig = key.sign(b"hello", hash).unwrap();
+                assert_eq!(sig.as_bytes().len(), bytes);
+                key.verify(b"hello", &sig).unwrap();
+                assert!(key.verify(b"other", &sig).is_err());
+            }
+        }
     }
 
     /// An RSA key under 1024 bits is refused, as OpenSSH refuses it.
