@@ -81,6 +81,18 @@ impl SkKey {
         &self.public
     }
 
+    /// The FIDO relying party the credential was enrolled for; `ssh:` and
+    /// `ssh:<suffix>` for keys made by `ssh-keygen`.
+    pub fn application(&self) -> &str {
+        &self.application
+    }
+
+    /// Whether the credential belongs to SSH. Any other application may be a
+    /// web credential, so the agent only signs SSH data with it.
+    pub fn is_ssh_application(&self) -> bool {
+        self.application.starts_with("ssh:")
+    }
+
     /// Wire blob used to match sign and remove requests.
     pub fn key_blob(&self) -> Vec<u8> {
         self.public.to_bytes().expect("vec write")

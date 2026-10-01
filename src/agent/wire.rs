@@ -357,14 +357,30 @@ pub enum FrameError {
     Wire(#[from] WireError),
 }
 
-/// Human-readable summary of what a sign request covers, for the challenge
-/// prompt. Understands the userauth request blob and the SSHSIG format.
-pub fn describe_data(data: &[u8]) -> Option<String> {
+/// What the data of a sign request is, as far as the agent can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignedData {
+    /// An SSH `publickey` userauth request (`SSH_MSG_USERAUTH_REQUEST`).
+    UserAuth { user: String, service: String },
+    /// An `ssh-keygen -Y sign` blob in the SSHSIG format.
+    SshSig { namespace: String },
+    /// Anything else.
+    Other,
+}
+
+/// Recognise the userauth request blob and the SSHSIG format.
+pub fn classify_data(data: &[u8]) -> SignedData {
     if let Some(rest) = data.strip_prefix(b"SSHSIG") {
         let mut r = rest;
-        let namespace = String::decode(&mut r).ok()?;
-        return Some(format!("signature in namespace {namespace:?}"));
+        return match String::decode(&mut r) {
+            Ok(namespace) => SignedData::SshSig { namespace },
+            Err(_) => SignedData::Other,
+        };
     }
+    userauth_request(data).unwrap_or(SignedData::Other)
+}
+
+fn userauth_request(data: &[u8]) -> Option<SignedData> {
     let mut r = data;
     let _session_id = Vec::<u8>::decode(&mut r).ok()?;
     let msg_type = u8::decode(&mut r).ok()?;
@@ -377,7 +393,17 @@ pub fn describe_data(data: &[u8]) -> Option<String> {
     if method != "publickey" {
         return None;
     }
-    Some(format!("{service} login as {user:?}"))
+    Some(SignedData::UserAuth { user, service })
+}
+
+/// Human-readable summary of what a sign request covers, for the challenge
+/// prompt. Understands the userauth request blob and the SSHSIG format.
+pub fn describe_data(data: &[u8]) -> Option<String> {
+    match classify_data(data) {
+        SignedData::UserAuth { user, service } => Some(format!("{service} login as {user:?}")),
+        SignedData::SshSig { namespace } => Some(format!("signature in namespace {namespace:?}")),
+        SignedData::Other => None,
+    }
 }
 
 #[cfg(test)]

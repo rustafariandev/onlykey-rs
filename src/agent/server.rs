@@ -66,6 +66,10 @@ pub enum AgentError {
     Fido(#[from] FidoError),
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
+    #[error(
+        "refusing to sign non-SSH data with security key for application {0:?}; only ssh: keys sign arbitrary data"
+    )]
+    NotWebSafe(String),
     #[error("provider string is not valid UTF-8")]
     BadProvider,
     #[error(
@@ -680,7 +684,14 @@ impl Agent {
     }
 
     /// Sign with a FIDO credential, waiting for the authenticator's touch.
+    ///
+    /// As in OpenSSH, a credential whose application is not `ssh:` signs only
+    /// SSH userauth requests and SSHSIG blobs, so the agent cannot be used to
+    /// mint assertions for the website such a credential may belong to.
     fn sign_security_key(&self, key: &SkKey, data: &[u8]) -> Result<Vec<u8>, AgentError> {
+        if !key.is_ssh_application() && wire::classify_data(data) == wire::SignedData::Other {
+            return Err(AgentError::NotWebSafe(key.application().to_owned()));
+        }
         let _guard = lock(&self.sk_lock);
         let mut hid = self.authenticator_for(key)?;
         let request = TouchRequest {
@@ -1773,6 +1784,58 @@ mod tests {
         // Pretend the lifetime elapsed.
         agent.held.lock().unwrap()[0].expires = Some(Instant::now());
         assert!(agent.public_keys().is_empty());
+    }
+
+    /// A security key enrolled for a website, not `ssh:`, signs SSH data only:
+    /// arbitrary data is refused before the authenticator is even opened.
+    #[test]
+    fn a_non_ssh_security_key_signs_only_ssh_data() {
+        use crate::agent::sk::SK_SSH_ED25519;
+        use crate::fido::fake::FakeFido;
+        use ssh_key::private::SkEd25519;
+        use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
+        use std::sync::atomic::AtomicUsize;
+
+        let seed = [0x24u8; 32];
+        let handle = [1u8, 2, 3];
+        let app = "https://example.com";
+        let probe = FakeFido::new(&seed, app, &handle, 0x01);
+        let public = SkEd25519Public::new(Ed25519PublicKey(probe.public()), app);
+        let key_blob = PublicKey::new(KeyData::SkEd25519(public.clone()), "web")
+            .to_bytes()
+            .unwrap();
+        let pair = SkEd25519::new(public, 0x01, handle).unwrap();
+        let mut add = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        SK_SSH_ED25519.encode(&mut add).unwrap();
+        pair.encode(&mut add).unwrap();
+        "web".encode(&mut add).unwrap();
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&opens);
+        let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
+        let sk_opener: SkOpener = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let device = FakeFido::new(&seed, app, &handle, 0x01).with_touch();
+            Ok(vec![Box::new(device) as Box<dyn HidTransport>])
+        });
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()))
+            .with_sk_opener(sk_opener);
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let sign = |data: &[u8]| {
+            let mut body = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+            key_blob.encode(&mut body).unwrap();
+            data.encode(&mut body).unwrap();
+            0u32.encode(&mut body).unwrap();
+            agent.handle(&body)
+        };
+        assert_eq!(sign(b"a webauthn challenge"), wire::failure());
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        let mut sshsig = b"SSHSIG".to_vec();
+        "file".encode(&mut sshsig).unwrap();
+        assert_eq!(sign(&sshsig)[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 
     /// With two authenticators attached, the one holding the credential is

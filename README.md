@@ -402,7 +402,9 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   pure-Rust implementation of CTAPHID and CTAP2, with CBOR from `minicbor`.
 - With several authenticators attached, each is first sent a silent
   assertion (`up = false`) for the key handle; the first that does not answer
-  `CTAP2_ERR_NO_CREDENTIALS` signs, as OpenSSH picks a device.
+  `CTAP2_ERR_NO_CREDENTIALS` signs, as OpenSSH picks a device. A key whose
+  application is not `ssh:` signs only SSH userauth requests and SSHSIG
+  blobs, as in OpenSSH, so it cannot be used to answer a website's challenge.
 - Every signature is verified against the public key before it is returned.
   Any device error, timeout or wrong challenge answers the SSH client with
   `SSH_AGENT_FAILURE` and keeps the agent running.
