@@ -69,11 +69,12 @@ impl TouchRequest {
     }
 }
 
-/// A signature with a FIDO security key that needs the key's PIN.
+/// Something a FIDO security key needs its PIN for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinRequest {
-    /// Comment of the key being used, e.g. `ferris@example.com`.
-    pub identity: String,
+    /// What the PIN is for, completing "Security key PIN to …", e.g.
+    /// `sign as ferris@example.com`.
+    pub action: String,
     /// What is being signed, if the request could be summarised.
     pub subject: Option<String>,
     /// PIN tries left before the security key blocks, if it said.
@@ -101,8 +102,8 @@ impl PinRequest {
             None => String::new(),
         };
         format!(
-            "{problem}Security key PIN to sign as {}{subject}{retries}:",
-            self.identity
+            "{problem}Security key PIN to {}{subject}{retries}:",
+            self.action
         )
     }
 }
@@ -508,9 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn pin_message_mentions_problem_identity_subject_and_retries() {
+    fn pin_message_mentions_problem_action_subject_and_retries() {
         let r = PinRequest {
-            identity: "ferris@example.com".into(),
+            action: "sign as ferris@example.com".into(),
             subject: Some("ssh login to host".into()),
             retries: Some(7),
             problem: None,
@@ -533,7 +534,7 @@ mod tests {
 
     fn request() -> PinRequest {
         PinRequest {
-            identity: "ferris@example.com".into(),
+            action: "sign as ferris@example.com".into(),
             subject: None,
             retries: None,
             problem: None,

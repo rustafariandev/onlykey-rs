@@ -26,6 +26,8 @@ const USER_PRESENCE: u8 = 0x01;
 /// `SSH_SK_USER_VERIFICATION_REQD`: the key needs a PIN as well. The
 /// assertion reports a verified user with the same bit of its flags.
 const USER_VERIFICATION: u8 = 0x04;
+/// `SSH_SK_RESIDENT_KEY`: the credential is stored on the authenticator.
+const RESIDENT: u8 = 0x20;
 
 /// A FIDO security key credential held by the agent.
 ///
@@ -37,6 +39,60 @@ pub struct SkKey {
     key_handle: Vec<u8>,
     flags: u8,
     public: PublicKey,
+}
+
+/// A resident credential as an SSH key: its public key, commented with its
+/// application, and the `SSH2_AGENTC_ADD_IDENTITY` body (key type, key,
+/// comment) that adds it to an agent.
+///
+/// The flags are user presence and resident, as `ssh-add -K` gives them,
+/// plus user verification when `verify` says the credential needs it.
+pub fn resident_key(
+    credential: &fido::credman::ResidentCredential,
+    verify: bool,
+) -> Result<(PublicKey, Vec<u8>), fido::FidoError> {
+    use fido::pin::CosePublicKey;
+    use ssh_key::public::{EcdsaPublicKey, Ed25519PublicKey};
+
+    let flags = USER_PRESENCE | RESIDENT | if verify { USER_VERIFICATION } else { 0 };
+    let application = credential.rp_id.as_str();
+    let handle = credential.credential_id.as_slice();
+    let comment = application;
+    let bad_key = |_| fido::FidoError::Protocol("cannot encode the resident key");
+    let mut body = Vec::new();
+    let public = match &credential.public_key {
+        CosePublicKey::Ed25519(x) => {
+            let public = ssh_key::public::SkEd25519::new(Ed25519PublicKey(*x), application);
+            let key = SkEd25519::new(public.clone(), flags, handle).map_err(bad_key)?;
+            SK_SSH_ED25519
+                .encode(&mut body)
+                .map_err(|_| fido::FidoError::Signature)?;
+            key.encode(&mut body)
+                .map_err(|_| fido::FidoError::Signature)?;
+            KeyData::SkEd25519(public)
+        }
+        CosePublicKey::P256(point) => {
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let sec1 = point.to_encoded_point(false);
+            let EcdsaPublicKey::NistP256(point) =
+                EcdsaPublicKey::from_sec1_bytes(sec1.as_bytes()).map_err(bad_key)?
+            else {
+                return Err(fido::FidoError::Protocol("P-256 key of the wrong size"));
+            };
+            let public = ssh_key::public::SkEcdsaSha2NistP256::new(point, application);
+            let key = SkEcdsaSha2NistP256::new(public.clone(), flags, handle).map_err(bad_key)?;
+            SK_ECDSA_P256
+                .encode(&mut body)
+                .map_err(|_| fido::FidoError::Signature)?;
+            key.encode(&mut body)
+                .map_err(|_| fido::FidoError::Signature)?;
+            KeyData::SkEcdsaSha2NistP256(public)
+        }
+    };
+    comment
+        .encode(&mut body)
+        .map_err(|_| fido::FidoError::Signature)?;
+    Ok((PublicKey::new(public, comment), body))
 }
 
 /// Decode the type-specific fields of an `ADD_IDENTITY` request body for a
@@ -249,6 +305,55 @@ mod tests {
         assert!(keys::verify(key.public_key(), b"other", &sig).is_err());
     }
 
+    /// A resident credential becomes an `ADD_IDENTITY` body that decodes to
+    /// the same key, with the verify-required flag only when asked for.
+    #[test]
+    fn resident_credentials_become_keys_with_their_flags() {
+        use fido::credman::ResidentCredential;
+        use fido::pin::CosePublicKey;
+
+        let device = FakeFido::new(&[0x42; 32], "ssh:okagent-test-uv", &[9, 8, 7], 0x01);
+        let credential = ResidentCredential {
+            rp_id: "ssh:okagent-test-uv".into(),
+            user_name: Some("openssh".into()),
+            credential_id: vec![9, 8, 7],
+            public_key: CosePublicKey::Ed25519(device.public()),
+            cred_protect: Some(3),
+        };
+        for (verify, flags) in [(true, 0x25), (false, 0x21)] {
+            let (public, body) = resident_key(&credential, verify).unwrap();
+            assert_eq!(public.comment(), "ssh:okagent-test-uv");
+            let mut r = body.as_slice();
+            let key_type = String::decode(&mut r).unwrap();
+            let key = decode(&key_type, &mut r).unwrap();
+            assert_eq!(key.flags, flags);
+            assert_eq!(key.needs_verification(), verify);
+            assert_eq!(key.application(), "ssh:okagent-test-uv");
+            assert_eq!(key.key_handle, [9, 8, 7]);
+            assert_eq!(key.public_key().key_data(), public.key_data());
+            assert_eq!(key.display_name(), "ssh:okagent-test-uv");
+        }
+
+        let point = p256::SecretKey::from_slice(&[0x22; 32])
+            .unwrap()
+            .public_key();
+        let ecdsa = ResidentCredential {
+            public_key: CosePublicKey::P256(point),
+            ..credential
+        };
+        let (public, body) = resident_key(&ecdsa, false).unwrap();
+        assert_eq!(public.algorithm(), Algorithm::SkEcdsaSha2NistP256);
+        let mut r = body.as_slice();
+        assert_eq!(String::decode(&mut r).unwrap(), SK_ECDSA_P256);
+        assert_eq!(
+            decode(SK_ECDSA_P256, &mut r)
+                .unwrap()
+                .public_key()
+                .key_data(),
+            public.key_data()
+        );
+    }
+
     /// A key loaded with `ssh-add -K` has no comment, so prompts name it by
     /// application and fingerprint instead.
     #[test]
@@ -317,7 +422,7 @@ mod tests {
             Err(fido::FidoError::UvRequired)
         ));
         let protocol = fido::PinProtocol::V2;
-        let token = fido::pin::pin_token(&mut hid, protocol, "1234").unwrap();
+        let token = fido::pin::pin_token(&mut hid, protocol, "1234", None).unwrap();
         let auth = fido::PinAuth {
             protocol,
             token: &token,

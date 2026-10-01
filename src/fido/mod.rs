@@ -13,6 +13,7 @@
 //! CTAP2 assertion produces for `clientDataHash = SHA256(message)`. See
 //! OpenSSH's `PROTOCOL.u2f`.
 
+pub mod credman;
 pub mod ctap;
 pub mod ctaphid;
 pub(crate) mod der;

@@ -14,6 +14,12 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .YS
 .SY okagent
 .RI [ options ]
+.B load-resident
+.RB [ \-\-socket
+.IR path ]
+.YS
+.SY okagent
+.RI [ options ]
 .B pubkey
 .RB [ \-\-pubkey\-file
 .IR file ]
@@ -215,6 +221,14 @@ or else on the terminal, before the touch.
 A wrong PIN is asked for again, showing the tries left; after three wrong
 PINs in a row the authenticator must be unplugged and plugged back in.
 With no askpass program and no terminal such a key is refused.
+Resident keys
+.RB ( "ssh-keygen \-O resident" )
+are best loaded with
+.BR "okagent load-resident" :
+.B ssh-add \-K
+drops the verify-required flag when it reads them from the authenticator,
+and a key enrolled with it is then hidden by the authenticator and cannot
+sign.
 A security key whose application does not start with
 .B ssh:
 may be a web credential, so, as with OpenSSH's agent, it signs only SSH
@@ -249,6 +263,32 @@ itself does.
 .TP
 .B status
 Print the firmware version and lock state of the attached OnlyKey.
+.TP
+\fBload-resident\fR [\fB\-\-socket\fR \fIpath\fR]
+Add the SSH keys stored on FIDO security keys (resident keys, made with
+.BR "ssh-keygen \-O resident" )
+to the agent, as
+.B ssh-add \-K
+does, but keeping whether each needs the authenticator's PIN.
+Every attached security key other than the OnlyKey is read, or only the one
+.B \-\-fido\-device
+names; each asks for its PIN as
+.B \-\-askpass
+describes, since listing resident keys needs it.
+Only credentials whose application starts with
+.B ssh:
+are added.
+A key that needs the PIN is recognised by asking the authenticator for it
+without one, silently and with no touch: such a key stays hidden from that
+request.
+The keys go to the agent at
+.IR path ,
+or else
+.BR SSH_AUTH_SOCK ,
+the
+.B socket
+config key, or okagent's default socket.
+Exits with status 1 when no key is added.
 .TP
 .B devices
 List the attached OnlyKeys and FIDO security keys, one interface per line:

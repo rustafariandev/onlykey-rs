@@ -15,6 +15,7 @@
 use super::FidoError;
 use super::ctap_status;
 use super::ctaphid::{CTAPHID_CBOR, CtapHid};
+use crate::challenge::{PinAnswer, PinPrompt, PinRequest};
 use crate::transport::HidTransport;
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
@@ -35,6 +36,17 @@ pub const AUTHENTICATOR_CLIENT_PIN: u8 = 0x06;
 pub const GET_RETRIES: u8 = 0x01;
 pub const GET_KEY_AGREEMENT: u8 = 0x02;
 pub const GET_PIN_TOKEN: u8 = 0x05;
+/// `getPinUvAuthTokenUsingPinWithPermissions`, CTAP2.1's token request that
+/// names what the token may be used for.
+pub const GET_PIN_TOKEN_WITH_PERMISSIONS: u8 = 0x09;
+
+/// CTAP2.1 PIN token permissions.
+pub const PERMISSION_GET_ASSERTION: u8 = 0x02;
+pub const PERMISSION_CREDENTIAL_MANAGEMENT: u8 = 0x04;
+
+/// PIN entries asked for in one go before giving up. An authenticator wants
+/// to be replugged after three wrong PINs in a row.
+pub const PIN_ATTEMPTS: usize = 3;
 
 /// Shortest PIN in Unicode code points and longest in UTF-8 bytes, as
 /// CTAP2 requires. A PIN outside these bounds is refused before it reaches
@@ -48,8 +60,10 @@ const COSE_ALG: i8 = 3;
 const COSE_CRV: i8 = -1;
 const COSE_X: i8 = -2;
 const COSE_Y: i8 = -3;
+const KTY_OKP: i8 = 1;
 const KTY_EC2: i8 = 2;
 const CRV_P256: i8 = 1;
+const CRV_ED25519: i8 = 6;
 /// `ECDH-ES+HKDF-256`, the algorithm CTAP2 names for its key agreement key.
 const ALG_ECDH_ES_HKDF_256: i8 = -25;
 
@@ -187,6 +201,14 @@ pub struct Info {
     pub client_pin: Option<bool>,
     /// The PIN/UV auth protocols listed, in the authenticator's order.
     pub protocols: Vec<u8>,
+    /// The versions listed, e.g. `FIDO_2_0` or `FIDO_2_1_PRE`.
+    pub versions: Vec<String>,
+    /// The `credMgmt` option: CTAP2.1 credential management (0x0A).
+    pub cred_mgmt: bool,
+    /// The `credentialMgmtPreview` option: the preview command (0x41).
+    pub cred_mgmt_preview: bool,
+    /// The `pinUvAuthToken` option: PIN tokens carry permissions (CTAP2.1).
+    pub pin_uv_auth_token: bool,
 }
 
 impl Info {
@@ -217,13 +239,32 @@ fn parse_info(cbor: &[u8]) -> Result<Info, FidoError> {
     let mut info = Info::default();
     for _ in 0..definite_map(&mut d)? {
         match d.u8().map_err(cbor_error)? {
+            1 => {
+                let count = d
+                    .array()
+                    .map_err(cbor_error)?
+                    .ok_or(FidoError::Protocol("indefinite CTAP array"))?;
+                for _ in 0..count {
+                    info.versions.push(d.str().map_err(cbor_error)?.to_owned());
+                }
+            }
             4 => {
                 for _ in 0..definite_map(&mut d)? {
                     let name = d.str().map_err(cbor_error)?;
-                    if name == "clientPin" {
-                        info.client_pin = Some(d.bool().map_err(cbor_error)?);
-                    } else {
-                        d.skip().map_err(cbor_error)?;
+                    let flag = match name {
+                        "clientPin" | "credMgmt" | "credentialMgmtPreview" | "pinUvAuthToken" => {
+                            d.bool().map_err(cbor_error)?
+                        }
+                        _ => {
+                            d.skip().map_err(cbor_error)?;
+                            continue;
+                        }
+                    };
+                    match name {
+                        "clientPin" => info.client_pin = Some(flag),
+                        "credMgmt" => info.cred_mgmt = flag,
+                        "credentialMgmtPreview" => info.cred_mgmt_preview = flag,
+                        _ => info.pin_uv_auth_token = flag,
                     }
                 }
             }
@@ -268,7 +309,17 @@ pub fn pin_length_ok(pin: &str) -> bool {
     pin.chars().count() >= MIN_PIN_CHARS && pin.len() <= MAX_PIN_BYTES
 }
 
-/// Exchange `pin` for a PIN token with `getPINToken`.
+/// What a CTAP2.1 PIN token is asked for: [`PERMISSION_GET_ASSERTION`]
+/// and the like, and the RP ID the permission is limited to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permissions<'a> {
+    pub bits: u8,
+    pub rp_id: Option<&'a str>,
+}
+
+/// Exchange `pin` for a PIN token: with `getPINToken` (0x05), or with
+/// `getPinUvAuthTokenUsingPinWithPermissions` (0x09) when `permissions` is
+/// given, as a CTAP2.1 authenticator listing `pinUvAuthToken` requires.
 ///
 /// A wrong PIN fails with [`FidoError::PinInvalid`] and costs one of the
 /// PIN's tries; [`FidoError::PinAuthBlocked`] means the authenticator wants
@@ -278,6 +329,7 @@ pub fn pin_token<T: HidTransport>(
     hid: &mut CtapHid<T>,
     protocol: PinProtocol,
     pin: &str,
+    permissions: Option<Permissions>,
 ) -> Result<Zeroizing<Vec<u8>>, FidoError> {
     if !pin_length_ok(pin) {
         return Err(FidoError::PinLength);
@@ -287,7 +339,7 @@ pub fn pin_token<T: HidTransport>(
     let secret = shared_secret(protocol, &platform, &device_key);
     let pin_hash = Zeroizing::new(Sha256::digest(pin.as_bytes()));
     let pin_hash_enc = protocol.encrypt(&secret, &pin_hash[..16])?;
-    let request = pin_token_request(protocol, &platform.public_key(), &pin_hash_enc)?;
+    let request = pin_token_request(protocol, &platform.public_key(), &pin_hash_enc, permissions)?;
     let reply = command(hid, &request)?;
     let mut d = Decoder::new(&reply);
     let mut encrypted = None;
@@ -357,12 +409,14 @@ fn client_pin_request_with(
     Ok(buffer)
 }
 
-/// A `getPINToken` request: the host's key agreement key (3) and
-/// `pinHashEnc` (6), after the protocol and subcommand.
+/// A PIN token request: the host's key agreement key (3) and `pinHashEnc`
+/// (6) after the protocol and subcommand, then for a request with
+/// permissions the permissions (9) and RP ID (10).
 fn pin_token_request(
     protocol: PinProtocol,
     platform: &PublicKey,
     pin_hash_enc: &[u8],
+    permissions: Option<Permissions>,
 ) -> Result<Vec<u8>, FidoError> {
     let mut extra = Vec::new();
     let mut e = Encoder::new(&mut extra);
@@ -371,7 +425,73 @@ fn pin_token_request(
     e.u8(6)
         .and_then(|e| e.bytes(pin_hash_enc))
         .map_err(|e| FidoError::Cbor(e.to_string()))?;
-    client_pin_request_with(protocol, GET_PIN_TOKEN, 2, &extra)
+    let Some(permissions) = permissions else {
+        return client_pin_request_with(protocol, GET_PIN_TOKEN, 2, &extra);
+    };
+    e.u8(9)
+        .and_then(|e| e.u8(permissions.bits))
+        .map_err(|e| FidoError::Cbor(e.to_string()))?;
+    let mut pairs = 3;
+    if let Some(rp_id) = permissions.rp_id {
+        e.u8(10)
+            .and_then(|e| e.str(rp_id))
+            .map_err(|e| FidoError::Cbor(e.to_string()))?;
+        pairs += 1;
+    }
+    client_pin_request_with(protocol, GET_PIN_TOKEN_WITH_PERMISSIONS, pairs, &extra)
+}
+
+/// Ask the user for the PIN through `prompt` and exchange it for a PIN
+/// token, asking again after a wrong PIN up to [`PIN_ATTEMPTS`] times.
+///
+/// `request` names what the PIN is for; the tries left and the reason for
+/// asking again are filled in here. A CTAP2.1 authenticator gets a token
+/// limited to `permissions`; an older one a plain token. A cancelled prompt
+/// fails with [`FidoError::PinCancelled`], one that cannot be shown with
+/// [`FidoError::UvRequired`].
+pub fn pin_token_interactive<T: HidTransport>(
+    hid: &mut CtapHid<T>,
+    prompt: &dyn PinPrompt,
+    request: &PinRequest,
+    permissions: Permissions,
+) -> Result<(PinProtocol, Zeroizing<Vec<u8>>), FidoError> {
+    let info = get_info(hid)?;
+    if info.client_pin != Some(true) {
+        return Err(FidoError::PinNotSet);
+    }
+    let protocol = info.protocol().ok_or(FidoError::Unsupported)?;
+    let permissions = info.pin_uv_auth_token.then_some(permissions);
+    let mut problem = None;
+    for _ in 0..PIN_ATTEMPTS {
+        let retries = match retries(hid, protocol) {
+            Ok(0) => return Err(FidoError::PinBlocked),
+            Ok(retries) => Some(retries),
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot read PIN retries");
+                None
+            }
+        };
+        let request = PinRequest {
+            retries,
+            problem: problem.take(),
+            ..request.clone()
+        };
+        tracing::info!("asking for the security key's PIN");
+        let pin = match prompt.pin(&request) {
+            PinAnswer::Pin(pin) => pin,
+            PinAnswer::Cancelled => return Err(FidoError::PinCancelled),
+            PinAnswer::Unavailable => return Err(FidoError::UvRequired),
+        };
+        match pin_token(hid, protocol, &pin, permissions) {
+            Ok(token) => return Ok((protocol, token)),
+            Err(FidoError::PinInvalid) => problem = Some("Wrong PIN".to_owned()),
+            Err(FidoError::PinLength) => {
+                problem = Some("A PIN has 4 to 63 characters".to_owned());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(FidoError::PinInvalid)
 }
 
 /// Encode `key` as a COSE_Key in CTAP2 canonical order: 1, 3, -1, -2, -3.
@@ -400,8 +520,24 @@ where
     Ok(())
 }
 
+/// A public key in COSE_Key form: a credential's key, or a key agreement
+/// key (always P-256).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CosePublicKey {
+    Ed25519([u8; 32]),
+    P256(PublicKey),
+}
+
 /// Decode a P-256 COSE_Key, checking its key type and curve.
 pub(crate) fn decode_cose_key(d: &mut Decoder) -> Result<PublicKey, FidoError> {
+    match decode_cose_public_key(d)? {
+        CosePublicKey::P256(key) => Ok(key),
+        CosePublicKey::Ed25519(_) => Err(FidoError::Protocol("key agreement key is not P-256")),
+    }
+}
+
+/// Decode an Ed25519 (OKP) or P-256 (EC2) COSE_Key.
+pub(crate) fn decode_cose_public_key(d: &mut Decoder) -> Result<CosePublicKey, FidoError> {
     let mut kty = None;
     let mut crv = None;
     let mut x = None;
@@ -415,23 +551,35 @@ pub(crate) fn decode_cose_key(d: &mut Decoder) -> Result<PublicKey, FidoError> {
             _ => d.skip().map_err(cbor_error)?,
         }
     }
-    if kty != Some(KTY_EC2) || crv != Some(CRV_P256) {
-        return Err(FidoError::Protocol("key agreement key is not P-256"));
+    let x = x.ok_or(FidoError::Protocol("COSE key without x"))?;
+    match (kty, crv) {
+        (Some(KTY_OKP), Some(CRV_ED25519)) => x
+            .try_into()
+            .map(CosePublicKey::Ed25519)
+            .map_err(|_| FidoError::Protocol("bad Ed25519 key length")),
+        (Some(KTY_EC2), Some(CRV_P256)) => {
+            let y = y.ok_or(FidoError::Protocol("COSE key without y"))?;
+            if x.len() != 32 || y.len() != 32 {
+                return Err(FidoError::Protocol("bad P-256 coordinate length"));
+            }
+            let point = EncodedPoint::from_affine_coordinates(
+                x.as_slice().into(),
+                y.as_slice().into(),
+                false,
+            );
+            Option::from(PublicKey::from_encoded_point(&point))
+                .map(CosePublicKey::P256)
+                .ok_or(FidoError::Protocol("P-256 key is not on the curve"))
+        }
+        _ => Err(FidoError::Protocol("COSE key is neither Ed25519 nor P-256")),
     }
-    let (Some(x), Some(y)) = (x, y) else {
-        return Err(FidoError::Protocol("key agreement key without coordinates"));
-    };
-    if x.len() != 32 || y.len() != 32 {
-        return Err(FidoError::Protocol("bad key agreement coordinate length"));
-    }
-    let point =
-        EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
-    Option::from(PublicKey::from_encoded_point(&point))
-        .ok_or(FidoError::Protocol("key agreement key is not on the curve"))
 }
 
 /// Send one CTAP2 message and return the CBOR of a successful reply.
-fn command<T: HidTransport>(hid: &mut CtapHid<T>, message: &[u8]) -> Result<Vec<u8>, FidoError> {
+pub(crate) fn command<T: HidTransport>(
+    hid: &mut CtapHid<T>,
+    message: &[u8],
+) -> Result<Vec<u8>, FidoError> {
     let reply = hid.transact(CTAPHID_CBOR, message, &|| {})?;
     let (&status, cbor) = reply
         .split_first()
@@ -442,13 +590,13 @@ fn command<T: HidTransport>(hid: &mut CtapHid<T>, message: &[u8]) -> Result<Vec<
     Ok(cbor.to_vec())
 }
 
-fn definite_map(d: &mut Decoder) -> Result<u64, FidoError> {
+pub(crate) fn definite_map(d: &mut Decoder) -> Result<u64, FidoError> {
     d.map()
         .map_err(cbor_error)?
         .ok_or(FidoError::Protocol("indefinite CTAP map"))
 }
 
-fn cbor_error(e: minicbor::decode::Error) -> FidoError {
+pub(crate) fn cbor_error(e: minicbor::decode::Error) -> FidoError {
     FidoError::Cbor(e.to_string())
 }
 
@@ -566,6 +714,7 @@ mod tests {
         let info = |protocols: Vec<u8>| Info {
             client_pin: Some(true),
             protocols,
+            ..Info::default()
         };
         assert_eq!(info(vec![]).protocol(), Some(PinProtocol::V1));
         assert_eq!(info(vec![1]).protocol(), Some(PinProtocol::V1));
@@ -595,7 +744,82 @@ mod tests {
         let info = parse_info(&cbor).unwrap();
         assert_eq!(info.client_pin, Some(true));
         assert_eq!(info.protocols, vec![1]);
+        assert_eq!(info.versions, vec!["FIDO_2_0"]);
+        assert!(!info.cred_mgmt && !info.pin_uv_auth_token);
         assert_eq!(parse_info(&[0xA0]).unwrap(), Info::default());
+    }
+
+    /// The getInfo reply of a SoloKeys Solo (firmware 4.1.5), captured from
+    /// the device: CTAP2.1-preview with `credMgmt`, PIN protocol 1 only.
+    #[test]
+    fn parses_a_solo_get_info_reply() {
+        let reply = hex::decode(concat!(
+            "a80183665532465f5632684649444f5f325f306c4649444f5f325f315f50524502826b",
+            "6372656450726f746563746b686d61632d73656372657403508876631bd4a0427f5773",
+            "0ec71c9e027904a562726bf5627570f564706c6174f468637265644d676d74f569636c",
+            "69656e7450696ef5051904b00681010714081880"
+        ))
+        .unwrap();
+        let info = parse_info(&reply).unwrap();
+        assert_eq!(info.versions, ["U2F_V2", "FIDO_2_0", "FIDO_2_1_PRE"]);
+        assert_eq!(info.client_pin, Some(true));
+        assert!(info.cred_mgmt);
+        assert!(!info.cred_mgmt_preview);
+        assert!(!info.pin_uv_auth_token);
+        assert_eq!(info.protocols, [1]);
+        assert_eq!(info.protocol(), Some(PinProtocol::V1));
+    }
+
+    /// A token request with permissions uses subcommand 0x09 and appends
+    /// the permissions (9) and RP ID (10) after `pinHashEnc`.
+    #[test]
+    fn token_request_with_permissions_names_them() {
+        let platform = secret_key(0x11).public_key();
+        let plain = pin_token_request(PinProtocol::V2, &platform, &[0xEE; 32], None).unwrap();
+        let permissions = Permissions {
+            bits: PERMISSION_GET_ASSERTION,
+            rp_id: Some("ssh:"),
+        };
+        let with =
+            pin_token_request(PinProtocol::V2, &platform, &[0xEE; 32], Some(permissions)).unwrap();
+        // map(4) 1: 2, 2: 5 ... versus map(6) 1: 2, 2: 9 ...
+        assert_eq!(
+            &plain[..6],
+            &[AUTHENTICATOR_CLIENT_PIN, 0xA4, 0x01, 0x02, 0x02, 0x05]
+        );
+        assert_eq!(
+            &with[..6],
+            &[AUTHENTICATOR_CLIENT_PIN, 0xA6, 0x01, 0x02, 0x02, 0x09]
+        );
+        assert_eq!(with[6..plain.len()], plain[6..]);
+        assert_eq!(
+            hex::encode(&with[plain.len()..]),
+            "0902" /* 9: ga */
+                .to_owned()
+                + "0a"
+                + "6473"
+                + "73683a" /* 10: "ssh:" */
+        );
+    }
+
+    #[test]
+    fn decodes_an_ed25519_cose_key() {
+        let mut buffer = Vec::new();
+        Encoder::new(&mut buffer)
+            .map(4)
+            .and_then(|e| e.i8(1))
+            .and_then(|e| e.i8(1))
+            .and_then(|e| e.i8(3))
+            .and_then(|e| e.i8(-8))
+            .and_then(|e| e.i8(-1))
+            .and_then(|e| e.i8(6))
+            .and_then(|e| e.i8(-2))
+            .and_then(|e| e.bytes(&[0x5A; 32]))
+            .unwrap();
+        let key = decode_cose_public_key(&mut Decoder::new(&buffer)).unwrap();
+        assert_eq!(key, CosePublicKey::Ed25519([0x5A; 32]));
+        // It is no key agreement key.
+        assert!(decode_cose_key(&mut Decoder::new(&buffer)).is_err());
     }
 
     #[test]

@@ -8,8 +8,11 @@
 //!
 //! With [`FakeFido::with_pin`] it also answers `authenticatorGetInfo` and the
 //! `authenticatorClientPIN` subcommands the agent uses, under both PIN/UV
-//! auth protocols, and checks `pinUvAuthParam` on getAssertion.
+//! auth protocols, and checks `pinUvAuthParam` on getAssertion. With
+//! [`FakeFido::resident`] its credential is a resident one, listed by
+//! credential management.
 
+use super::credman::{CREDENTIAL_MANAGEMENT, CREDENTIAL_MANAGEMENT_PREVIEW};
 use super::ctap::AUTHENTICATOR_GET_ASSERTION;
 use super::ctaphid::{CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_INIT, CTAPHID_KEEPALIVE};
 use super::pin::{
@@ -70,6 +73,18 @@ pub struct FakeFido {
     cancelled: bool,
     pin: Option<PinState>,
     id: Option<String>,
+    resident: Option<Resident>,
+}
+
+/// The resident side of a [`FakeFido`] built with [`FakeFido::resident`].
+struct Resident {
+    user_name: String,
+    cred_protect: u8,
+    /// The level credential management lists; `None` leaves it out.
+    reported_cred_protect: Option<u8>,
+    /// Lists `credMgmt` but answers only the preview command 0x41, as a
+    /// CTAP2.1-preview key might.
+    preview_only: bool,
 }
 
 impl FakeFido {
@@ -92,6 +107,7 @@ impl FakeFido {
             cancelled: false,
             pin: None,
             id: None,
+            resident: None,
         }
     }
 
@@ -108,6 +124,47 @@ impl FakeFido {
             token: None,
             token_requests: 0,
         });
+        self
+    }
+
+    /// Make the credential a resident one enrolled for `user_name` with
+    /// credProtect `cred_protect`, listed by credential management. Level 3
+    /// hides it from any getAssertion without a valid PIN token.
+    pub fn resident(mut self, user_name: &str, cred_protect: u8) -> Self {
+        self.resident = Some(Resident {
+            user_name: user_name.to_owned(),
+            cred_protect,
+            reported_cred_protect: Some(cred_protect),
+            preview_only: false,
+        });
+        self
+    }
+
+    /// Leave credProtect out of credential listings, as some
+    /// CTAP2.1-preview authenticators do.
+    pub fn without_cred_protect_in_listings(mut self) -> Self {
+        if let Some(resident) = &mut self.resident {
+            resident.reported_cred_protect = None;
+        }
+        self
+    }
+
+    /// List credProtect as `level` whatever the credential's real level, as
+    /// a SoloKeys Solo (firmware 4.1.5) lists level 1 for a credential it
+    /// hides.
+    pub fn reporting_cred_protect(mut self, level: u8) -> Self {
+        if let Some(resident) = &mut self.resident {
+            resident.reported_cred_protect = Some(level);
+        }
+        self
+    }
+
+    /// Answer credential management only on the preview command 0x41,
+    /// while still listing `credMgmt`.
+    pub fn credential_management_preview_only(mut self) -> Self {
+        if let Some(resident) = &mut self.resident {
+            resident.preview_only = true;
+        }
         self
     }
 
@@ -237,6 +294,17 @@ impl FakeFido {
                 let reply = self.client_pin(params);
                 self.push_message(self.cid, cmd, &reply);
             }
+            Some((&command @ (CREDENTIAL_MANAGEMENT | CREDENTIAL_MANAGEMENT_PREVIEW), params))
+                if self.resident.is_some() =>
+            {
+                let preview_only = self.resident.as_ref().is_some_and(|r| r.preview_only);
+                let reply = if preview_only && command == CREDENTIAL_MANAGEMENT {
+                    vec![0x01] // CTAP1_ERR_INVALID_COMMAND
+                } else {
+                    self.credential_management(params)
+                };
+                self.push_message(self.cid, cmd, &reply);
+            }
             _ => self.push_message(self.cid, cmd, &[0x01]), // CTAP1_ERR_INVALID_COMMAND
         }
     }
@@ -247,17 +315,27 @@ impl FakeFido {
         let mut reply = vec![0x00];
         let mut e = Encoder::new(&mut reply);
         let entries = if self.pin.is_some() { 3 } else { 1 };
+        let resident = self.resident.is_some();
         e.map(entries)
             .and_then(|e| e.u8(1))
-            .and_then(|e| e.array(1))
+            .and_then(|e| e.array(if resident { 2 } else { 1 }))
             .and_then(|e| e.str("FIDO_2_0"))
             .expect("vec write");
+        if resident {
+            e.str("FIDO_2_1_PRE").expect("vec write");
+        }
         if let Some(state) = &self.pin {
             e.u8(4)
-                .and_then(|e| e.map(1))
+                .and_then(|e| e.map(if resident { 2 } else { 1 }))
                 .and_then(|e| e.str("clientPin"))
                 .and_then(|e| e.bool(true))
-                .and_then(|e| e.u8(6))
+                .expect("vec write");
+            if resident {
+                e.str("credMgmt")
+                    .and_then(|e| e.bool(true))
+                    .expect("vec write");
+            }
+            e.u8(6)
                 .and_then(|e| e.array(state.protocols.len() as u64))
                 .expect("vec write");
             for &protocol in &state.protocols {
@@ -338,6 +416,97 @@ impl FakeFido {
         reply
     }
 
+    /// `authenticatorCredentialManagement`: enumerate the one RP and its one
+    /// credential. The Begin subcommands need a valid `pinUvAuthParam`.
+    fn credential_management(&mut self, params: &[u8]) -> Vec<u8> {
+        let Some(request) = parse_credential_management(params) else {
+            return vec![0x12]; // CTAP2_ERR_INVALID_CBOR
+        };
+        let resident = self.resident.as_ref().expect("checked by the caller");
+        let rp_id_hash = Sha256::digest(self.application.as_bytes());
+        if matches!(request.sub_command, 0x02 | 0x04) {
+            let token = self.pin.as_ref().and_then(|p| p.token.as_ref());
+            let mut message = vec![request.sub_command];
+            message.extend_from_slice(&request.params);
+            let authorised = match (token, request.auth) {
+                (Some((p, token)), Some((protocol, param))) => {
+                    p.number() == protocol && p.authenticate(token, &message) == param
+                }
+                _ => false,
+            };
+            if !authorised {
+                return vec![0x33]; // CTAP2_ERR_PIN_AUTH_INVALID
+            }
+        }
+        let mut reply = vec![0x00];
+        let mut e = Encoder::new(&mut reply);
+        match request.sub_command {
+            // enumerateRPsBegin: {3: rp, 4: rpIDHash, 5: totalRPs}
+            0x02 => {
+                e.map(3)
+                    .and_then(|e| e.u8(3))
+                    .and_then(|e| e.map(1))
+                    .and_then(|e| e.str("id"))
+                    .and_then(|e| e.str(&self.application))
+                    .and_then(|e| e.u8(4))
+                    .and_then(|e| e.bytes(&rp_id_hash))
+                    .and_then(|e| e.u8(5))
+                    .and_then(|e| e.u8(1))
+                    .expect("vec write");
+            }
+            // enumerateCredentialsBegin: {6: user, 7: credentialID,
+            // 8: publicKey, 9: totalCredentials, 10: credProtect}
+            0x04 => {
+                let mut wanted = Decoder::new(&request.params);
+                let asked = wanted
+                    .map()
+                    .ok()
+                    .and_then(|_| wanted.u8().ok())
+                    .and_then(|_| wanted.bytes().ok());
+                if asked != Some(rp_id_hash.as_slice()) {
+                    return vec![0x2e]; // CTAP2_ERR_NO_CREDENTIALS
+                }
+                let pairs = if resident.reported_cred_protect.is_some() {
+                    5
+                } else {
+                    4
+                };
+                e.map(pairs)
+                    .and_then(|e| e.u8(6))
+                    .and_then(|e| e.map(2))
+                    .and_then(|e| e.str("id"))
+                    .and_then(|e| e.bytes(&[0; 32]))
+                    .and_then(|e| e.str("name"))
+                    .and_then(|e| e.str(&resident.user_name))
+                    .and_then(|e| e.u8(7))
+                    .and_then(|e| e.map(2))
+                    .and_then(|e| e.str("id"))
+                    .and_then(|e| e.bytes(&self.key_handle))
+                    .and_then(|e| e.str("type"))
+                    .and_then(|e| e.str("public-key"))
+                    // An Ed25519 COSE_Key: {1: OKP, 3: EdDSA, -1: Ed25519, -2: x}
+                    .and_then(|e| e.u8(8))
+                    .and_then(|e| e.map(4))
+                    .and_then(|e| e.i8(1))
+                    .and_then(|e| e.i8(1))
+                    .and_then(|e| e.i8(3))
+                    .and_then(|e| e.i8(-8))
+                    .and_then(|e| e.i8(-1))
+                    .and_then(|e| e.i8(6))
+                    .and_then(|e| e.i8(-2))
+                    .and_then(|e| e.bytes(&self.pair.public.0))
+                    .and_then(|e| e.u8(9))
+                    .and_then(|e| e.u8(1))
+                    .expect("vec write");
+                if let Some(level) = resident.reported_cred_protect {
+                    e.u8(10).and_then(|e| e.u8(level)).expect("vec write");
+                }
+            }
+            _ => return vec![0x3e], // CTAP2_ERR_INVALID_SUBCOMMAND
+        }
+        reply
+    }
+
     fn get_assertion(&mut self, cmd: u8, params: &[u8]) {
         let Some(request) = parse_request(params) else {
             self.push_message(self.cid, cmd, &[0x12]); // CTAP2_ERR_INVALID_CBOR
@@ -348,6 +517,16 @@ impl FakeFido {
             return;
         }
         // A valid pinUvAuthParam verifies the user; a bad one is refused.
+        // A credential that requires verification hides from requests
+        // without one, as credProtect level 3 makes a real device do.
+        let hidden = self
+            .resident
+            .as_ref()
+            .is_some_and(|r| r.cred_protect == super::credman::CRED_PROTECT_UV_REQUIRED);
+        if hidden && request.pin_auth.is_none() {
+            self.push_message(self.cid, cmd, &[0x2e]); // CTAP2_ERR_NO_CREDENTIALS
+            return;
+        }
         let mut verified = false;
         if let Some((param, protocol)) = &request.pin_auth {
             let token = self.pin.as_ref().and_then(|p| p.token.as_ref());
@@ -437,6 +616,41 @@ struct Request {
     up: bool,
     /// `pinUvAuthParam` and `pinUvAuthProtocol`, when both are given.
     pin_auth: Option<(Vec<u8>, u8)>,
+}
+
+/// The parts of an `authenticatorCredentialManagement` request the fake
+/// acts on: the subcommand, its parameters as sent, and the protocol and
+/// `pinUvAuthParam`.
+struct CredentialManagementRequest {
+    sub_command: u8,
+    params: Vec<u8>,
+    auth: Option<(u8, Vec<u8>)>,
+}
+
+fn parse_credential_management(message: &[u8]) -> Option<CredentialManagementRequest> {
+    let mut d = Decoder::new(message);
+    let mut sub_command = None;
+    let mut params = Vec::new();
+    let mut protocol = None;
+    let mut param = None;
+    for _ in 0..d.map().ok()?? {
+        match d.u8().ok()? {
+            1 => sub_command = Some(d.u8().ok()?),
+            2 => {
+                let start = d.position();
+                d.skip().ok()?;
+                params = message[start..d.position()].to_vec();
+            }
+            3 => protocol = Some(d.u8().ok()?),
+            4 => param = Some(d.bytes().ok()?.to_vec()),
+            _ => d.skip().ok()?,
+        }
+    }
+    Some(CredentialManagementRequest {
+        sub_command: sub_command?,
+        params,
+        auth: protocol.zip(param),
+    })
 }
 
 /// The parts of an `authenticatorClientPIN` request the fake acts on.
@@ -607,7 +821,7 @@ mod tests {
             let protocol = info.protocol().unwrap();
             assert_eq!(protocol.number(), *protocols.iter().max().unwrap());
             assert_eq!(pin::retries(&mut hid, protocol).unwrap(), 8);
-            let token = pin::pin_token(&mut hid, protocol, "1234").unwrap();
+            let token = pin::pin_token(&mut hid, protocol, "1234", None).unwrap();
             let hash: [u8; 32] = Sha256::digest(b"hello").into();
             let auth = PinAuth {
                 protocol,
@@ -642,17 +856,17 @@ mod tests {
         let mut hid = CtapHid::new(device);
         let v1 = PinProtocol::V1;
         assert!(matches!(
-            pin::pin_token(&mut hid, v1, "0000"),
+            pin::pin_token(&mut hid, v1, "0000", None),
             Err(FidoError::PinInvalid)
         ));
         assert_eq!(pin::retries(&mut hid, v1).unwrap(), 7);
         // Too short never reaches the device.
         assert!(matches!(
-            pin::pin_token(&mut hid, v1, "12"),
+            pin::pin_token(&mut hid, v1, "12", None),
             Err(FidoError::PinLength)
         ));
         assert_eq!(pin::retries(&mut hid, v1).unwrap(), 7);
-        let token = pin::pin_token(&mut hid, v1, "1234").unwrap();
+        let token = pin::pin_token(&mut hid, v1, "1234", None).unwrap();
         assert_eq!(pin::retries(&mut hid, v1).unwrap(), 8);
 
         hid.transport_mut().power_cycle();
@@ -673,20 +887,20 @@ mod tests {
         assert!(matches!(stale, Err(FidoError::PinAuthInvalid)), "{stale:?}");
 
         assert!(matches!(
-            pin::pin_token(&mut hid, v1, "0000"),
+            pin::pin_token(&mut hid, v1, "0000", None),
             Err(FidoError::PinInvalid)
         ));
         assert!(matches!(
-            pin::pin_token(&mut hid, v1, "0000"),
+            pin::pin_token(&mut hid, v1, "0000", None),
             Err(FidoError::PinInvalid)
         ));
         assert!(matches!(
-            pin::pin_token(&mut hid, v1, "0000"),
+            pin::pin_token(&mut hid, v1, "0000", None),
             Err(FidoError::PinAuthBlocked)
         ));
         // Even the right PIN waits for a replug.
         assert!(matches!(
-            pin::pin_token(&mut hid, v1, "1234"),
+            pin::pin_token(&mut hid, v1, "1234", None),
             Err(FidoError::PinAuthBlocked)
         ));
         assert_eq!(hid.transport().pin_retries(), Some(5));

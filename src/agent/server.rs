@@ -6,7 +6,7 @@ use super::keytype::{HeldKey, KeyDecoder, KeyRegistry};
 use super::local::{LocalKeyError, LocalKeyRef};
 use super::sk::SkKey;
 use super::wire::{self, Request};
-use crate::challenge::{ChallengeSink, PinAnswer, PinPrompt, PinRequest, TouchRequest};
+use crate::challenge::{ChallengeSink, PinPrompt, PinRequest, TouchRequest};
 use crate::device::{DeviceError, OnlyKey};
 use crate::fido::ctaphid::CtapHid;
 use crate::fido::{FidoError, PinAuth, PinProtocol, pin};
@@ -123,10 +123,6 @@ struct CachedPin {
     token: Zeroizing<Vec<u8>>,
     expires: Instant,
 }
-
-/// PIN entries asked for in one signature before giving up. An
-/// authenticator wants to be replugged after three wrong PINs in a row.
-const PIN_ATTEMPTS: usize = 3;
 
 /// Delay per failed unlock, as in OpenSSH: 0.1 s more for each failure.
 const UNLOCK_BACKOFF: Duration = Duration::from_millis(100);
@@ -823,7 +819,7 @@ impl Agent {
                 result => return Ok(result?),
             }
         }
-        let (protocol, token) = self.pin_token(hid, touch)?;
+        let (protocol, token) = self.pin_token(hid, key, touch)?;
         let auth = PinAuth {
             protocol,
             token: &token,
@@ -833,51 +829,31 @@ impl Agent {
         Ok(sig)
     }
 
-    /// Ask the user for the PIN and exchange it for a PIN token, asking again
-    /// after a wrong one up to [`PIN_ATTEMPTS`] times.
+    /// Ask the user for the PIN and exchange it for a PIN token allowed to
+    /// sign for `key`'s application.
     fn pin_token(
         &self,
         hid: &mut CtapHid<Box<dyn HidTransport>>,
+        key: &SkKey,
         touch: &TouchRequest,
     ) -> Result<(PinProtocol, Zeroizing<Vec<u8>>), AgentError> {
         let prompt = self.pin_prompt.as_ref().ok_or(FidoError::UvRequired)?;
-        let info = pin::get_info(hid)?;
-        if info.client_pin != Some(true) {
-            return Err(FidoError::PinNotSet.into());
-        }
-        let protocol = info.protocol().ok_or(FidoError::Unsupported)?;
-        let mut problem = None;
-        for _ in 0..PIN_ATTEMPTS {
-            let retries = match pin::retries(hid, protocol) {
-                Ok(0) => return Err(FidoError::PinBlocked.into()),
-                Ok(retries) => Some(retries),
-                Err(e) => {
-                    tracing::debug!(error = %e, "cannot read PIN retries");
-                    None
-                }
-            };
-            let request = PinRequest {
-                identity: touch.identity.clone(),
-                subject: touch.subject.clone(),
-                retries,
-                problem: problem.take(),
-            };
-            tracing::info!("asking for the security key's PIN");
-            let pin = match prompt.pin(&request) {
-                PinAnswer::Pin(pin) => pin,
-                PinAnswer::Cancelled => return Err(FidoError::PinCancelled.into()),
-                PinAnswer::Unavailable => return Err(FidoError::UvRequired.into()),
-            };
-            match pin::pin_token(hid, protocol, &pin) {
-                Ok(token) => return Ok((protocol, token)),
-                Err(FidoError::PinInvalid) => problem = Some("Wrong PIN".to_owned()),
-                Err(FidoError::PinLength) => {
-                    problem = Some("A PIN has 4 to 63 characters".to_owned());
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(FidoError::PinInvalid.into())
+        let request = PinRequest {
+            action: format!("sign as {}", touch.identity),
+            subject: touch.subject.clone(),
+            retries: None,
+            problem: None,
+        };
+        let permissions = pin::Permissions {
+            bits: pin::PERMISSION_GET_ASSERTION,
+            rp_id: Some(key.application()),
+        };
+        Ok(pin::pin_token_interactive(
+            hid,
+            prompt.as_ref(),
+            &request,
+            permissions,
+        )?)
     }
 
     /// The PIN token kept for `device`, if the cache is on and it is fresh.
@@ -2279,7 +2255,7 @@ mod tests {
         );
         let requests = prompt.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].identity, "uv@example.com");
+        assert_eq!(requests[0].action, "sign as uv@example.com");
         assert_eq!(requests[0].retries, Some(8));
         assert_eq!(requests[0].problem, None);
         assert_eq!(setup.sink.1.lock().unwrap().len(), 1);
@@ -2315,7 +2291,7 @@ mod tests {
     #[test]
     fn a_cancelled_pin_fails_without_a_touch() {
         let prompt = Arc::new(crate::challenge::RecordingPin::answering(vec![
-            PinAnswer::Cancelled,
+            crate::challenge::PinAnswer::Cancelled,
         ]));
         let setup = UvSetup::new(Some(prompt), Duration::ZERO);
         let result = setup.sign();
@@ -2354,6 +2330,60 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(setup.opens.load(Ordering::SeqCst), 0);
+    }
+
+    /// A verify-required resident key, added as `okagent load-resident`
+    /// adds it, signs after the PIN. Added without the flag, as `ssh-add -K`
+    /// adds it, the device hides it and signing fails.
+    #[test]
+    fn a_resident_key_signs_only_with_its_verify_flag() {
+        use crate::fido::credman::{CRED_PROTECT_UV_REQUIRED, ResidentCredential};
+        use crate::fido::fake::FakeFido;
+        use crate::fido::pin::CosePublicKey;
+
+        for verify in [true, false] {
+            let device = FakeFido::new(&[0x42; 32], "ssh:okagent-test-uv", &[9, 8, 7], 0x01)
+                .with_pin("1234", 8, &[1])
+                .resident("openssh", CRED_PROTECT_UV_REQUIRED);
+            let credential = ResidentCredential {
+                rp_id: "ssh:okagent-test-uv".into(),
+                user_name: Some("openssh".into()),
+                credential_id: vec![9, 8, 7],
+                public_key: CosePublicKey::Ed25519(device.public()),
+                cred_protect: Some(CRED_PROTECT_UV_REQUIRED),
+            };
+            let (public, body) = crate::agent::sk::resident_key(&credential, verify).unwrap();
+            let device = Arc::new(Mutex::new(device));
+            let sk_opener: SkOpener = {
+                let device = Arc::clone(&device);
+                Arc::new(move || Ok(vec![Box::new(Arc::clone(&device)) as Box<dyn HidTransport>]))
+            };
+            let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
+            let prompt = pins(&["1234"]);
+            let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()))
+                .with_sk_opener(sk_opener)
+                .with_pin_prompt(Arc::clone(&prompt) as Arc<dyn PinPrompt>);
+            let mut add = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+            add.extend_from_slice(&body);
+            assert_eq!(agent.handle(&add), wire::success());
+
+            let result = agent.sign(&public.to_bytes().unwrap(), b"data", 0);
+            if verify {
+                let reply = result.unwrap();
+                let mut r = &reply[1..];
+                let blob = Vec::<u8>::decode(&mut r).unwrap();
+                let sig = ssh_key::Signature::try_from(blob.as_slice()).unwrap();
+                keys::verify(&public, b"data", &sig).unwrap();
+                assert_eq!(sig.as_bytes()[64], 0x05);
+                assert_eq!(prompt.requests.lock().unwrap().len(), 1);
+            } else {
+                assert!(
+                    matches!(result, Err(AgentError::Fido(FidoError::NoCredential))),
+                    "{result:?}"
+                );
+                assert!(prompt.requests.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[test]

@@ -60,6 +60,7 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 | --- | --- |
 | `okagent status` | Firmware version and lock state of the attached token. |
 | `okagent devices` | Attached OnlyKeys and FIDO security keys, with the paths `--fido-device` takes. |
+| `okagent load-resident` | Add the resident SSH keys on FIDO security keys to the agent, keeping verify-required (unlike `ssh-add -K`). |
 | `okagent pubkey ID...` | Public keys in `authorized_keys` format. |
 | `okagent run ID... -- CMD` | Run a command with a temporary agent in `SSH_AUTH_SOCK` (and `SSH_AGENT_PID`). |
 | `okagent shell ID...` | Start `$SHELL` with a temporary agent. |
@@ -157,7 +158,10 @@ asks for it with `--askpass` (default `$SSH_ASKPASS`, e.g.
 `/usr/libexec/openssh/ssh-askpass`), or on the terminal when there is no
 askpass program, then waits for the touch. `--pin-cache SECONDS` (or
 `pin-cache` in the config) reuses the PIN for that long; by default it is
-asked for at every signature. With several authenticators attached, okagent
+asked for at every signature. Load resident keys (`ssh-keygen -O resident`)
+with `okagent load-resident` rather than `ssh-add -K`, which drops the
+verify-required flag so the authenticator hides such a key and it cannot sign.
+With several authenticators attached, okagent
 asks each one silently which holds the credential, so only that one asks
 for a touch. The OnlyKey's own FIDO applet is left out; to sign with it, or
 to pin one device, pass `--fido-device /dev/hidrawN` (or set `fido-device`

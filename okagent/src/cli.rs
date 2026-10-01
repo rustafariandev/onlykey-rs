@@ -5,10 +5,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
 use onlykey_agent::agent::{self, Agent, Opener, SkOpener};
+use onlykey_agent::agent::{client, sk};
 use onlykey_agent::challenge::{
-    AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt, TtyPin, TtyPrompt,
+    AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt, PinRequest, TtyPin,
+    TtyPrompt,
 };
 use onlykey_agent::device::{OnlyKey, Timeouts};
+use onlykey_agent::fido::credman;
+use onlykey_agent::fido::ctaphid::CtapHid;
+use onlykey_agent::fido::pin;
 use onlykey_agent::identity::{Curve, Identity, KeyKind, KeySpec, Slot};
 use onlykey_agent::protocol::DeviceStatus;
 use onlykey_agent::ssh_key::HashAlg;
@@ -83,6 +88,9 @@ pub enum Cmd {
     Devices(DevicesArgs),
     /// Print public keys in authorized_keys format.
     Pubkey(IdentityArgs),
+    /// Add the SSH keys stored on FIDO security keys (resident keys) to the
+    /// agent, keeping whether each needs its PIN (unlike `ssh-add -K`).
+    LoadResident(LoadResidentArgs),
     /// Run the agent on a unix socket.
     Serve(ServeArgs),
     /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
@@ -219,6 +227,14 @@ pub struct DebugSignArgs {
     /// Digest for an RSA key: sha256 or sha512.
     #[arg(long, default_value = "sha512")]
     pub hash: String,
+}
+
+#[derive(Debug, Args)]
+pub struct LoadResidentArgs {
+    /// Agent socket to add the keys to (default: $SSH_AUTH_SOCK, then the
+    /// config's `socket`, then okagent's default socket).
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -471,6 +487,7 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         Cmd::Status => status(&ctx),
         Cmd::Devices(args) => devices(&args),
         Cmd::Pubkey(args) => pubkey(&ctx, &args),
+        Cmd::LoadResident(args) => load_resident(&ctx, &args),
         Cmd::Serve(args) => serve(&ctx, args),
         Cmd::Run(args) => run(&ctx, &args.identities, args.command),
         Cmd::Shell(args) => {
@@ -582,6 +599,93 @@ fn pubkey(ctx: &Context_, args: &IdentityArgs) -> Result<ExitCode> {
         writeln!(out, "{}", key.to_openssh()?)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Read the resident SSH keys of every attached security key (or the one
+/// `--fido-device` names) and add them to the agent; fails when none is
+/// added.
+fn load_resident(ctx: &Context_, args: &LoadResidentArgs) -> Result<ExitCode> {
+    let socket = args
+        .socket
+        .clone()
+        .or_else(|| {
+            std::env::var_os("SSH_AUTH_SOCK")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| ctx.config.socket.clone())
+        .unwrap_or_else(agent::default_socket_path);
+    if !ctx.pin_prompt.available() {
+        bail!(
+            "listing resident keys needs the security key's PIN, but there is no askpass program (--askpass or SSH_ASKPASS) or terminal to ask with"
+        );
+    }
+    let mut added = 0;
+    for transport in HidapiTransport::open_all_fido(ctx.fido_device.as_deref())? {
+        let path = transport.path().to_owned();
+        let mut hid = CtapHid::new(transport);
+        match load_resident_from(ctx, &mut hid, &path, &socket) {
+            Ok(count) => added += count,
+            Err(e) => eprintln!("okagent: {path}: {e:#}"),
+        }
+    }
+    if added == 0 {
+        eprintln!("okagent: no resident SSH keys added");
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Add one security key's resident SSH keys to the agent at `socket`;
+/// returns how many.
+fn load_resident_from(
+    ctx: &Context_,
+    hid: &mut CtapHid<HidapiTransport>,
+    path: &str,
+    socket: &Path,
+) -> Result<usize> {
+    let info = pin::get_info(hid)?;
+    if credman::command_byte(&info).is_none() {
+        bail!("no credential management, so its resident keys cannot be listed");
+    }
+    let request = PinRequest {
+        action: format!("list the resident keys on {path}"),
+        subject: None,
+        retries: None,
+        problem: None,
+    };
+    let permissions = pin::Permissions {
+        bits: pin::PERMISSION_CREDENTIAL_MANAGEMENT,
+        rp_id: None,
+    };
+    let (protocol, token) =
+        pin::pin_token_interactive(hid, ctx.pin_prompt.as_ref(), &request, permissions)?;
+    let credentials = credman::enumerate(hid, &info, protocol, &token)?;
+    let mut added = 0;
+    for credential in &credentials {
+        if !credential.rp_id.starts_with("ssh:") {
+            tracing::debug!(
+                rp = credential.rp_id,
+                "skipping a resident credential not for SSH"
+            );
+            continue;
+        }
+        let verify = credman::needs_verification(hid, credential)?;
+        let (public, body) = sk::resident_key(credential, verify)?;
+        client::add_identity(socket, &body)?;
+        eprintln!(
+            "Resident key added: {} ({} {}{})",
+            public.comment(),
+            public.algorithm(),
+            public.fingerprint(HashAlg::Sha256),
+            if verify { ", verify-required" } else { "" }
+        );
+        added += 1;
+    }
+    if added == 0 {
+        eprintln!("okagent: {path}: no resident SSH keys");
+    }
+    Ok(added)
 }
 
 fn shutdown_flag() -> Result<Arc<AtomicBool>> {
@@ -1093,6 +1197,16 @@ mod tests {
             assert_eq!(base.identity, ["base@example.com"]);
             assert_eq!(additional, ["extra@example.com"]);
         }
+    }
+
+    #[test]
+    fn load_resident_takes_a_socket() {
+        let cli =
+            Cli::try_parse_from(["okagent", "load-resident", "--socket", "/tmp/a.sock"]).unwrap();
+        let Cmd::LoadResident(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert_eq!(args.socket.as_deref(), Some(Path::new("/tmp/a.sock")));
     }
 
     #[test]

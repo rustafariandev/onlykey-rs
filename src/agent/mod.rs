@@ -1,5 +1,6 @@
 //! SSH agent protocol handling and the unix-socket server.
 
+pub mod client;
 pub mod extension;
 pub mod keytype;
 pub mod local;
