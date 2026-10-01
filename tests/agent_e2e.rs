@@ -418,7 +418,9 @@ fn ssh_add_loads_a_regular_ecdsa_key() {
 
 /// `ssh-add FILE` loads a plain DSA key where OpenSSH still supports DSA.
 /// Since OpenSSH 9.8 `ssh-dss` is compiled out by default, so this skips on
-/// modern builds; the agent path is covered by unit tests either way.
+/// modern builds; the agent path is covered by unit tests either way. Only
+/// built with the `dsa` feature, without which the agent refuses DSA keys.
+#[cfg(feature = "dsa")]
 #[test]
 fn ssh_add_loads_a_regular_dsa_key() {
     if !have("ssh-add") || !have("ssh-keygen") {

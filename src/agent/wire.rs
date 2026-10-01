@@ -630,13 +630,29 @@ mod tests {
             Err(WireError::Key(KeyDecodeError::Malformed(_)))
         ));
 
-        // A supported type with a malformed body is likewise a local-key
+        // A supported type with a malformed body is likewise a decode
         // error, not a crash.
+        let mut ecdsa = vec![SSH2_AGENTC_ADD_IDENTITY];
+        "ecdsa-sha2-nistp256".encode(&mut ecdsa).unwrap();
+        assert!(matches!(
+            parse_request(&ecdsa),
+            Err(WireError::Key(KeyDecodeError::Malformed(
+                "ecdsa-sha2-nistp256"
+            )))
+        ));
+
+        // DSA is only a known key type with the `dsa` feature.
         let mut dss = vec![SSH2_AGENTC_ADD_IDENTITY];
         "ssh-dss".encode(&mut dss).unwrap();
+        #[cfg(feature = "dsa")]
         assert!(matches!(
             parse_request(&dss),
             Err(WireError::Key(KeyDecodeError::Malformed("ssh-dss")))
+        ));
+        #[cfg(not(feature = "dsa"))]
+        assert!(matches!(
+            parse_request(&dss),
+            Err(WireError::Key(KeyDecodeError::UnsupportedType(_)))
         ));
 
         // An `ssh-rsa` add is decoded into a local key.

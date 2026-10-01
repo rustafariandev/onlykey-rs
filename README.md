@@ -19,8 +19,8 @@ Two crates:
 
 Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macOS.
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
-(stored only). A plain ed25519, RSA, ECDSA (nistp256/384/521) or DSA private
-key can also be loaded into a running agent with `ssh-add FILE` and signed in
+(stored only). A plain ed25519, RSA or ECDSA (nistp256/384/521) private key
+(and DSA, with the `dsa` build feature) can also be loaded into a running agent with `ssh-add FILE` and signed in
 memory, with no token involved. FIDO security-key SSH keys
 (`sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com`) can be
 loaded the same way and are signed by the attached authenticator over a
@@ -127,13 +127,14 @@ memory, with no token and no button press; `ssh-add -d FILE` removes that key
 (given the `.pub` of a token key, it removes that one too) and `ssh-add -D`
 removes every identity, including those from the config file, until the agent
 restarts or they are added back with `ssh-add -s`. ed25519, RSA, ECDSA
-(`ecdsa-sha2-nistp256`, `-nistp384`, `-nistp521`) and DSA (`ssh-dss`) keys are
-accepted, matching the key types `ssh-agent` itself can hold; an RSA key
+(`ecdsa-sha2-nistp256`, `-nistp384`, `-nistp521`) keys are accepted; an RSA key
 under 1024 bits is refused, as OpenSSH refuses it. An RSA key signs
 `rsa-sha2-256` or `rsa-sha2-512` (a client asking for the legacy SHA-1
 `ssh-rsa` signature is refused, as with the token); ECDSA uses the curve's own
-digest and DSA uses SHA-1. DSA only works with OpenSSH builds that still enable
-`ssh-dss`. A key stays loaded only for the life of the agent:
+digest. DSA (`ssh-dss`) keys are accepted only when okagent is built with the
+`dsa` feature (`cargo install ... okagent --features dsa`); they sign with
+SHA-1 and only work with OpenSSH builds that still enable `ssh-dss`, which
+OpenSSH turned off in 9.8 and removed in 10.0. A key stays loaded only for the life of the agent:
 
 ```sh
 okagent serve ferris@example.com &
@@ -415,13 +416,14 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   the agent cannot honour) and destination or certificate constraints are
   refused.
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
-  which loads a plain ed25519, RSA, ECDSA or DSA private key into the agent;
+  which loads a plain ed25519, RSA or ECDSA (or, with the `dsa` feature, DSA)
+  private key into the agent;
   the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
   / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The key
   types the agent can load are pluggable: implement
   `onlykey_agent::agent::KeyDecoder` and register it with
   `Agent::with_key_type` (or `register_key_type`); the built-in ed25519, RSA,
-  ECDSA, DSA and FIDO `sk-` types are registered the same way, and a later
+  ECDSA, FIDO `sk-` and (with the `dsa` feature) DSA types are registered the same way, and a later
   registration under a name wins. An in-memory key is signed by a
   `LocalKey` implementation. SSH protocol extension
   requests are pluggable too: implement `onlykey_agent::agent::Extension` and

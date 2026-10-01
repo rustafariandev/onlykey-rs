@@ -1588,6 +1588,7 @@ mod tests {
         (body, public)
     }
 
+    #[cfg(feature = "dsa")]
     fn local_dsa_key(comment: &str) -> (Vec<u8>, PublicKey) {
         let pair = ssh_key::private::DsaKeypair::random(&mut rand_core::OsRng).unwrap();
         let public = PublicKey::new(
@@ -1607,12 +1608,14 @@ mod tests {
     fn local_ecdsa_and_dsa_keys_sign_without_the_device() {
         let opener: Opener = Arc::new(|| panic!("device must not be opened"));
         let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
-        let cases = [
+        #[allow(unused_mut)]
+        let mut cases = vec![
             local_ecdsa_key(ssh_key::EcdsaCurve::NistP256, "p256@example.com"),
             local_ecdsa_key(ssh_key::EcdsaCurve::NistP384, "p384@example.com"),
             local_ecdsa_key(ssh_key::EcdsaCurve::NistP521, "p521@example.com"),
-            local_dsa_key("dsa@example.com"),
         ];
+        #[cfg(feature = "dsa")]
+        cases.push(local_dsa_key("dsa@example.com"));
         for (add, public) in cases {
             let blob = public.to_bytes().unwrap();
             assert_eq!(agent.handle(&add), wire::success());

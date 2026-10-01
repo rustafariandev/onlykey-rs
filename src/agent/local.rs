@@ -12,8 +12,12 @@ use rsa::Pkcs1v15Sign;
 use sha2::{Digest, Sha256, Sha512};
 use signature::Signer;
 use ssh_encoding::{Decode, Encode, Reader};
-use ssh_key::private::{DsaKeypair, EcdsaKeypair, Ed25519Keypair, RsaKeypair};
-use ssh_key::public::{DsaPublicKey, EcdsaPublicKey, KeyData};
+#[cfg(feature = "dsa")]
+use ssh_key::private::DsaKeypair;
+use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, RsaKeypair};
+#[cfg(feature = "dsa")]
+use ssh_key::public::DsaPublicKey;
+use ssh_key::public::{EcdsaPublicKey, KeyData};
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, Mpint, PublicKey, Signature};
 use std::fmt;
 use thiserror::Error;
@@ -249,16 +253,18 @@ impl fmt::Debug for EcdsaLocalKey {
     }
 }
 
-/// A plain DSA private key (`ssh-dss`).
+/// A plain DSA private key (`ssh-dss`), with the `dsa` feature.
 ///
 /// The scalar is held by [`DsaKeypair`], which zeroizes it when dropped.
 /// Signing uses SHA-1, the only digest DSA ever used with SSH, so the
 /// `sha2-256`/`sha2-512` request flag does not apply.
+#[cfg(feature = "dsa")]
 pub struct DsaLocalKey {
     pair: DsaKeypair,
     public: PublicKey,
 }
 
+#[cfg(feature = "dsa")]
 impl DsaLocalKey {
     fn from_pair(pair: DsaKeypair, comment: &str) -> Self {
         let public = PublicKey::new(KeyData::Dsa(DsaPublicKey::from(&pair)), comment);
@@ -266,6 +272,7 @@ impl DsaLocalKey {
     }
 }
 
+#[cfg(feature = "dsa")]
 impl LocalKey for DsaLocalKey {
     fn public_key(&self) -> &PublicKey {
         &self.public
@@ -276,6 +283,7 @@ impl LocalKey for DsaLocalKey {
     }
 }
 
+#[cfg(feature = "dsa")]
 impl fmt::Debug for DsaLocalKey {
     /// Shows the public key only, so the private half never reaches a log.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -319,6 +327,7 @@ pub fn decode(key_type: &str, reader: &mut impl Reader) -> Result<LocalKeyRef, K
             let comment = String::decode(reader).map_err(|_| malformed_ecdsa(curve))?;
             Ok(LocalKeyRef::new(EcdsaLocalKey::from_pair(pair, &comment)))
         }
+        #[cfg(feature = "dsa")]
         "ssh-dss" => {
             // The agent's DSA private fields are `p q g y x`, which is exactly
             // the keypair encoding, followed by the comment.
@@ -382,6 +391,7 @@ fn malformed_ecdsa(curve: EcdsaCurve) -> KeyDecodeError {
     KeyDecodeError::Malformed(key_type)
 }
 
+#[cfg(feature = "dsa")]
 fn malformed_dsa() -> KeyDecodeError {
     KeyDecodeError::Malformed("ssh-dss")
 }
@@ -445,9 +455,16 @@ mod tests {
             Err(KeyDecodeError::Malformed("ecdsa-sha2-nistp384"))
         ));
         let mut dsa: &[u8] = &[];
+        #[cfg(feature = "dsa")]
         assert!(matches!(
             decode("ssh-dss", &mut dsa),
             Err(KeyDecodeError::Malformed("ssh-dss"))
+        ));
+        // Without the `dsa` feature, DSA is not a known key type at all.
+        #[cfg(not(feature = "dsa"))]
+        assert!(matches!(
+            decode("ssh-dss", &mut dsa),
+            Err(KeyDecodeError::UnsupportedType(t)) if t == "ssh-dss"
         ));
     }
 
@@ -582,6 +599,7 @@ mod tests {
     }
 
     /// A DSA key decodes, signs with SHA-1 and verifies.
+    #[cfg(feature = "dsa")]
     #[test]
     fn decodes_signs_and_verifies_a_dsa_key() {
         let pair = DsaKeypair::random(&mut rand_core::OsRng).unwrap();

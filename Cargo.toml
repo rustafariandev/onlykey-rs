@@ -25,9 +25,12 @@ readme = "README.md"
 default = []
 # `serde` derives on `Curve`, for config files.
 serde = ["dep:serde"]
+# Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`. Off by default:
+# OpenSSH disabled DSA in 9.8 and removed it in 10.0.
+dsa = ["ssh-key/dsa"]
 
 [dependencies]
-ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa", "dsa"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
 ssh-encoding = "0.2"
 signature = "2"
 sha2 = { version = "0.10", features = ["oid"] }

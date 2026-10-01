@@ -11,6 +11,11 @@ readme = "../README.md"
 name = "okagent"
 path = "src/main.rs"
 
+[features]
+default = []
+# Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`.
+dsa = ["onlykey-agent/dsa"]
+
 [dependencies]
 onlykey-agent = { path = "..", version = "1.0.1", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }

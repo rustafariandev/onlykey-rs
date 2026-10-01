@@ -123,6 +123,7 @@ impl KeyRegistry {
             "ecdsa-sha2-nistp384",
             "ecdsa-sha2-nistp521",
         ]));
+        #[cfg(feature = "dsa")]
         registry.register(LocalDecoder(&["ssh-dss"]));
         registry.register(SkDecoder);
         registry

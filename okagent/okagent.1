@@ -99,7 +99,7 @@ string such as
 .BR ferris@example.com ,
 and every signature must be confirmed on the device by entering a
 three-digit challenge on its buttons.
-A plain ed25519, RSA, ECDSA or DSA private key can instead be loaded into a
+A plain ed25519, RSA or ECDSA private key can instead be loaded into a
 running agent with
 .B ssh-add
 (see below), in which case it is held in the agent's memory and signed in
@@ -184,11 +184,13 @@ made in software, with no OnlyKey and no challenge, even while another key is
 being served. ed25519, RSA, ECDSA
 .RB ( ecdsa-sha2-nistp256 ,
 .IR \-nistp384 " and " \-nistp521 )
-and DSA
-.RB ( ssh-dss )
 keys are accepted, and the key is forgotten when the agent exits.
-An RSA key under 1024 bits is refused, as OpenSSH refuses it. DSA only
-works with OpenSSH builds that still enable
+An RSA key under 1024 bits is refused, as OpenSSH refuses it.
+DSA
+.RB ( ssh-dss )
+keys are accepted only when okagent was built with the
+.B dsa
+feature, and only work with OpenSSH builds that still enable
 .IR ssh-dss .
 A FIDO security key
 .RB ( sk-ssh-ed25519@openssh.com
