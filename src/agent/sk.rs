@@ -91,6 +91,27 @@ impl SkKey {
         self.flags & USER_VERIFICATION != 0
     }
 
+    /// Whether the authenticator behind `hid` holds this credential, asked
+    /// with a silent (`up: false`) assertion that needs no touch. Used to pick
+    /// the right device when several are attached, as OpenSSH does.
+    pub fn is_held_by<T: HidTransport>(
+        &self,
+        hid: &mut CtapHid<T>,
+    ) -> Result<bool, fido::FidoError> {
+        match fido::get_assertion(
+            hid,
+            &self.application,
+            &[0; 32],
+            &self.key_handle,
+            false,
+            &|| {},
+        ) {
+            Ok(_) => Ok(true),
+            Err(fido::FidoError::NoCredential) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Sign `data` with the authenticator behind `transport`.
     ///
     /// The FIDO assertion signs `SHA256(application) || flags || counter ||
@@ -102,14 +123,24 @@ impl SkKey {
         data: &[u8],
         on_presence: &dyn Fn(),
     ) -> Result<Signature, fido::FidoError> {
+        self.sign_with(&mut CtapHid::new(transport), data, on_presence)
+    }
+
+    /// [`Self::sign`] over a CTAPHID channel already in use, such as one
+    /// [`Self::is_held_by`] just probed.
+    pub fn sign_with<T: HidTransport>(
+        &self,
+        hid: &mut CtapHid<T>,
+        data: &[u8],
+        on_presence: &dyn Fn(),
+    ) -> Result<Signature, fido::FidoError> {
         if self.needs_verification() {
             return Err(fido::FidoError::UvRequired);
         }
-        let mut hid = CtapHid::new(transport);
         let client_data_hash: [u8; 32] = Sha256::digest(data).into();
         let up = self.flags & USER_PRESENCE != 0;
         let assertion = fido::get_assertion(
-            &mut hid,
+            hid,
             &self.application,
             &client_data_hash,
             &self.key_handle,

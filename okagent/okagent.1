@@ -444,9 +444,10 @@ Use the FIDO security key whose hidraw or HID path contains
 for
 .B sk-
 keys.
-By default the first attached authenticator other than the OnlyKey is used
-(with several, a warning names the one chosen); give the OnlyKey's own
-FIDO interface here to sign with it instead.
+By default every attached authenticator other than the OnlyKey is asked,
+without a touch, whether it holds the key, and the first that does signs;
+give the OnlyKey's own FIDO interface here to sign with it instead.
+U2F-only (CTAP1) authenticators are not supported.
 The same value can be set with the
 .B fido-device
 config key.

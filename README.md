@@ -148,13 +148,15 @@ FIDO security-key SSH keys work the same way. `ssh-add ~/.ssh/id_ed25519_sk`
 (or `id_ecdsa_sk`) loads a key whose private half is actually on the
 authenticator; when a client signs, okagent drives the device with a
 pure-Rust CTAP2 client, so it works with any FIDO2 key (a YubiKey, the
-OnlyKey's own FIDO applet, and so on) and needs no C library. A key made with
+OnlyKey's own FIDO applet, and so on) and needs no C library. Older U2F-only
+(CTAP1) keys are not supported. A key made with
 `ssh-keygen -t ed25519-sk` or `-t ecdsa-sk` must be touched to sign; a key
 made with `-O verify-required` needs a PIN, which is not supported yet and is
-refused with a clear error. By default the first authenticator other than
-the OnlyKey is used; on a host with more than one, or to sign with the
-OnlyKey's own FIDO applet, pass `--fido-device /dev/hidrawN` (or set
-`fido-device` in the config) to choose one:
+refused with a clear error. With several authenticators attached, okagent
+asks each one silently which holds the credential, so only that one asks
+for a touch. The OnlyKey's own FIDO applet is left out; to sign with it, or
+to pin one device, pass `--fido-device /dev/hidrawN` (or set `fido-device`
+in the config):
 
 ```sh
 okagent serve ferris@example.com &
@@ -398,6 +400,9 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   signature, so the flags and counter from the authenticator data are appended
   to the signature as `PROTOCOL.u2f` requires. The whole exchange is a
   pure-Rust implementation of CTAPHID and CTAP2, with CBOR from `minicbor`.
+- With several authenticators attached, each is first sent a silent
+  assertion (`up = false`) for the key handle; the first that does not answer
+  `CTAP2_ERR_NO_CREDENTIALS` signs, as OpenSSH picks a device.
 - Every signature is verified against the public key before it is returned.
   Any device error, timeout or wrong challenge answers the SSH client with
   `SSH_AGENT_FAILURE` and keeps the agent running.

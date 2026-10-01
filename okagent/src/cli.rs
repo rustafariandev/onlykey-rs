@@ -50,7 +50,8 @@ pub struct Cli {
     pub notify_command: Option<String>,
 
     /// FIDO security key to use for `sk-` keys, by hidraw path substring.
-    /// Defaults to the first attached authenticator other than the OnlyKey.
+    /// Defaults to whichever attached authenticator, other than the OnlyKey,
+    /// holds the key.
     #[arg(long, global = true, value_name = "PATH")]
     pub fido_device: Option<String>,
 
@@ -301,8 +302,10 @@ impl Context_ {
         let opener: Opener = Arc::new(move || Ok(OnlyKey::open_with_timeouts(timeouts)?.boxed()));
         let fido_device = self.fido_device.clone();
         let sk_opener: SkOpener = Arc::new(move || {
-            let transport = HidapiTransport::open_fido(fido_device.as_deref())?;
-            Ok(Box::new(transport) as Box<dyn HidTransport>)
+            Ok(HidapiTransport::open_all_fido(fido_device.as_deref())?
+                .into_iter()
+                .map(|t| Box::new(t) as Box<dyn HidTransport>)
+                .collect())
         });
         let agent = Agent::new(entries, opener, Arc::clone(&self.sink)).with_sk_opener(sk_opener);
         if let Some(path) = pubkey_file {

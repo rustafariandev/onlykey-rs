@@ -113,13 +113,16 @@ impl HidapiTransport {
         Self::open_with("OnlyKey", is_command_interface, TransportError::NotFound)
     }
 
-    /// Enumerate and open the attached FIDO security key's CTAPHID interface.
+    /// Enumerate and open every attached FIDO security key's CTAPHID
+    /// interface, in path order.
     ///
-    /// `device` is an optional path substring, for hosts with more than one
-    /// authenticator; without it the first (sorted) match is used. The
+    /// `device` is an optional path substring to narrow the choice; without
+    /// it the caller asks each device which one holds its credential. The
     /// OnlyKey's own FIDO interface is skipped unless `device` names it, so
     /// the token that serves the agent's other keys is not picked by accident.
-    pub fn open_fido(device: Option<&str>) -> Result<Self, TransportError> {
+    /// Interfaces that cannot be opened are skipped with a warning; if none
+    /// opens, the first error is returned.
+    pub fn open_all_fido(device: Option<&str>) -> Result<Vec<Self>, TransportError> {
         let device = device.map(str::to_owned);
         let filter = move |info: &DeviceInfo| {
             is_fido_candidate(
@@ -129,7 +132,22 @@ impl HidapiTransport {
                 device.as_deref(),
             )
         };
-        Self::open_with("FIDO security key", filter, TransportError::NoDevice)
+        let api = Self::refreshed_api()?;
+        let mut opened = Vec::new();
+        let mut first_error = None;
+        for info in Self::candidates(&api, filter) {
+            match Self::open_info(&api, info, "FIDO security key") {
+                Ok(transport) => opened.push(transport),
+                Err(e) => {
+                    tracing::warn!(path = %info.path().to_string_lossy(), error = %e, "cannot open FIDO security key");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if opened.is_empty() {
+            return Err(first_error.unwrap_or(TransportError::NoDevice));
+        }
+        Ok(opened)
     }
 
     /// Open the first enumerated interface matching `filter`.
@@ -138,20 +156,35 @@ impl HidapiTransport {
         filter: impl Fn(&DeviceInfo) -> bool,
         missing: TransportError,
     ) -> Result<Self, TransportError> {
+        let api = Self::refreshed_api()?;
+        let candidates = Self::candidates(&api, filter);
+        let Some(info) = candidates.first() else {
+            return Err(missing);
+        };
+        if candidates.len() > 1 {
+            tracing::warn!(count = candidates.len(), chosen = %info.path().to_string_lossy(), "several {label} interfaces matched");
+        }
+        Self::open_info(&api, info, label)
+    }
+
+    fn refreshed_api() -> Result<std::sync::MutexGuard<'static, HidApi>, TransportError> {
         let mut api = hid_api().lock().unwrap_or_else(|p| p.into_inner());
         api.refresh_devices()?;
+        Ok(api)
+    }
+
+    /// The interfaces matching `filter`, sorted and one per path.
+    fn candidates(api: &HidApi, filter: impl Fn(&DeviceInfo) -> bool) -> Vec<&DeviceInfo> {
         let mut candidates: Vec<&DeviceInfo> = api.device_list().filter(|d| filter(d)).collect();
         candidates.sort_by_key(|d| d.path().to_bytes().to_vec());
         // macOS lists a device once per top-level usage, all with one path.
         candidates.dedup_by_key(|d| d.path().to_bytes().to_vec());
-        let Some(info) = candidates.first() else {
-            return Err(missing);
-        };
+        candidates
+    }
+
+    fn open_info(api: &HidApi, info: &DeviceInfo, label: &str) -> Result<Self, TransportError> {
         let path = info.path().to_string_lossy().into_owned();
-        if candidates.len() > 1 {
-            tracing::warn!(count = candidates.len(), chosen = %path, "several {label} interfaces matched");
-        }
-        let device = match info.open_device(&api) {
+        let device = match info.open_device(api) {
             Ok(device) => device,
             Err(HidError::IoError { error })
                 if error.kind() == std::io::ErrorKind::PermissionDenied =>

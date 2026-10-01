@@ -9,6 +9,7 @@ use super::wire::{self, Request};
 use crate::challenge::{ChallengeSink, TouchRequest};
 use crate::device::{DeviceError, OnlyKey};
 use crate::fido::FidoError;
+use crate::fido::ctaphid::CtapHid;
 use crate::identity::KeySpec;
 use crate::keys;
 use crate::transport::{HidTransport, HidapiTransport};
@@ -37,12 +38,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub type Device = OnlyKey<Box<dyn HidTransport>>;
 /// How the agent obtains a device for each operation.
 pub type Opener = Arc<dyn Fn() -> Result<Device, DeviceError> + Send + Sync>;
-/// How the agent obtains a FIDO authenticator for each security-key signature.
-pub type SkOpener = Arc<dyn Fn() -> Result<Box<dyn HidTransport>, FidoError> + Send + Sync>;
+/// How the agent obtains the FIDO authenticators for each security-key
+/// signature. With more than one, the agent asks each which holds the key.
+pub type SkOpener = Arc<dyn Fn() -> Result<Vec<Box<dyn HidTransport>>, FidoError> + Send + Sync>;
 
-/// The default: the attached FIDO security key, discovered over hidraw.
+/// The default: every attached FIDO security key, discovered over hidraw.
 fn default_sk_opener() -> SkOpener {
-    Arc::new(|| Ok(Box::new(HidapiTransport::open_fido(None)?)))
+    Arc::new(|| {
+        Ok(HidapiTransport::open_all_fido(None)?
+            .into_iter()
+            .map(|t| Box::new(t) as Box<dyn HidTransport>)
+            .collect())
+    })
 }
 
 #[derive(Debug, Error)]
@@ -675,12 +682,12 @@ impl Agent {
     /// Sign with a FIDO credential, waiting for the authenticator's touch.
     fn sign_security_key(&self, key: &SkKey, data: &[u8]) -> Result<Vec<u8>, AgentError> {
         let _guard = lock(&self.sk_lock);
-        let transport = (self.sk_opener)()?;
+        let mut hid = self.authenticator_for(key)?;
         let request = TouchRequest {
             identity: key.public_key().comment().to_owned(),
             subject: wire::describe_data(data),
         };
-        let sig = key.sign(transport, data, &|| {
+        let sig = key.sign_with(&mut hid, data, &|| {
             tracing::info!("security key is waiting for a touch");
             self.sink.present_touch(&request);
         })?;
@@ -691,6 +698,24 @@ impl Agent {
             "signed with security key"
         );
         Ok(wire::sign_response(&sig))
+    }
+
+    /// The attached authenticator to sign with `key`. A lone device is used
+    /// as is; among several, the first that answers a silent probe for the
+    /// credential is chosen, so no touch is asked of the others.
+    fn authenticator_for(&self, key: &SkKey) -> Result<CtapHid<Box<dyn HidTransport>>, AgentError> {
+        let mut devices: Vec<_> = (self.sk_opener)()?.into_iter().map(CtapHid::new).collect();
+        if devices.len() <= 1 {
+            return devices.pop().ok_or(AgentError::Fido(FidoError::NoDevice));
+        }
+        for (index, mut hid) in devices.into_iter().enumerate() {
+            match key.is_held_by(&mut hid) {
+                Ok(true) => return Ok(hid),
+                Ok(false) => tracing::debug!(index, "security key does not hold the credential"),
+                Err(e) => tracing::warn!(index, error = %e, "cannot probe security key"),
+            }
+        }
+        Err(FidoError::NoCredential.into())
     }
 
     /// The served token key whose public key blob is `key_blob`, if its
@@ -1750,6 +1775,57 @@ mod tests {
         assert!(agent.public_keys().is_empty());
     }
 
+    /// With two authenticators attached, the one holding the credential is
+    /// found by a silent probe and signs; the other is never asked to.
+    #[test]
+    fn the_authenticator_holding_the_credential_signs() {
+        use crate::agent::sk::SK_SSH_ED25519;
+        use crate::fido::fake::FakeFido;
+        use ssh_key::private::SkEd25519;
+        use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
+
+        let seed = [0x42u8; 32];
+        let handle = [9u8, 8, 7];
+        let probe = FakeFido::new(&seed, "ssh:", &handle, 0x01);
+        let public = SkEd25519Public::new(Ed25519PublicKey(probe.public()), "ssh:");
+        let key_blob = PublicKey::new(KeyData::SkEd25519(public.clone()), "two")
+            .to_bytes()
+            .unwrap();
+        let pair = SkEd25519::new(public, 0x01, handle).unwrap();
+        let mut add = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        SK_SSH_ED25519.encode(&mut add).unwrap();
+        pair.encode(&mut add).unwrap();
+        "two".encode(&mut add).unwrap();
+
+        let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
+        let sk_opener: SkOpener = Arc::new(move || {
+            // Another key, holding another credential, enumerates first.
+            let other = FakeFido::new(&[0x07; 32], "ssh:", &[1, 1, 1], 0x01).with_touch();
+            let holder = FakeFido::new(&seed, "ssh:", &handle, 0x01).with_touch();
+            Ok(vec![
+                Box::new(other) as Box<dyn HidTransport>,
+                Box::new(holder) as Box<dyn HidTransport>,
+            ])
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let agent = Agent::new(
+            Vec::new(),
+            opener,
+            Arc::clone(&sink) as Arc<dyn ChallengeSink>,
+        )
+        .with_sk_opener(sk_opener);
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        key_blob.encode(&mut sign).unwrap();
+        b"data".as_slice().encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        let reply = agent.handle(&sign);
+        assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+        // Only the real signature asked for a touch, not the probes.
+        assert_eq!(sink.1.lock().unwrap().len(), 1);
+    }
+
     /// An `sk-ssh-ed25519` key added with `ssh-add FILE` is listed, signs
     /// through the (fake) authenticator, and is removed by public key.
     #[test]
@@ -1777,7 +1853,7 @@ mod tests {
         let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
         let sk_opener: SkOpener = Arc::new(move || {
             let device = FakeFido::new(&seed, "ssh:", &handle, 0x01).with_touch();
-            Ok(Box::new(device) as Box<dyn HidTransport>)
+            Ok(vec![Box::new(device) as Box<dyn HidTransport>])
         });
         let sink = Arc::new(RecordingSink::default());
         let agent = Agent::new(
