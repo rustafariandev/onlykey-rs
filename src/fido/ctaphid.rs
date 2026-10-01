@@ -35,20 +35,19 @@ pub const CTAPHID_ERROR: u8 = TYPE_INIT | 0x3F;
 /// `KEEPALIVE` status: the authenticator is waiting for a touch.
 const STATUS_UPNEEDED: u8 = 0x02;
 
-/// How long to wait before retransmitting when the device says nothing at
-/// all, and how many times to try.
-const READ_TIMEOUT: Duration = Duration::from_millis(200);
-const RETRIES: usize = 15;
+/// How long one read waits before the loop checks its deadlines again.
+const POLL: Duration = Duration::from_millis(100);
+/// How long a device may take to send anything at all after a request. USB
+/// HID does not drop reports and CTAPHID has no retransmission, so silence is
+/// waited out rather than answered with a resend: an OnlyKey takes ~350 ms
+/// to start on a getAssertion, and a resend would start a second one.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a device may go quiet between packets once it has answered. The
+/// specification suggests a keepalive every 100 ms; an OnlyKey leaves ~260 ms.
+const PACKET_GAP: Duration = Duration::from_secs(2);
 /// How long to wait in all once the device has started working on a request
 /// (sending keepalives), typically for a touch.
 const TOUCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The result of one read loop: a complete reply, or silence that merits a
-/// retransmission.
-enum Outcome {
-    Got(Vec<u8>),
-    Silent,
-}
 
 /// A CTAPHID channel bound to an open transport.
 pub struct CtapHid<T: HidTransport> {
@@ -89,21 +88,8 @@ impl<T: HidTransport> CtapHid<T> {
     pub fn init(&mut self) -> Result<(), FidoError> {
         self.cid = CID_BROADCAST;
         let nonce = nonce()?;
-        let packets = self.frame(CTAPHID_INIT, &nonce)?;
-        let mut reply = None;
-        for _ in 0..RETRIES {
-            for packet in &packets {
-                self.transport.write_report(packet)?;
-            }
-            match self.receive(CTAPHID_INIT, &|| {})? {
-                Outcome::Got(data) => {
-                    reply = Some(data);
-                    break;
-                }
-                Outcome::Silent => continue,
-            }
-        }
-        let reply = reply.ok_or(FidoError::Timeout)?;
+        self.send(CTAPHID_INIT, &nonce)?;
+        let reply = self.receive(CTAPHID_INIT, &|| {})?;
         if reply.len() < 17 || reply[..8] != nonce {
             return Err(FidoError::Protocol("bad CTAPHID_INIT reply"));
         }
@@ -114,11 +100,10 @@ impl<T: HidTransport> CtapHid<T> {
     /// Send one message and wait for its reply. `on_presence` is called once
     /// if the device asks the user to touch it.
     ///
-    /// The request is resent only while the device has said nothing at all.
-    /// Once it has acknowledged the request with a keepalive, resending would
-    /// start a second operation (and ask for a second touch), so a device
-    /// that then goes quiet or is not touched in time gets a
-    /// `CTAPHID_CANCEL` and the call fails with [`FidoError::Timeout`].
+    /// The request is sent once. A device that says nothing for
+    /// [`RESPONSE_TIMEOUT`], goes quiet for [`PACKET_GAP`] after it has
+    /// answered, or is not touched in time gets a `CTAPHID_CANCEL`, and the
+    /// call fails with [`FidoError::Timeout`].
     pub fn transact(
         &mut self,
         cmd: u8,
@@ -128,17 +113,16 @@ impl<T: HidTransport> CtapHid<T> {
         if self.cid == CID_BROADCAST {
             self.init()?;
         }
-        let packets = self.frame(cmd, payload)?;
-        for _ in 0..RETRIES {
-            for packet in &packets {
-                self.transport.write_report(packet)?;
-            }
-            match self.receive(cmd, on_presence)? {
-                Outcome::Got(data) => return Ok(data),
-                Outcome::Silent => continue,
-            }
+        self.send(cmd, payload)?;
+        self.receive(cmd, on_presence)
+    }
+
+    /// Write `payload` as one message for `cmd` on the current channel.
+    fn send(&mut self, cmd: u8, payload: &[u8]) -> Result<(), FidoError> {
+        for packet in &self.frame(cmd, payload)? {
+            self.transport.write_report(packet)?;
         }
-        Err(FidoError::Timeout)
+        Ok(())
     }
 
     /// Split `payload` into packets for `cmd` on the current channel.
@@ -172,27 +156,24 @@ impl<T: HidTransport> CtapHid<T> {
     }
 
     /// Wait for the reply to `expected`, ignoring packets from other
-    /// channels. Returns `Silent` if nothing at all arrives before the
-    /// retransmit timeout. After a keepalive, silence or the touch timeout
-    /// cancels the request instead.
-    fn receive(&mut self, expected: u8, on_presence: &dyn Fn()) -> Result<Outcome, FidoError> {
-        let mut deadline = Instant::now() + READ_TIMEOUT;
+    /// channels. Silence past the deadline, or the touch timeout once the
+    /// device is busy, cancels the request.
+    fn receive(&mut self, expected: u8, on_presence: &dyn Fn()) -> Result<Vec<u8>, FidoError> {
+        let mut deadline = Instant::now() + RESPONSE_TIMEOUT;
         // Set by the first keepalive and never extended, so a device that
         // keeps sending keepalives cannot hold the caller forever.
         let mut busy_until: Option<Instant> = None;
         let mut notified = false;
         loop {
             let now = Instant::now();
-            if let Some(at) = busy_until
-                && (now >= at || now >= deadline)
-            {
-                self.cancel();
+            if now >= deadline || busy_until.is_some_and(|at| now >= at) {
+                // There is no request to abandon before a channel exists.
+                if expected != CTAPHID_INIT {
+                    self.cancel();
+                }
                 return Err(FidoError::Timeout);
             }
-            if now >= deadline {
-                return Ok(Outcome::Silent);
-            }
-            let wait = READ_TIMEOUT.min(deadline - now);
+            let wait = POLL.min(deadline - now);
             let Some(packet) = self.transport.read_report(wait)? else {
                 continue;
             };
@@ -210,11 +191,11 @@ impl<T: HidTransport> CtapHid<T> {
                     // for so long in all.
                     let now = Instant::now();
                     busy_until.get_or_insert(now + self.touch_timeout);
-                    deadline = now + READ_TIMEOUT;
+                    deadline = now + PACKET_GAP;
                 }
                 CTAPHID_ERROR => return Err(FidoError::Hid(packet[7])),
                 cmd if cmd == expected => {
-                    return Ok(Outcome::Got(self.read_message(&packet, &mut deadline)?));
+                    return self.read_message(&packet);
                 }
                 cmd => return Err(FidoError::Unexpected { cmd, expected }),
             }
@@ -234,11 +215,7 @@ impl<T: HidTransport> CtapHid<T> {
     }
 
     /// Collect a first packet plus its continuations into one message.
-    fn read_message(
-        &mut self,
-        first: &Report,
-        deadline: &mut Instant,
-    ) -> Result<Vec<u8>, FidoError> {
+    fn read_message(&mut self, first: &Report) -> Result<Vec<u8>, FidoError> {
         let len = ((first[5] as usize) << 8) | first[6] as usize;
         if len > MAX_MESSAGE {
             return Err(FidoError::TooLarge(len));
@@ -248,14 +225,14 @@ impl<T: HidTransport> CtapHid<T> {
         out.extend_from_slice(&first[7..7 + head]);
 
         // Continuations follow promptly; keepalives are not expected here.
-        *deadline = Instant::now() + READ_TIMEOUT;
+        let deadline = Instant::now() + PACKET_GAP;
         let mut seq = 0u8;
         while out.len() < len {
             let now = Instant::now();
-            if now >= *deadline {
+            if now >= deadline {
                 return Err(FidoError::Timeout);
             }
-            let wait = READ_TIMEOUT.min(*deadline - now);
+            let wait = POLL.min(deadline - now);
             let Some(packet) = self.transport.read_report(wait)? else {
                 continue;
             };
@@ -367,6 +344,81 @@ mod tests {
         assert_eq!(CTAPHID_INIT, 0x86);
         assert_eq!(CTAPHID_CBOR, 0x90);
         assert_eq!(CTAPHID_KEEPALIVE, 0xBB);
+    }
+
+    /// A device that replies on a schedule, measured from the first write,
+    /// and records every write.
+    struct Paced {
+        replies: std::collections::VecDeque<(Duration, Report)>,
+        writes: Vec<Report>,
+        started: Option<Instant>,
+    }
+
+    impl HidTransport for Paced {
+        fn write_report(
+            &mut self,
+            report: &Report,
+        ) -> Result<(), crate::transport::TransportError> {
+            self.started.get_or_insert_with(Instant::now);
+            self.writes.push(*report);
+            Ok(())
+        }
+
+        fn read_report(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<Report>, crate::transport::TransportError> {
+            let (Some(started), Some(&(at, report))) = (self.started, self.replies.front()) else {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            };
+            let due = started + at;
+            let now = Instant::now();
+            if due > now + timeout {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+            std::thread::sleep(due.saturating_duration_since(now));
+            self.replies.pop_front();
+            Ok(Some(report))
+        }
+    }
+
+    /// An OnlyKey's timing, measured on hardware: nothing for ~340 ms, two
+    /// keepalives, then ~260 ms more before the reply. The request is sent
+    /// once and the reply is received; nothing is resent or cancelled.
+    #[test]
+    fn a_slow_device_is_waited_for_not_resent() {
+        let packet = |cmd: u8, byte: u8| {
+            let mut p = [0u8; 64];
+            p[..4].copy_from_slice(&1u32.to_be_bytes());
+            p[4] = cmd;
+            p[6] = 1;
+            p[7] = byte;
+            p
+        };
+        let transport = Paced {
+            replies: [
+                (
+                    Duration::from_millis(340),
+                    packet(CTAPHID_KEEPALIVE, STATUS_UPNEEDED),
+                ),
+                (Duration::from_millis(341), packet(CTAPHID_KEEPALIVE, 0x01)),
+                (Duration::from_millis(600), packet(CTAPHID_CBOR, 0x00)),
+            ]
+            .into(),
+            writes: Vec::new(),
+            started: None,
+        };
+        let mut hid = CtapHid::new(transport);
+        hid.cid = 1;
+        let prompts = std::cell::Cell::new(0);
+        let reply = hid.transact(CTAPHID_CBOR, &[0x42], &|| prompts.set(prompts.get() + 1));
+        assert_eq!(reply.unwrap(), vec![0x00]);
+        assert_eq!(prompts.get(), 1);
+        let writes = hid.into_transport().writes;
+        assert_eq!(writes.len(), 1, "the request was resent or cancelled");
+        assert_eq!(writes[0], packet(CTAPHID_CBOR, 0x42));
     }
 
     /// After a keepalive, the request is not resent: when the touch timeout
