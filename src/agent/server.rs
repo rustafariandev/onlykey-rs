@@ -101,7 +101,17 @@ pub struct Agent {
     cache: Mutex<HashMap<KeySpec, PublicKey>>,
     /// `ssh-add -x` state: a salted hash of the passphrase while locked.
     passphrase_lock: Mutex<Option<PassphraseHash>>,
+    /// Wrong unlock passphrases since the last good one, which slow down
+    /// each further failure (see [`Self::handle_unlock`]).
+    unlock_failures: Mutex<u32>,
+    /// Delay added per recorded failure; a field so tests can shorten it.
+    unlock_backoff: Duration,
 }
+
+/// Delay per failed unlock, as in OpenSSH: 0.1 s more for each failure.
+const UNLOCK_BACKOFF: Duration = Duration::from_millis(100);
+/// Failures counted at most, so the delay tops out at 10 s.
+const MAX_UNLOCK_FAILURES: u32 = 100;
 
 /// A served identity with an optional expiry from the lifetime constraint of
 /// an `ssh-add -t` request.
@@ -185,6 +195,8 @@ impl Agent {
             sk_lock: Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
             passphrase_lock: Mutex::new(None),
+            unlock_failures: Mutex::new(0),
+            unlock_backoff: UNLOCK_BACKOFF,
         }
     }
 
@@ -597,14 +609,29 @@ impl Agent {
 
     /// `ssh-add -X`: unlock if the passphrase matches. Fails when the agent
     /// is not locked.
+    ///
+    /// A wrong passphrase is answered only after a delay that grows by 0.1 s
+    /// with each failure, up to 10 s, as OpenSSH does, so the passphrase
+    /// cannot be guessed quickly through the socket.
     fn handle_unlock(&self, passphrase: &[u8]) -> Vec<u8> {
-        if self.unlock(passphrase) {
-            tracing::info!("agent unlocked");
-            wire::success()
-        } else {
-            tracing::warn!("unlock request refused: not locked or wrong passphrase");
-            wire::failure()
+        if !self.is_locked() {
+            tracing::warn!("unlock request refused: agent is not locked");
+            return wire::failure();
         }
+        if self.unlock(passphrase) {
+            *lock(&self.unlock_failures) = 0;
+            tracing::info!("agent unlocked");
+            return wire::success();
+        }
+        let failures = {
+            let mut failures = lock(&self.unlock_failures);
+            *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
+            *failures
+        };
+        let delay = self.unlock_backoff * failures;
+        tracing::warn!(failures, ?delay, "unlock request refused: wrong passphrase");
+        std::thread::sleep(delay);
+        wire::failure()
     }
 
     /// Answer an `SSH_AGENTC_EXTENSION` request with the handler registered
@@ -1179,6 +1206,30 @@ mod tests {
         // Unlocking an unlocked agent fails.
         assert_eq!(agent.handle(&unlock), wire::failure());
         assert_eq!(agent.public_keys(), vec![key]);
+    }
+
+    /// Each wrong unlock passphrase waits longer than the last; the right one
+    /// answers at once and resets the count.
+    #[test]
+    fn wrong_unlock_passphrases_are_slowed_down() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let mut agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        agent.unlock_backoff = Duration::from_millis(20);
+        assert!(agent.lock(b"hunter2"));
+
+        let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter3".as_slice().encode(&mut wrong).unwrap();
+        for failures in 1..=3u32 {
+            let started = Instant::now();
+            assert_eq!(agent.handle(&wrong), wire::failure());
+            assert!(started.elapsed() >= Duration::from_millis(20) * failures);
+            assert_eq!(*agent.unlock_failures.lock().unwrap(), failures);
+        }
+
+        let mut right = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut right).unwrap();
+        assert_eq!(agent.handle(&right), wire::success());
+        assert_eq!(*agent.unlock_failures.lock().unwrap(), 0);
     }
 
     /// While locked, only listing, unlock and extensions are served: every
