@@ -10,8 +10,9 @@
 //! the same way; see [`KeySpec::stored`] and [`KeySpec::rsa`].
 //!
 //! A plain ed25519, RSA or ECDSA (nistp256/384/521) private key, or a DSA one
-//! with the `dsa` feature, can also be loaded into a running agent with `ssh-add FILE`; the agent signs with it
-//! in memory, with no token and no challenge. The key types the agent can load
+//! with the `dsa` feature, can also be loaded into a running agent with
+//! `ssh-add FILE`; the agent signs with it in memory, with no token and no
+//! challenge. The key types the agent can load
 //! are pluggable: implement [`agent::KeyDecoder`] and register it with
 //! [`agent::Agent::register_key_type`]. In-memory keys are signed by a
 //! [`agent::local::LocalKey`] implementation.
