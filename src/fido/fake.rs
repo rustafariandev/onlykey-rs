@@ -6,6 +6,7 @@
 //! agent path — CTAPHID framing, CBOR, signature assembly and verification —
 //! run against a device that actually signs, with no hardware.
 
+use super::ctap::AUTHENTICATOR_GET_ASSERTION;
 use super::ctaphid::{CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_INIT, CTAPHID_KEEPALIVE};
 use crate::protocol::Report;
 use crate::transport::{HidTransport, TransportError};
@@ -151,7 +152,12 @@ impl FakeFido {
     }
 
     fn process(&mut self, cmd: u8, message: &[u8]) {
-        let Some(request) = parse_request(message) else {
+        // A CTAP2 message is a command byte, then that command's CBOR.
+        let Some((&AUTHENTICATOR_GET_ASSERTION, params)) = message.split_first() else {
+            self.push_message(self.cid, cmd, &[0x01]); // CTAP1_ERR_INVALID_COMMAND
+            return;
+        };
+        let Some(request) = parse_request(params) else {
             self.push_message(self.cid, cmd, &[0x12]); // CTAP2_ERR_INVALID_CBOR
             return;
         };

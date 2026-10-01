@@ -11,6 +11,10 @@ use super::ctaphid::{CTAPHID_CBOR, CtapHid};
 use crate::transport::HidTransport;
 use minicbor::{Decoder, Encoder};
 
+/// The CTAP2 command byte of `authenticatorGetAssertion`, which precedes the
+/// CBOR parameters in a `CTAPHID_CBOR` message.
+pub const AUTHENTICATOR_GET_ASSERTION: u8 = 0x02;
+
 /// A successful `getAssertion` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assertion {
@@ -53,7 +57,7 @@ fn encode_request(
     key_handle: &[u8],
     up: bool,
 ) -> Result<Vec<u8>, FidoError> {
-    let mut buffer = Vec::new();
+    let mut buffer = vec![AUTHENTICATOR_GET_ASSERTION];
     let mut e = Encoder::new(&mut buffer);
     e.map(4)
         .and_then(|e| e.u8(1))
@@ -120,7 +124,9 @@ mod tests {
     #[test]
     fn request_has_the_expected_shape() {
         let request = encode_request("ssh:", &[0xAB; 32], &[0x01, 0x02], true).unwrap();
-        let mut d = Decoder::new(&request);
+        let (&command, params) = request.split_first().unwrap();
+        assert_eq!(command, AUTHENTICATOR_GET_ASSERTION);
+        let mut d = Decoder::new(params);
         assert_eq!(d.map().unwrap(), Some(4));
         assert_eq!(d.u8().unwrap(), 1);
         assert_eq!(d.str().unwrap(), "ssh:");
