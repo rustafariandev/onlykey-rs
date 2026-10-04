@@ -22,7 +22,9 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 dist="$root/dist"
 engine="${CONTAINER_ENGINE:-podman}"
-rustup_version="${RUSTUP_VERSION:-stable}"
+# A fixed release, so a package build does not change with whatever
+# "stable" is that day; override with RUSTUP_VERSION.
+rustup_version="${RUSTUP_VERSION:-1.98.1}"
 
 mkdir -p "$dist"
 

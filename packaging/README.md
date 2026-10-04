@@ -24,8 +24,8 @@ onlykey-agent = { git = "https://github.com/rustafariandev/onlykey-rs" }
 
 The crate uses `edition = "2024"` and therefore needs **rustc >= 1.85**. The
 toolchains shipped by Debian 12 (1.63), Ubuntu 22.04 (1.75) and RHEL 8/9 are
-older, so every source build installs a pinned rustup toolchain inside a
-distro-matched container and then builds against that distro's glibc. The
+older, so every source build installs a pinned rustup toolchain (1.98.1;
+`RUSTUP_VERSION` overrides it) inside a distro-matched container and then builds against that distro's glibc. The
 resulting `Depends`/`Requires` are correct for the target, and the RPM built
 on Rocky 8 (glibc 2.28) runs forward on EL9/EL10 and Fedora. The static musl
 tarball needs no libc at all.
@@ -102,8 +102,15 @@ git push origin HEAD --follow-tags
 `Cargo.lock`, `packaging/debian/changelog`, `packaging/arch/PKGBUILD` and
 `packaging/rpm/okagent.spec`, then creates the annotated `vX.Y.Z` tag. The
 tag triggers `.github/workflows/release.yml`, which builds every artifact on
-GitHub runners and attaches them (with `SHA256SUMS`) to the release. CI
-(`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Linux and
+GitHub runners and attaches them (with `SHA256SUMS`) to the release, along
+with a signed build-provenance attestation for each file. To check that a
+downloaded file was built by that workflow from this repository:
+
+```sh
+gh attestation verify okagent-*.tar.gz --repo rustafariandev/onlykey-rs
+```
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Linux and
 macOS for every push and pull request.
 
 ## Layout

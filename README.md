@@ -503,7 +503,12 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   `Agent::with_key_type` (or `register_key_type`); the built-in ed25519, RSA,
   ECDSA, FIDO `sk-` and (with the `dsa` feature) DSA types are registered the same way, and a later
   registration under a name wins. An in-memory key is signed by a
-  `LocalKey` implementation. SSH protocol extension
+  `LocalKey` implementation. RSA keys are signed with the `rsa` crate, whose
+  private-key operations are not constant-time (RUSTSEC-2023-0071, the
+  Marvin attack; no fixed release exists yet): a client that can time many
+  signatures, such as a host the agent is forwarded to, may learn about the
+  key. Prefer ed25519 or ECDSA for keys loaded into the agent, or keep RSA
+  keys on the OnlyKey. SSH protocol extension
   requests are pluggable too: implement `onlykey_agent::agent::Extension` and
   register it with `Agent::with_extension` (or `register_extension`), and the
   handler answers the `SSH_AGENTC_EXTENSION` requests whose name it matches,
