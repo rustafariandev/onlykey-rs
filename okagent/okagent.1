@@ -202,8 +202,11 @@ The lifetime constraint of
 is honoured and the PIN is ignored.
 The confirm constraint
 .RB ( "ssh-add \-c" )
-is honoured: the user is asked to allow each signature, on the terminal or
-through the notify command.
+is honoured: the user is asked to allow each signature, on the terminal
+while okagent runs in the foreground there, else through the askpass program
+(see
+.BR \-\-askpass );
+with neither, the signature is refused.
 Destination constraints
 .RB ( "ssh-add \-h" )
 are stored and enforced: the
@@ -250,7 +253,8 @@ also need the authenticator's PIN, which is asked for with
 .B \-\-askpass
 (or
 .BR SSH_ASKPASS ),
-or else on the terminal, before the touch.
+or else on the terminal while okagent runs in the foreground there, before
+the touch.
 A wrong PIN is asked for again, showing the tries left; after three wrong
 PINs in a row the authenticator must be unplugged and plugged back in.
 With no askpass program and no terminal such a key is refused.
@@ -1014,6 +1018,11 @@ is used on macOS and
 .IR /tmp/okagent\- uid /agent.sock
 elsewhere.
 The socket and its directory are created with owner-only permissions.
+An existing directory is used only if it belongs to the user or root and
+others cannot write to it (unless it is sticky, like
+.IR /tmp );
+otherwise okagent refuses to start, since another user could swap in a
+socket of their own.
 .TP
 .IR $XDG_RUNTIME_DIR/okagent/run\- pid .sock
 Temporary socket used by

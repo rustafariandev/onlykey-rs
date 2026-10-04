@@ -31,9 +31,12 @@ pure-Rust CTAP2 client, with no C library involved.
 - A Rust toolchain (edition 2024).
 - Linux: no C libraries, the HID backend is pure Rust and reads
   `/dev/hidraw*` directly. A udev rule is needed so the device can be opened
-  without root: copy `49-onlykey.rules` from the
-  [OnlyKey docs](https://docs.crp.to/linux.html) to `/etc/udev/rules.d/` and
-  replug the device. "Permission denied" means the rule is missing.
+  without root: copy `packaging/common/49-onlykey.rules` to
+  `/etc/udev/rules.d/` and replug the device (the packages install it).
+  "Permission denied" means the rule is missing. It grants the device to the
+  user at the active local session; the rule from the
+  [OnlyKey docs](https://docs.crp.to/linux.html) instead lets every local
+  user use the token.
 - macOS: the Xcode Command Line Tools (`xcode-select --install`), which
   build hidapi's IOKit backend. No driver or permission setup is needed.
 
@@ -81,16 +84,15 @@ which key to log in with. Use an empty long-lived agent in place of
 tools:
 
 ```sh
-okagent serve &                       # or: eval "$(okagent serve --daemon)"
-export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR:-/tmp}/okagent/agent.sock"
+eval "$(okagent serve --daemon)"      # starts the agent, sets SSH_AUTH_SOCK
 ssh-add ~/.ssh/id_ed25519             # a plain key, signed in memory
 ssh-add -s ferris@example.com         # an OnlyKey key, derived on demand
 ssh-add -c ~/.ssh/id_ed25519          # ...and confirm each use from now on
 ```
 
-A key added with `ssh-add -c` asks before every signature, on the terminal or
-through the `--askpass` program, and a background agent can report it with
-`--notify-command`. Destination-constrained keys (`ssh-add -h`) are
+A key added with `ssh-add -c` asks before every signature: on the terminal
+while okagent runs in the foreground there, else through the `--askpass`
+program; with neither, the signature is refused. Destination-constrained keys (`ssh-add -h`) are
 served only on a connection the OpenSSH client has bound to a permitted host
 with its `session-bind@openssh.com` extension. `--key-lifetime SECONDS` gives
 keys added later a default lifetime, as `ssh-agent -t` does.
@@ -484,7 +486,7 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   are the certificates of `ssh-add -s IDENTITY CERT…`
   (`associated-certs-v00@openssh.com`). The provider's PIN is ignored. The
   confirm constraint (`ssh-add -c`) is honoured: the user is asked to allow
-  each signature, on the terminal or through the notify command. Destination
+  each signature, on the terminal or through the askpass program. Destination
   constraints (`ssh-add -h`, `restrict-destination-v00@openssh.com`) are
   stored and enforced: the OpenSSH client's `session-bind@openssh.com`
   extension is verified against the server's host-key signature and recorded
@@ -518,8 +520,8 @@ Differences from the Python agent:
 
 - A payload whose length is a multiple of 57 is sent correctly (the Python
   client never terminates it and the device times out).
-- The socket is created with owner-only permissions, and a live socket is
-  never replaced.
+- The socket is created with owner-only permissions in a directory other
+  users cannot write to, and a live socket is never replaced.
 - The challenge prompt goes to the terminal or a notify command, not stdout.
 
 ## Development

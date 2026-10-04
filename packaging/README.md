@@ -121,6 +121,8 @@ packaging/
 Makefile                    wrappers over the scripts
 ```
 
-The udev rule is taken from <https://docs.crp.to/linux.html> and shipped
-verbatim, including its `MODE:="0666"` line; the comments in the file
-describe how to tighten it to an owner or group.
+The udev rule is taken from <https://docs.crp.to/linux.html>, with its
+`MODE:="0666"` (read and write for every local user) replaced by
+`TAG+="uaccess"`, which grants the device to the user at the active local
+session only. The comments in the file describe how to grant it to an owner
+or group instead, for machines without a local session.

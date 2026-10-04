@@ -10,6 +10,7 @@ Files: packaging/common/49-onlykey.rules
 Copyright: OnlyKey / CryptoTrust
 Comment: Bundled so the token can be opened without root; taken from
  https://docs.crp.to/linux.html and https://github.com/trustcrypto/trustcrypto.github.io
+ and modified to grant access through uaccess instead of to every user.
 License: MIT
 
 License: MIT

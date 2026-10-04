@@ -23,7 +23,7 @@ use ssh_key::HashAlg;
 use ssh_key::PublicKey;
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1004,18 +1004,21 @@ impl Agent {
             tracing::warn!("unlock request refused: agent is not locked");
             return wire::failure();
         }
+        // Held through the delay, so guesses are taken one at a time however
+        // many connections send them.
+        let mut failures = lock(&self.unlock_failures);
         if self.unlock(passphrase) {
-            *lock(&self.unlock_failures) = 0;
+            *failures = 0;
             tracing::info!("agent unlocked");
             return wire::success();
         }
-        let failures = {
-            let mut failures = lock(&self.unlock_failures);
-            *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
-            *failures
-        };
-        let delay = self.unlock_backoff * failures;
-        tracing::warn!(failures, ?delay, "unlock request refused: wrong passphrase");
+        *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
+        let delay = self.unlock_backoff * *failures;
+        tracing::warn!(
+            failures = *failures,
+            ?delay,
+            "unlock request refused: wrong passphrase"
+        );
         std::thread::sleep(delay);
         wire::failure()
     }
@@ -1512,6 +1515,10 @@ pub enum SocketError {
     AlreadyRunning(PathBuf),
     #[error("cannot create socket directory {path}: {source}")]
     Directory { path: PathBuf, source: io::Error },
+    #[error("refusing socket directory {path}: {reason}")]
+    UnsafeDirectory { path: PathBuf, reason: &'static str },
+    #[error("refusing to replace {0}, which is not a socket")]
+    NotASocket(PathBuf),
     #[error("cannot bind {path}: {source}")]
     Bind { path: PathBuf, source: io::Error },
 }
@@ -1533,16 +1540,29 @@ impl Drop for SocketGuard {
 
 /// Create the listening socket with owner-only permissions.
 ///
-/// A stale socket file is replaced; a live one is an error.
+/// A missing directory is created owner-only. An existing one must be safe
+/// from other users (see [`check_socket_dir`]), since whoever can rename
+/// the socket can put their own in its place and receive the keys `ssh-add`
+/// sends. A stale socket file is replaced; a live one, or a file that is
+/// not a socket, is an error.
 pub fn bind_socket(path: &Path) -> Result<(UnixListener, SocketGuard), SocketError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|source| SocketError::Directory {
-            path: dir.to_owned(),
-            source,
-        })?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        if !dir.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(|source| SocketError::Directory {
+                    path: dir.to_owned(),
+                    source,
+                })?;
+        }
+        check_socket_dir(dir)?;
     }
-    if path.exists() {
+    if let Ok(existing) = std::fs::symlink_metadata(path) {
+        if !existing.file_type().is_socket() {
+            return Err(SocketError::NotASocket(path.to_owned()));
+        }
         match UnixStream::connect(path) {
             Ok(_) => return Err(SocketError::AlreadyRunning(path.to_owned())),
             Err(_) => {
@@ -1558,6 +1578,39 @@ pub fn bind_socket(path: &Path) -> Result<(UnixListener, SocketGuard), SocketErr
         source,
     })?;
     Ok((listener, SocketGuard(path.to_owned())))
+}
+
+/// Refuse a socket directory another user controls: one owned by someone
+/// other than this user or root, one others can write to without the sticky
+/// bit (which keeps them from renaming our socket, as in `/tmp`), or a
+/// symlink another user owns, as a pre-created `/tmp/okagent-<uid>` would be.
+fn check_socket_dir(dir: &Path) -> Result<(), SocketError> {
+    let refuse = |reason| SocketError::UnsafeDirectory {
+        path: dir.to_owned(),
+        reason,
+    };
+    let unreadable = |source| SocketError::Directory {
+        path: dir.to_owned(),
+        source,
+    };
+    let uid = nix::unistd::getuid().as_raw();
+    let trusted = |owner: u32| owner == uid || owner == 0;
+    let link = std::fs::symlink_metadata(dir).map_err(unreadable)?;
+    if link.file_type().is_symlink() && !trusted(link.uid()) {
+        return Err(refuse("it is a symlink owned by another user"));
+    }
+    let meta = std::fs::metadata(dir).map_err(unreadable)?;
+    if !meta.is_dir() {
+        return Err(refuse("it is not a directory"));
+    }
+    if !trusted(meta.uid()) {
+        return Err(refuse("it is owned by another user"));
+    }
+    let sticky = meta.mode() & 0o1000 != 0;
+    if meta.mode() & 0o022 != 0 && !sticky {
+        return Err(refuse("other users can write to it"));
+    }
+    Ok(())
 }
 
 /// Where the agent listens by default: `$XDG_RUNTIME_DIR/okagent/agent.sock`,
@@ -1889,6 +1942,33 @@ mod tests {
         b"hunter2".as_slice().encode(&mut right).unwrap();
         assert_eq!(agent.handle(&right), wire::success());
         assert_eq!(*agent.unlock_failures.lock().unwrap(), 0);
+    }
+
+    /// Guesses sent on parallel connections wait their turn, so more
+    /// connections do not mean more guesses per second.
+    #[test]
+    fn parallel_unlock_guesses_are_taken_one_at_a_time() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let mut agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        agent.unlock_backoff = Duration::from_millis(20);
+        assert!(agent.lock(b"hunter2"));
+        let agent = Arc::new(agent);
+
+        let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter3".as_slice().encode(&mut wrong).unwrap();
+        let started = Instant::now();
+        let guesses: Vec<_> = (0..4)
+            .map(|_| {
+                let agent = Arc::clone(&agent);
+                let wrong = wrong.clone();
+                std::thread::spawn(move || agent.handle(&wrong))
+            })
+            .collect();
+        for guess in guesses {
+            assert_eq!(guess.join().unwrap(), wire::failure());
+        }
+        // 20 + 40 + 60 + 80 ms one after another.
+        assert!(started.elapsed() >= Duration::from_millis(200));
     }
 
     /// While locked, only listing, unlock and extensions are served: every
@@ -3190,8 +3270,10 @@ mod tests {
         let path = dir.path().join("sub").join("agent.sock");
         let (listener, guard) = bind_socket(&path).unwrap();
         assert!(path.exists());
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&path).unwrap().mode();
         assert_eq!(mode & 0o077, 0, "socket mode {mode:o} is not owner-only");
+        let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "directory mode {dir_mode:o}");
         assert!(matches!(
             bind_socket(&path),
             Err(SocketError::AlreadyRunning(_))
@@ -3199,9 +3281,43 @@ mod tests {
         drop(listener);
         drop(guard);
         assert!(!path.exists());
-        // A stale file is replaced.
-        std::fs::write(&path, b"").unwrap();
+        // A stale socket is replaced.
+        drop(UnixListener::bind(&path).unwrap());
         let (_l, _g) = bind_socket(&path).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_socket_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        std::fs::write(&path, b"private key").unwrap();
+        assert!(matches!(
+            bind_socket(&path),
+            Err(SocketError::NotASocket(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"private key");
+    }
+
+    /// A directory others can write to, as a pre-created `/tmp/okagent-<uid>`
+    /// would be, is refused rather than used or fixed up.
+    #[test]
+    fn a_socket_directory_others_can_write_to_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("okagent");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            bind_socket(&shared.join("agent.sock")),
+            Err(SocketError::UnsafeDirectory { .. })
+        ));
+        // With the sticky bit, others cannot rename the socket away.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let (_l, _g) = bind_socket(&shared.join("agent.sock")).unwrap();
+        // An existing directory's mode is left as it was.
+        let mode = std::fs::metadata(&shared).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o1777);
     }
 
     use ssh_encoding::Encode;

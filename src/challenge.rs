@@ -38,10 +38,10 @@ impl Challenge {
             .as_deref()
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        format!(
+        printable(&format!(
             "OnlyKey: enter {a} {b} {c} to sign as {}{slot}{subject}, or press any button if challenge mode is off",
             self.identity
-        )
+        ))
     }
 }
 
@@ -62,10 +62,10 @@ impl TouchRequest {
             .as_deref()
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        format!(
+        printable(&format!(
             "Security key: touch it to sign as {}{subject}",
             self.identity
-        )
+        ))
     }
 }
 
@@ -89,10 +89,10 @@ impl ConfirmRequest {
             .as_deref()
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        format!(
+        printable(&format!(
             "Allow use of key {}{subject}? Key fingerprint {}. (yes/no)",
             self.identity, self.fingerprint
-        )
+        ))
     }
 }
 
@@ -128,11 +128,31 @@ impl PinRequest {
             Some(n) => format!(", {n} tries left"),
             None => String::new(),
         };
-        format!(
+        printable(&format!(
             "{problem}Security key PIN to {}{subject}{retries}:",
             self.action
-        )
+        ))
     }
+}
+
+/// `text` with control characters and bidirectional overrides escaped, so a
+/// prompt stays one line that says what it seems to. Key comments and the
+/// signed data's description come from clients, which could otherwise move
+/// the cursor, rewrite the prompt or send terminal escape sequences.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let reorders = matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        );
+        if c.is_control() || reorders || c == '\u{2028}' || c == '\u{2029}' {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// What a [`PinPrompt`] got from the user.
@@ -242,19 +262,30 @@ fn answer(line: &str) -> PinAnswer {
 #[derive(Debug, Default)]
 pub struct TtyPin;
 
+/// The controlling terminal, opened for reading and writing, while this
+/// process is in its foreground process group. A background agent
+/// (`okagent serve &`, or one under `okagent shell`) shares the terminal with
+/// the user's shell: reading it would stop the agent with SIGTTIN, or take a
+/// line the user typed for another program as the answer.
+fn foreground_tty() -> Option<std::fs::File> {
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let foreground = nix::unistd::tcgetpgrp(&tty).ok()?;
+    (foreground == nix::unistd::getpgrp()).then_some(tty)
+}
+
 impl PinPrompt for TtyPin {
     fn available(&self) -> bool {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .is_ok()
+        foreground_tty().is_some()
     }
 
     fn pin(&self, request: &PinRequest) -> PinAnswer {
         use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 
-        let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        let Some(mut tty) = foreground_tty() else {
             return PinAnswer::Unavailable;
         };
         let Ok(saved) = tcgetattr(&tty) else {
@@ -389,12 +420,12 @@ impl ChallengeSink for TtyPrompt {
     }
 
     fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
-        let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
-            return None;
-        };
-        let Ok(reader) = tty.try_clone() else {
-            return None;
-        };
+        use nix::sys::termios::{FlushArg, tcflush};
+
+        let mut tty = foreground_tty()?;
+        let reader = tty.try_clone().ok()?;
+        // Drop typeahead, so only an answer typed after the prompt counts.
+        tcflush(&tty, FlushArg::TCIFLUSH).ok()?;
         if write!(tty, "{} ", request.message()).is_err() {
             return None;
         }
@@ -596,6 +627,24 @@ mod tests {
                 .message()
                 .contains("sign as ferris@example.com with stored key ECC3 (ssh login to host)")
         );
+    }
+
+    #[test]
+    fn messages_escape_control_and_bidi_characters() {
+        let r = ConfirmRequest {
+            identity: "a\u{202e}b".into(),
+            fingerprint: "SHA256:x".into(),
+            subject: Some("ssh\r\x1b[2KAllow harmless\n\u{9b}".into()),
+        };
+        let m = r.message();
+        assert!(!m.chars().any(|c| c.is_control()), "{m:?}");
+        assert!(!m.contains('\u{202e}'), "{m:?}");
+        assert!(m.contains(r"a\u{202e}b"), "{m:?}");
+        assert!(
+            m.contains(r"ssh\u{d}\u{1b}[2KAllow harmless\u{a}\u{9b}"),
+            "{m:?}"
+        );
+        assert!(m.contains("Key fingerprint SHA256:x."), "{m:?}");
     }
 
     #[test]
