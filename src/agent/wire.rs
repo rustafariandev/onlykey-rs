@@ -9,6 +9,7 @@ use ssh_encoding::{Decode, Encode};
 use ssh_key::{Algorithm, HashAlg, PublicKey, Signature};
 use std::io::{self, Read, Write};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// SSH v1 request for RSA identities, which some clients still send first.
 pub const SSH_AGENTC_REQUEST_RSA_IDENTITIES: u8 = 1;
@@ -116,9 +117,9 @@ pub enum Request {
     /// `ssh-add -D`: remove every identity.
     RemoveAllIdentities,
     /// `ssh-add -x`: lock the agent with a passphrase.
-    Lock(Vec<u8>),
+    Lock(Zeroizing<Vec<u8>>),
     /// `ssh-add -X`: unlock it again.
-    Unlock(Vec<u8>),
+    Unlock(Zeroizing<Vec<u8>>),
     /// `ssh-add -s`: add the key named by `provider`. `lifetime` is the
     /// constraint from `ssh-add -t` (seconds), if any; `pin` is accepted but
     /// unused. `certs` are the certificates given after the provider
@@ -126,7 +127,7 @@ pub enum Request {
     /// `ssh-add -c` and `-h` constraints.
     AddSmartcardKey {
         provider: Vec<u8>,
-        pin: Vec<u8>,
+        pin: Zeroizing<Vec<u8>>,
         lifetime: Option<u32>,
         confirm: bool,
         destination: Vec<DestinationConstraint>,
@@ -220,7 +221,7 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
         SSH_AGENTC_REMOVE_ALL_IDENTITIES => Ok(Request::RemoveAllIdentities),
         SSH_AGENTC_ADD_SMARTCARD_KEY => {
             let provider = Vec::<u8>::decode(&mut rest)?;
-            let pin = Vec::<u8>::decode(&mut rest)?;
+            let pin = Zeroizing::new(Vec::<u8>::decode(&mut rest)?);
             Ok(Request::AddSmartcardKey {
                 provider,
                 pin,
@@ -232,7 +233,7 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
         }
         SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => {
             let provider = Vec::<u8>::decode(&mut rest)?;
-            let pin = Vec::<u8>::decode(&mut rest)?;
+            let pin = Zeroizing::new(Vec::<u8>::decode(&mut rest)?);
             let constraints = parse_constraints(&mut rest)?;
             Ok(Request::AddSmartcardKey {
                 provider,
@@ -252,8 +253,8 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
             }
             Ok(Request::RemoveSmartcardKey { provider })
         }
-        SSH_AGENTC_LOCK => Ok(Request::Lock(Vec::<u8>::decode(&mut rest)?)),
-        SSH_AGENTC_UNLOCK => Ok(Request::Unlock(Vec::<u8>::decode(&mut rest)?)),
+        SSH_AGENTC_LOCK => Ok(Request::Lock(Zeroizing::new(Vec::decode(&mut rest)?))),
+        SSH_AGENTC_UNLOCK => Ok(Request::Unlock(Zeroizing::new(Vec::decode(&mut rest)?))),
         SSH_AGENTC_EXTENSION => {
             let name = String::decode(&mut rest)?;
             Ok(Request::Extension {
@@ -613,12 +614,12 @@ mod tests {
         b"hunter2".as_slice().encode(&mut body).unwrap();
         assert_eq!(
             parse_request(&body).unwrap(),
-            Request::Lock(b"hunter2".to_vec())
+            Request::Lock(Zeroizing::new(b"hunter2".to_vec()))
         );
         body[0] = SSH_AGENTC_UNLOCK;
         assert_eq!(
             parse_request(&body).unwrap(),
-            Request::Unlock(b"hunter2".to_vec())
+            Request::Unlock(Zeroizing::new(b"hunter2".to_vec()))
         );
         assert!(matches!(
             parse_request(&[SSH_AGENTC_LOCK, 0, 0]),
@@ -636,7 +637,7 @@ mod tests {
             parse_request(&body).unwrap(),
             Request::AddSmartcardKey {
                 provider: b"ferris@example.com".to_vec(),
-                pin: b"pin".to_vec(),
+                pin: Zeroizing::new(b"pin".to_vec()),
                 lifetime: None,
                 confirm: false,
                 destination: Vec::new(),
@@ -654,7 +655,7 @@ mod tests {
             parse_request(&constrained).unwrap(),
             Request::AddSmartcardKey {
                 provider: b"ferris@example.com".to_vec(),
-                pin: b"pin".to_vec(),
+                pin: Zeroizing::new(b"pin".to_vec()),
                 lifetime: Some(60),
                 confirm: false,
                 destination: Vec::new(),
@@ -930,9 +931,9 @@ mod tests {
 
     #[test]
     fn request_names_do_not_leak_secrets() {
-        let lock = Request::Lock(b"hunter2".to_vec());
+        let lock = Request::Lock(b"hunter2".to_vec().into());
         assert_eq!(lock.name(), "lock");
-        assert_eq!(Request::Unlock(b"hunter2".to_vec()).name(), "unlock");
+        assert_eq!(Request::Unlock(b"hunter2".to_vec().into()).name(), "unlock");
         assert_eq!(Request::RemoveAllIdentities.name(), "remove-all-identities");
         assert_eq!(Request::Unsupported(200).name(), "unsupported");
     }

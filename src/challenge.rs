@@ -316,12 +316,52 @@ impl PinPrompt for TtyPin {
         if write!(tty, "{} ", request.message()).is_err() {
             return PinAnswer::Unavailable;
         }
-        let mut line = Zeroizing::new(String::new());
-        match BufReader::new(&reader).read_line(&mut line) {
+        match read_secret_line(&reader) {
             // End of input (Ctrl-D) cancels.
-            Ok(0) => PinAnswer::Cancelled,
-            Ok(_) => answer(&line),
+            Ok(None) => PinAnswer::Cancelled,
+            Ok(Some(line)) => answer(&line),
             Err(_) => PinAnswer::Unavailable,
+        }
+    }
+}
+
+/// The longest line [`read_secret_line`] takes; CTAP2 PINs are at most 63
+/// bytes.
+const MAX_SECRET_LINE: usize = 256;
+
+/// Read one line a byte at a time into a buffer that never grows, so the
+/// returned, wiped one is the only copy: a `BufReader` would keep the PIN in
+/// its own buffer, and a growing `String` in each one it outgrew. `None` at
+/// end of input.
+fn read_secret_line(mut reader: impl std::io::Read) -> std::io::Result<Option<Zeroizing<String>>> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_SECRET_LINE));
+    let mut byte = Zeroizing::new([0u8; 1]);
+    loop {
+        if reader.read(&mut *byte)? == 0 {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() == MAX_SECRET_LINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line too long",
+            ));
+        }
+        bytes.push(byte[0]);
+    }
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(text) => Ok(Some(Zeroizing::new(text))),
+        Err(e) => {
+            drop(Zeroizing::new(e.into_bytes()));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not UTF-8",
+            ))
         }
     }
 }
@@ -627,6 +667,23 @@ mod tests {
                 .message()
                 .contains("sign as ferris@example.com with stored key ECC3 (ssh login to host)")
         );
+    }
+
+    #[test]
+    fn secret_lines_are_read_up_to_the_newline() {
+        let mut input: &[u8] = b"1234\r\nrest";
+        assert_eq!(
+            read_secret_line(&mut input).unwrap().unwrap().as_str(),
+            "1234\r"
+        );
+        assert_eq!(input, b"rest", "nothing past the line is consumed");
+        assert!(read_secret_line(&b""[..]).unwrap().is_none());
+        assert_eq!(
+            read_secret_line(&b"12"[..]).unwrap().unwrap().as_str(),
+            "12"
+        );
+        assert!(read_secret_line(&[b'1'; MAX_SECRET_LINE + 1][..]).is_err());
+        assert!(read_secret_line(&b"\xff\n"[..]).is_err());
     }
 
     #[test]

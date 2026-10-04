@@ -24,6 +24,7 @@ use ssh_key::{Algorithm, Certificate, PublicKey, Signature};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Suffix of every OpenSSH certificate key type.
 pub const CERT_SUFFIX: &str = "-cert-v01@openssh.com";
@@ -242,11 +243,12 @@ pub fn decode_cert_add(
     }
     let algorithm = cert.public_key().algorithm();
     let base = algorithm.as_str();
-    let mut body = if base == "ssh-ed25519" {
+    // The copy holds the private key: wipe it after.
+    let mut body = Zeroizing::new(if base == "ssh-ed25519" {
         Vec::new()
     } else {
         public_fields(cert.public_key()).ok_or_else(malformed)?
-    };
+    });
     let prefix = body.len();
     body.extend_from_slice(reader);
     let mut rest = body.as_slice();
