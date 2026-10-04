@@ -80,7 +80,10 @@
 //!   when an `sk-` key is served.
 //! - [`agent`]: the SSH agent wire protocol and unix-socket server;
 //!   [`agent::Extension`] lets callers answer protocol extension requests and
-//!   [`agent::KeyDecoder`] lets them add key types.
+//!   [`agent::KeyDecoder`] lets them add key types. The built-in
+//!   [`agent::destination`] support verifies `session-bind@openssh.com` and
+//!   enforces `ssh-add -h` destination constraints, and `ssh-add -c`
+//!   confirmation goes through the [`ChallengeSink`].
 //!
 //! Any [`HidTransport`] implementation can stand in for the hardware, which is
 //! how the test suite drives the full agent with a fake token.
@@ -94,7 +97,7 @@ pub mod keys;
 pub mod protocol;
 pub mod transport;
 
-pub use challenge::{Challenge, ChallengeSink};
+pub use challenge::{Challenge, ChallengeSink, ConfirmRequest};
 pub use device::{DeviceError, OnlyKey, Timeouts, challenge_digits};
 pub use identity::{
     Curve, EccSlot, Identity, IdentityError, KeyKind, KeySource, KeySpec, RsaSlot, Slot,

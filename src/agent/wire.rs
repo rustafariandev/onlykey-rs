@@ -2,6 +2,7 @@
 //! their replies (draft-miller-ssh-agent).
 
 use super::cert::{self, AssociatedCerts, CertKey};
+use super::destination::{self, DestinationConstraint};
 use super::keytype::KeyDecodeError;
 use super::keytype::{HeldKey, KeyRegistry};
 use ssh_encoding::{Decode, Encode};
@@ -77,6 +78,8 @@ pub enum WireError {
     UnsupportedConstraint(u8),
     #[error("unsupported key constraint extension {0:?}")]
     UnsupportedExtension(String),
+    #[error(transparent)]
+    Constraint(#[from] destination::ConstraintError),
     #[error("frame of {0} bytes exceeds the {MAX_FRAME}-byte limit")]
     FrameTooLarge(usize),
 }
@@ -95,11 +98,14 @@ pub enum Request {
     /// `ssh-add FILE`: add a private key held in memory, or a FIDO credential
     /// signed by the device. `cert` is set when the add is for the key's
     /// certificate (`-cert.pub`) rather than the plain key. `lifetime` is the
-    /// constraint from `ssh-add -t` (seconds), if any.
+    /// constraint from `ssh-add -t` (seconds), if any; `confirm` is the
+    /// `ssh-add -c` constraint; `destination` the `ssh-add -h` constraint.
     AddIdentity {
         key: HeldKey,
         cert: Option<Box<CertKey>>,
         lifetime: Option<u32>,
+        confirm: bool,
+        destination: Vec<DestinationConstraint>,
     },
     /// `ssh-add -d FILE`: remove the identity with this public key blob.
     RemoveIdentity {
@@ -114,11 +120,14 @@ pub enum Request {
     /// `ssh-add -s`: add the key named by `provider`. `lifetime` is the
     /// constraint from `ssh-add -t` (seconds), if any; `pin` is accepted but
     /// unused. `certs` are the certificates given after the provider
-    /// (`ssh-add -s PROVIDER CERT…`).
+    /// (`ssh-add -s PROVIDER CERT…`); `confirm` and `destination` are the
+    /// `ssh-add -c` and `-h` constraints.
     AddSmartcardKey {
         provider: Vec<u8>,
         pin: Vec<u8>,
         lifetime: Option<u32>,
+        confirm: bool,
+        destination: Vec<DestinationConstraint>,
         certs: Option<AssociatedCerts>,
     },
     /// `ssh-add -e`: remove the key named by `provider`.
@@ -180,6 +189,8 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
                 key,
                 cert,
                 lifetime: None,
+                confirm: false,
+                destination: Vec::new(),
             })
         }
         SSH2_AGENTC_ADD_ID_CONSTRAINED => {
@@ -196,6 +207,8 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
                 key,
                 cert,
                 lifetime: constraints.lifetime,
+                confirm: constraints.confirm,
+                destination: constraints.destination,
             })
         }
         SSH2_AGENTC_REMOVE_IDENTITY => {
@@ -210,6 +223,8 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
                 provider,
                 pin,
                 lifetime: None,
+                confirm: false,
+                destination: Vec::new(),
                 certs: None,
             })
         }
@@ -221,6 +236,8 @@ pub fn parse_request_with(key_types: &KeyRegistry, body: &[u8]) -> Result<Reques
                 provider,
                 pin,
                 lifetime: constraints.lifetime,
+                confirm: constraints.confirm,
+                destination: constraints.destination,
                 certs: constraints.certs,
             })
         }
@@ -275,29 +292,33 @@ fn decode_key(
 #[derive(Debug, Default)]
 struct Constraints {
     lifetime: Option<u32>,
+    confirm: bool,
+    destination: Vec<DestinationConstraint>,
     certs: Option<AssociatedCerts>,
 }
 
-/// Decode the constraint list that ends a constrained add. The lifetime
-/// constraint is understood, as are the `sk-provider@openssh.com` extension
-/// `ssh-add` always attaches to a FIDO key (whose value names the middleware
-/// library; this agent has its own, so it is ignored) and the
-/// `associated-certs-v00@openssh.com` extension of `ssh-add -s PROVIDER
-/// CERT…`. Anything else is rejected so it is not silently dropped: the
-/// confirm constraint (`ssh-add -c`), since the agent has no way to ask before
-/// each signature, and destination constraints.
+/// Decode the constraint list that ends a constrained add. The lifetime,
+/// confirm and destination constraints are understood, as is the
+/// `sk-provider@openssh.com` extension `ssh-add` always attaches to a FIDO key
+/// (whose value names the middleware library; this agent has its own, so it is
+/// ignored) and the `associated-certs-v00@openssh.com` extension of
+/// `ssh-add -s PROVIDER CERT…`. An unknown extension or constraint is
+/// rejected so it is not silently dropped.
 fn parse_constraints(rest: &mut &[u8]) -> Result<Constraints, WireError> {
     let mut constraints = Constraints::default();
     while !rest.is_empty() {
         let kind = u8::decode(rest)?;
         match kind {
             SSH_AGENT_CONSTRAIN_LIFETIME => constraints.lifetime = Some(u32::decode(rest)?),
+            SSH_AGENT_CONSTRAIN_CONFIRM => constraints.confirm = true,
             SSH_AGENT_CONSTRAIN_EXTENSION => {
                 let name = String::decode(rest)?;
                 if name == "sk-provider@openssh.com" {
                     let _provider = String::decode(rest)?;
                 } else if name == cert::ASSOCIATED_CERTS {
                     constraints.certs = Some(cert::parse_associated_certs(rest)?);
+                } else if name == destination::RESTRICT_DESTINATION {
+                    constraints.destination = destination::parse_constraints(rest)?;
                 } else {
                     return Err(WireError::UnsupportedExtension(name));
                 }
@@ -475,6 +496,40 @@ mod tests {
         PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([byte; 32])), comment)
     }
 
+    /// The constraint-extension bytes for one valid destination constraint:
+    /// from the origin to `example.com`, identified by `key(7, "")`.
+    fn destination_extension() -> Vec<u8> {
+        let host_key = key(7, "");
+        let mut hostkeys = Vec::new();
+        host_key.to_bytes().unwrap().encode(&mut hostkeys).unwrap();
+        0u8.encode(&mut hostkeys).unwrap();
+
+        let mut from = Vec::new();
+        "".encode(&mut from).unwrap();
+        "".encode(&mut from).unwrap();
+        Vec::<u8>::new().encode(&mut from).unwrap();
+
+        let mut to = Vec::new();
+        "".encode(&mut to).unwrap();
+        "example.com".encode(&mut to).unwrap();
+        Vec::<u8>::new().encode(&mut to).unwrap();
+        to.extend_from_slice(&hostkeys);
+
+        let mut constraint = Vec::new();
+        from.encode(&mut constraint).unwrap();
+        to.encode(&mut constraint).unwrap();
+        Vec::<u8>::new().encode(&mut constraint).unwrap();
+
+        let mut body = Vec::new();
+        constraint.encode(&mut body).unwrap();
+
+        let mut out = Vec::new();
+        SSH_AGENT_CONSTRAIN_EXTENSION.encode(&mut out).unwrap();
+        destination::RESTRICT_DESTINATION.encode(&mut out).unwrap();
+        body.encode(&mut out).unwrap();
+        out
+    }
+
     #[test]
     fn parses_request_identities() {
         assert_eq!(parse_request(&[11]).unwrap(), Request::RequestIdentities);
@@ -562,6 +617,8 @@ mod tests {
                 provider: b"ferris@example.com".to_vec(),
                 pin: b"pin".to_vec(),
                 lifetime: None,
+                confirm: false,
+                destination: Vec::new(),
                 certs: None,
             }
         );
@@ -578,33 +635,32 @@ mod tests {
                 provider: b"ferris@example.com".to_vec(),
                 pin: b"pin".to_vec(),
                 lifetime: Some(60),
+                confirm: false,
+                destination: Vec::new(),
                 certs: None,
             }
         );
 
-        // `ssh-add -c` asks for confirmation before each use, which the
-        // agent cannot do, so the add is refused rather than weakened.
+        // `ssh-add -c` asks for confirmation before each use; the constraint is
+        // carried through for the signature path to honour.
         let mut confirm = constrained.clone();
         SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut confirm).unwrap();
-        assert!(matches!(
-            parse_request(&confirm),
-            Err(WireError::UnsupportedConstraint(
-                SSH_AGENT_CONSTRAIN_CONFIRM
-            ))
-        ));
+        match parse_request(&confirm).unwrap() {
+            Request::AddSmartcardKey { confirm, .. } => assert!(confirm),
+            other => panic!("unexpected request {other:?}"),
+        }
 
+        // `ssh-add -h` attaches a destination constraint.
         let mut extension = body.clone();
         extension[0] = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED;
-        SSH_AGENT_CONSTRAIN_EXTENSION
-            .encode(&mut extension)
-            .unwrap();
-        "restrict-destination-v00@openssh.com"
-            .encode(&mut extension)
-            .unwrap();
-        assert!(matches!(
-            parse_request(&extension),
-            Err(WireError::UnsupportedExtension(_))
-        ));
+        extension.extend_from_slice(&destination_extension());
+        match parse_request(&extension).unwrap() {
+            Request::AddSmartcardKey { destination, .. } => {
+                assert_eq!(destination.len(), 1);
+                assert_eq!(destination[0].to.hostname.as_deref(), Some("example.com"));
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
 
         let mut unknown = body.clone();
         unknown[0] = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED;
@@ -647,6 +703,7 @@ mod tests {
                 key,
                 cert,
                 lifetime,
+                ..
             } => {
                 assert_eq!(key.public_key().comment(), "ferris@example.com");
                 assert_eq!(key.key_blob(), blob);
@@ -675,15 +732,13 @@ mod tests {
             Request::AddIdentity { lifetime, .. } => assert_eq!(lifetime, Some(60)),
             other => panic!("unexpected request {other:?}"),
         }
-        // A confirm constraint is refused rather than silently dropped.
+        // A confirm constraint is carried through for the signature path.
         let mut confirm = constrained;
         SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut confirm).unwrap();
-        assert!(matches!(
-            parse_request(&confirm),
-            Err(WireError::UnsupportedConstraint(
-                SSH_AGENT_CONSTRAIN_CONFIRM
-            ))
-        ));
+        match parse_request(&confirm).unwrap() {
+            Request::AddIdentity { confirm, .. } => assert!(confirm),
+            other => panic!("unexpected request {other:?}"),
+        }
 
         // A security key is decoded, not rejected.
         use ssh_key::private::SkEd25519;
@@ -810,6 +865,7 @@ mod tests {
                 key,
                 cert: Some(got),
                 lifetime: None,
+                ..
             } => {
                 assert_eq!(*got, cert);
                 assert_eq!(key.public_key().comment(), "ferris@example.com");

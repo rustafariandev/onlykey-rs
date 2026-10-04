@@ -7,8 +7,8 @@ use nix::unistd::{ForkResult, fork, setsid};
 use onlykey_agent::agent::{self, Agent, CertKey, Opener, SkOpener};
 use onlykey_agent::agent::{client, sk};
 use onlykey_agent::challenge::{
-    AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt, PinRequest, TtyPin,
-    TtyPrompt,
+    AskpassConfirm, AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt,
+    PinRequest, TtyPin, TtyPrompt,
 };
 use onlykey_agent::device::{OnlyKey, Timeouts};
 use onlykey_agent::fido::credman;
@@ -75,6 +75,11 @@ pub struct Cli {
     /// default) asks for every signature.
     #[arg(long, global = true, value_name = "SECONDS")]
     pub pin_cache: Option<u64>,
+
+    /// Default lifetime in seconds for keys added later with `ssh-add` that
+    /// do not give their own `-t`; 0 (the default) keeps them until removed.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub key_lifetime: Option<u32>,
 
     /// File of OpenSSH certificates (`-cert.pub` lines) for OnlyKey keys;
     /// each is served next to the key it certifies. Repeatable, and added to
@@ -276,6 +281,8 @@ struct Context_ {
     /// Asks for security key PINs.
     pin_prompt: Arc<dyn PinPrompt>,
     pin_cache: Duration,
+    /// Default lifetime for keys added later, from `--key-lifetime`.
+    key_lifetime: Option<u32>,
 }
 
 impl Context_ {
@@ -302,6 +309,10 @@ impl Context_ {
     /// Identities in order of preference: the command line, then the config
     /// file, then the comments of `preloaded` public keys. `additional`
     /// identities are appended to whichever list is chosen.
+    ///
+    /// An empty list is allowed: an agent started with no identities serves no
+    /// keys until `ssh-add` adds some. Callers that need a key to connect
+    /// (`ssh`, `mosh`, `ssh-copy-id`) check for one themselves.
     fn entries(
         &self,
         args: &IdentityArgs,
@@ -330,9 +341,7 @@ impl Context_ {
             entries.push(self.key(identity)?);
         }
         if entries.is_empty() {
-            bail!(
-                "no identities given; pass [user@]host, add [[identity]] entries to the config file, or point --pubkey-file at exported keys"
-            );
+            tracing::info!("no identities given; serving no keys until ssh-add adds some");
         }
         for e in &entries {
             if e.identity.is_transliterated() {
@@ -371,6 +380,7 @@ impl Context_ {
             .with_sk_opener(sk_opener)
             .with_pin_prompt(Arc::clone(&self.pin_prompt))
             .with_pin_cache(self.pin_cache)
+            .with_default_lifetime(self.key_lifetime)
             .with_certificates(certs);
         if let Some(path) = pubkey_file {
             let matched = agent.preload(keys);
@@ -484,10 +494,17 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         .or_else(|| config.askpass.clone())
         .or_else(|| std::env::var("SSH_ASKPASS").ok())
         .filter(|program| !program.is_empty());
+    // `ssh-add -c` confirmation goes through the same askpass program, when
+    // one is configured and no terminal is available.
+    if let Some(program) = askpass.clone() {
+        sinks.push(Box::new(AskpassConfirm::new(program)));
+    }
     let pin_cache = Duration::from_secs(cli.pin_cache.or(config.pin_cache).unwrap_or(0));
+    let key_lifetime = cli.key_lifetime.or(config.key_lifetime);
     let ctx = Context_ {
         pin_prompt: Arc::new(pin_prompt(askpass)),
         pin_cache,
+        key_lifetime,
         config,
         curve,
         curve_given: cli.curve.is_some(),
@@ -1119,6 +1136,7 @@ mod tests {
             fido_device: None,
             pin_prompt: Arc::new(ChainPin::default()),
             pin_cache: Duration::ZERO,
+            key_lifetime: None,
         }
     }
 
@@ -1358,5 +1376,12 @@ mod tests {
 
         // With no command-line identities at all, --slot still errors.
         assert!(ctx.entries(&IdentityArgs::default(), &[], &[]).is_err());
+    }
+
+    #[test]
+    fn no_identities_yields_an_empty_keyless_list() {
+        let ctx = context(Config::default());
+        let entries = ctx.entries(&IdentityArgs::default(), &[], &[]).unwrap();
+        assert!(entries.is_empty());
     }
 }

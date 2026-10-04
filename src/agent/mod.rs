@@ -2,6 +2,7 @@
 
 pub mod cert;
 pub mod client;
+pub mod destination;
 pub mod extension;
 pub mod keytype;
 pub mod local;
@@ -10,6 +11,10 @@ pub mod sk;
 pub mod wire;
 
 pub use cert::{AssociatedCerts, CertError, CertKey};
+pub use destination::{
+    BindError, Connection, ConstraintError, ConstraintHop, DestinationConstraint, HostKeySpec,
+    SessionBinding, Userauth,
+};
 pub use extension::{Extension, ExtensionContext, ExtensionReply};
 pub use keytype::{HeldKey, KeyDecodeError, KeyDecoder, KeyRegistry};
 #[cfg(feature = "dsa")]

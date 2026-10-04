@@ -8,6 +8,7 @@
 //! fido-device = "/dev/hidraw5"  # optional, when several FIDO keys are attached
 //! askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs
 //! pin-cache = 300              # seconds to reuse a security key's PIN; 0 = ask every time
+//! key-lifetime = 600           # default lifetime of keys added later; 0 = until removed
 //! cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]  # certificates for token keys
 //!
 //! [[identity]]
@@ -47,6 +48,9 @@ pub struct Config {
     pub askpass: Option<String>,
     /// Seconds a security key's PIN token is reused; 0 asks every time.
     pub pin_cache: Option<u64>,
+    /// Default lifetime in seconds for keys added later without their own
+    /// `ssh-add -t`; 0 keeps them until removed.
+    pub key_lifetime: Option<u32>,
     /// Files of certificates for token keys, matched to them by public key.
     #[serde(default)]
     pub cert_file: Vec<PathBuf>,
@@ -153,6 +157,7 @@ mod tests {
             log-file = "/tmp/okagent.log"
             askpass = "/usr/libexec/openssh/ssh-askpass"
             pin-cache = 300
+            key-lifetime = 600
             cert-file = ["/tmp/a-cert.pub", "/tmp/b-cert.pub"]
             [[identity]]
             name = "ferris@example.com"
@@ -180,6 +185,7 @@ mod tests {
             Some("/usr/libexec/openssh/ssh-askpass")
         );
         assert_eq!(cfg.pin_cache, Some(300));
+        assert_eq!(cfg.key_lifetime, Some(600));
         assert_eq!(
             cfg.cert_file,
             [Path::new("/tmp/a-cert.pub"), Path::new("/tmp/b-cert.pub")]

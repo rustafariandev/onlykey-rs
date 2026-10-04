@@ -69,6 +69,33 @@ impl TouchRequest {
     }
 }
 
+/// One use of a key that the `ssh-add -c` confirm constraint asks the user
+/// to allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmRequest {
+    /// Comment of the key being used, e.g. `ferris@example.com`.
+    pub identity: String,
+    /// The key's SHA-256 fingerprint, as `SHA256:…`.
+    pub fingerprint: String,
+    /// What is being signed, if the request could be summarised.
+    pub subject: Option<String>,
+}
+
+impl ConfirmRequest {
+    /// One-line human-readable prompt.
+    pub fn message(&self) -> String {
+        let subject = self
+            .subject
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        format!(
+            "Allow use of key {}{subject}? Key fingerprint {}. (yes/no)",
+            self.identity, self.fingerprint
+        )
+    }
+}
+
 /// Something a FIDO security key needs its PIN for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinRequest {
@@ -337,6 +364,15 @@ pub trait ChallengeSink: Send + Sync {
     /// Tell the user a FIDO security key is waiting for a touch. The default
     /// does nothing, for sinks that only handle OnlyKey challenges.
     fn present_touch(&self, _request: &TouchRequest) {}
+
+    /// Ask the user to allow one use of a key added with `ssh-add -c`.
+    /// `Some(true)` allows, `Some(false)` refuses, and `None` means this sink
+    /// cannot ask (no terminal, no askpass program), so a later sink may.
+    /// The default is `None`, which the agent treats as a refusal rather than
+    /// weakening the constraint.
+    fn confirm(&self, _request: &ConfirmRequest) -> Option<bool> {
+        None
+    }
 }
 
 /// Writes the prompt to the controlling terminal, or stderr if there is none.
@@ -350,6 +386,65 @@ impl ChallengeSink for TtyPrompt {
 
     fn present_touch(&self, request: &TouchRequest) {
         write_tty(&request.message());
+    }
+
+    fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
+        let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+            return None;
+        };
+        let Ok(reader) = tty.try_clone() else {
+            return None;
+        };
+        if write!(tty, "{} ", request.message()).is_err() {
+            return None;
+        }
+        let mut line = String::new();
+        match BufReader::new(&reader).read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(matches!(
+                line.trim().to_ascii_lowercase().as_str(),
+                "yes" | "y"
+            )),
+        }
+    }
+}
+
+/// Asks for confirmation through an askpass program, as `ssh` does when the
+/// agent requires it: the prompt is the program's only argument,
+/// `SSH_ASKPASS_PROMPT` is `confirm`, and a zero exit with a `yes` answer
+/// allows the signature. `None` means the program could not be run.
+#[derive(Debug, Clone)]
+pub struct AskpassConfirm {
+    program: String,
+}
+
+impl AskpassConfirm {
+    pub fn new(program: impl Into<String>) -> Self {
+        AskpassConfirm {
+            program: program.into(),
+        }
+    }
+}
+
+impl ChallengeSink for AskpassConfirm {
+    fn present(&self, _challenge: &Challenge) {}
+
+    fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
+        let output = Command::new(&self.program)
+            .arg(request.message())
+            .env("SSH_ASKPASS_PROMPT", "confirm")
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return Some(false);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Some(matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "yes" | "y"
+        ))
     }
 }
 
@@ -444,13 +539,21 @@ impl ChallengeSink for MultiSink {
             sink.present_touch(request);
         }
     }
+
+    fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
+        // The first sink that can answer decides; the rest are not asked.
+        self.0.iter().find_map(|sink| sink.confirm(request))
+    }
 }
 
 /// Records challenges and touch requests instead of showing them; for tests.
+/// The third field holds the answers a confirmation would get, `true` for
+/// yes; when it runs out, confirmation is refused as by the trait default.
 #[derive(Debug, Default)]
 pub struct RecordingSink(
     pub std::sync::Mutex<Vec<Challenge>>,
     pub std::sync::Mutex<Vec<TouchRequest>>,
+    pub std::sync::Mutex<VecDeque<bool>>,
 );
 
 impl ChallengeSink for RecordingSink {
@@ -460,6 +563,10 @@ impl ChallengeSink for RecordingSink {
 
     fn present_touch(&self, request: &TouchRequest) {
         self.1.lock().unwrap().push(request.clone());
+    }
+
+    fn confirm(&self, _request: &ConfirmRequest) -> Option<bool> {
+        self.2.lock().unwrap().pop_front()
     }
 }
 
@@ -587,6 +694,45 @@ mod tests {
         std::fs::write(&plain, "echo 1234\n").unwrap();
         assert!(!AskpassPin::new(plain.to_str().unwrap()).available());
         assert!(!AskpassPin::new(dir.path().to_str().unwrap()).available());
+    }
+
+    fn confirm_request() -> ConfirmRequest {
+        ConfirmRequest {
+            identity: "ferris@example.com".into(),
+            fingerprint: "SHA256:abc".into(),
+            subject: Some("ssh-connection login as \"ferris\"".into()),
+        }
+    }
+
+    #[test]
+    fn askpass_confirms_on_yes_and_reads_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        // The prompt arrives as the only argument with the confirm env var.
+        let yes = askpass(
+            dir.path(),
+            r#"[ "$SSH_ASKPASS_PROMPT" = confirm ] && case "$1" in *ferris*) echo yes;; esac"#,
+        );
+        assert_eq!(
+            AskpassConfirm::new(yes).confirm(&confirm_request()),
+            Some(true)
+        );
+        assert_eq!(
+            AskpassConfirm::new(askpass(dir.path(), "echo no")).confirm(&confirm_request()),
+            Some(false)
+        );
+        assert_eq!(
+            AskpassConfirm::new(askpass(dir.path(), "exit 1")).confirm(&confirm_request()),
+            Some(false)
+        );
+        let missing = AskpassConfirm::new(dir.path().join("missing").to_str().unwrap());
+        assert_eq!(missing.confirm(&confirm_request()), None);
+
+        // MultiSink skips sinks that cannot answer and takes the first answer.
+        let multi = MultiSink(vec![
+            Box::new(missing),
+            Box::new(AskpassConfirm::new(askpass(dir.path(), "echo yes"))),
+        ]);
+        assert_eq!(multi.confirm(&confirm_request()), Some(true));
     }
 
     #[test]

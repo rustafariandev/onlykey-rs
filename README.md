@@ -71,7 +71,29 @@ from the checkout, or copy it to `~/.local/share/man/man1/` to get
 
 An identity is `[user@]host`. Pass `--curve nistp256` for a P-256 key; the
 default is ed25519. Identities can be omitted when the config file lists them,
-or when `--pubkey-file` names them (see below).
+or when `--pubkey-file` names them (see below). With no identities from any
+source, `serve`, `run`, `shell` and `pubkey` start with an empty key list: a
+long-lived agent can then be filled with `ssh-add` (`ssh-add FILE` for a plain
+key, `ssh-add -s [user@]host` for an OnlyKey key) just like a bare
+`ssh-agent`. `ssh`, `mosh` and `ssh-copy-id` still need an identity to know
+which key to log in with. Use an empty long-lived agent in place of
+`ssh-agent` by pointing `SSH_AUTH_SOCK` at its socket and using the usual
+tools:
+
+```sh
+okagent serve &                       # or: eval "$(okagent serve --daemon)"
+export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR:-/tmp}/okagent/agent.sock"
+ssh-add ~/.ssh/id_ed25519             # a plain key, signed in memory
+ssh-add -s ferris@example.com         # an OnlyKey key, derived on demand
+ssh-add -c ~/.ssh/id_ed25519          # ...and confirm each use from now on
+```
+
+A key added with `ssh-add -c` asks before every signature, on the terminal or
+through the `--askpass` program, and a background agent can report it with
+`--notify-command`. Destination-constrained keys (`ssh-add -h`) are
+served only on a connection the OpenSSH client has bound to a permitted host
+with its `session-bind@openssh.com` extension. `--key-lifetime SECONDS` gives
+keys added later a default lifetime, as `ssh-agent -t` does.
 
 By default the identity's host is also the ssh destination. Pass
 `--host [user@]server[:port]` to `ssh`, `mosh` or `ssh-copy-id` to connect
@@ -248,8 +270,9 @@ notify-command = "notify-send OnlyKey"  # optional
 # pubkey-file = "/home/ferris/.ssh/onlykey.pub"
 # log-file = "/home/ferris/.local/state/okagent.log"
 # fido-device = "/dev/hidraw5"          # optional, for several FIDO keys
-# askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs
+# askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs and ssh-add -c confirmation
 # pin-cache = 300                       # seconds to reuse a PIN; 0 asks every time
+# key-lifetime = 600                    # default lifetime for keys added later; 0 = until removed
 # cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]  # certificates for token keys
 
 [[identity]]
@@ -459,9 +482,14 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   reported as `SSH_AGENT_FAILURE`. The lifetime constraint of
   `ssh-add -t` is honoured, for `ssh-add -s` and `ssh-add FILE` alike, as
   are the certificates of `ssh-add -s IDENTITY CERT…`
-  (`associated-certs-v00@openssh.com`). The provider's PIN is ignored, and
-  the confirm constraint (`ssh-add -c`, which the agent cannot honour) and
-  destination constraints are refused.
+  (`associated-certs-v00@openssh.com`). The provider's PIN is ignored. The
+  confirm constraint (`ssh-add -c`) is honoured: the user is asked to allow
+  each signature, on the terminal or through the notify command. Destination
+  constraints (`ssh-add -h`, `restrict-destination-v00@openssh.com`) are
+  stored and enforced: the OpenSSH client's `session-bind@openssh.com`
+  extension is verified against the server's host-key signature and recorded
+  per connection, and a constrained key signs only on a connection bound to a
+  permitted host.
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
   which loads a plain ed25519, RSA or ECDSA (or, with the `dsa` feature, DSA)
   private key into the agent, and its `*-cert-v01@openssh.com` certificate;
@@ -478,6 +506,8 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   handler answers the `SSH_AGENTC_EXTENSION` requests whose name it matches,
   seeing whether the agent is locked through `ExtensionContext`. A handler is
   not refused automatically while locked, so it decides for itself.
+  The built-in `query` and `session-bind@openssh.com` extensions are answered
+  before a registered handler is consulted.
   Unregistered extensions get `SSH_AGENT_EXTENSION_FAILURE` and the SSH
   protocol 1 listing an empty `SSH_AGENT_RSA_IDENTITIES_ANSWER`, as OpenSSH's
   agent replies; everything else gets a failure reply, which OpenSSH treats as

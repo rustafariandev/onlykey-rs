@@ -151,6 +151,21 @@ lists them (see
 .BR "CONFIGURATION FILE" ),
 or when a public key file names them (see
 .BR \-\-pubkey\-file ).
+With no identities from any source,
+.BR serve ,
+.BR run ,
+.B shell
+and
+.B pubkey
+start with an empty key list, which
+.B ssh-add
+can then fill like a bare
+.BR ssh-agent ;
+.BR ssh ,
+.B mosh
+and
+.B ssh-copy-id
+still require an identity.
 .PP
 The agent implements the
 .IR "request identities" ,
@@ -184,10 +199,18 @@ succeeds even while the OnlyKey is unplugged.
 Answer the PKCS#11 PIN prompt with an empty passphrase.
 The lifetime constraint of
 .B ssh-add \-s \-t
-is honoured and the PIN is ignored. The confirm constraint
+is honoured and the PIN is ignored.
+The confirm constraint
 .RB ( "ssh-add \-c" )
-is refused, since the agent cannot ask before each signature, as are
-destination constraints.
+is honoured: the user is asked to allow each signature, on the terminal or
+through the notify command.
+Destination constraints
+.RB ( "ssh-add \-h" )
+are stored and enforced: the
+.B session-bind@openssh.com
+extension OpenSSH sends is verified against the server's host-key signature
+and recorded per connection, and the key signs only on a connection bound to
+a permitted host.
 .BI "ssh-add \-s " "provider certificate" \fR...
 also serves the given OpenSSH certificates of the key, each as an identity
 of its own that the token signs for; certificates of other keys are skipped.
@@ -263,8 +286,7 @@ configuration, until the agent restarts or they are added back with
 .BR "ssh-add \-s" .
 The lifetime constraint of
 .B ssh-add \-t
-is honoured; the confirm constraint and destination constraints are
-refused, as with
+is honoured; the confirm and destination constraints are honoured as with
 .BR "ssh-add \-s" .
 Anything else not listed here is refused.
 .B ssh-add \-x
@@ -273,9 +295,12 @@ locks the agent with a passphrase: until
 unlocks it with the same passphrase, it lists no keys and refuses to sign,
 add or remove keys.
 This lock is the SSH agent's own and is separate from the OnlyKey's PIN.
-The CLI registers no protocol extensions, so extension requests are answered
-with the extension-failure code and the SSH protocol 1 key listing with an
-empty list, as
+The built-in
+.B query
+and
+.B session-bind@openssh.com
+extensions are answered; any other extension request gets the
+extension-failure code and the SSH protocol 1 key listing an empty list, as
 .BR ssh-agent (1)
 itself does.
 .SH COMMANDS
@@ -564,6 +589,15 @@ output, as
 does with
 .BR SSH_ASKPASS ;
 a non-zero exit cancels.
+The same program also answers the confirmation of a key added with
+.BR "ssh-add \-c" :
+the prompt is passed with
+.B SSH_ASKPASS_PROMPT
+set to
+.BR confirm ,
+and a
+.B yes
+answer allows the signature.
 Defaults to the
 .B askpass
 config key, then
@@ -584,6 +618,21 @@ when
 removes every identity; a device that was replugged asks for the PIN again.
 The same value can be set with the
 .B pin-cache
+config key.
+.TP
+.BI \-\-key\-lifetime " seconds"
+Give keys added later with
+.B ssh-add
+a lifetime of
+.I seconds
+when they do not give their own
+.BR "ssh-add \-t" ,
+as
+.B ssh-agent \-t
+does.
+The default, 0, keeps them until they are removed.
+The same value can be set with the
+.B key-lifetime
 config key.
 .TP
 .BI \-\-cert\-file " file"
@@ -839,6 +888,10 @@ See
 See
 .BR \-\-pin\-cache .
 .TP
+.BI key-lifetime " = " seconds
+See
+.BR \-\-key\-lifetime .
+.TP
 .BI cert-file " = [\(dq" file \(dq ", ...]"
 See
 .BR \-\-cert\-file .
@@ -880,6 +933,7 @@ notify-command = "notify-send OnlyKey"
 # fido-device = "/dev/hidraw5"
 # askpass = "/usr/libexec/openssh/ssh-askpass"
 # pin-cache = 300
+# key-lifetime = 600
 # cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]
 
 [[identity]]

@@ -305,6 +305,46 @@ fn ssh_add_loads_a_regular_ed25519_key() {
     assert_eq!(listed_keys(&h), 0);
 }
 
+/// An agent started with no identities serves no keys, and `ssh-add FILE`
+/// populates it, exactly as a bare `ssh-agent` starts and is filled.
+#[test]
+fn empty_agent_starts_keyless_and_accepts_added_keys() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(Vec::new());
+    assert_eq!(listed_keys(&h), 0, "a keyless agent lists no keys");
+    // As OpenSSH's ssh-add does for an empty agent: a message, no key lines.
+    let empty = h.cmd("ssh-add").arg("-L").output().unwrap();
+    assert!(!empty.status.success());
+    assert!(!empty.stdout.starts_with(b"ssh-") && !empty.stdout.starts_with(b"ecdsa-"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_ed25519");
+    let generated = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "keyless@example.com", "-f"])
+        .arg(&key_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(generated.success(), "ssh-keygen failed");
+
+    assert!(ssh_add_file(&h, &key_path));
+    assert_eq!(listed_keys(&h), 1);
+    let out = h.cmd("ssh-add").arg("-L").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with("keyless@example.com"))
+        .expect("added key is listed");
+    sign_and_check(&h, dir.path(), line, "keyless-ed25519");
+
+    assert!(h.cmd("ssh-add").arg("-D").status().unwrap().success());
+    assert_eq!(listed_keys(&h), 0);
+}
+
 /// `ssh-add FILE` loads a plain RSA key too, signing in software with the
 /// digest the client asks for (`rsa-sha2-512` for `ssh-keygen -Y sign`).
 /// 1024 bits, the smallest OpenSSH accepts, signs as well as 2048.
@@ -910,4 +950,465 @@ fn token_keys_serve_certificates() {
     assert_eq!(lines.len(), 3, "two keys and a certificate: {lines:?}");
     assert!(lines[2].starts_with("ssh-ed25519-cert-v01@openssh.com "));
     sign_and_check(&h, dir.path(), &cert_line, "startup-cert");
+}
+
+/// A real OpenSSH `ssh-agent` on a private socket, so the same commands can be
+/// run against it and against okagent and the observable results compared.
+struct ReferenceAgent {
+    socket: std::path::PathBuf,
+    child: std::process::Child,
+    _dir: tempfile::TempDir,
+}
+
+impl ReferenceAgent {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let child = Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ReferenceAgent {
+            socket,
+            child,
+            _dir: dir,
+        }
+    }
+
+    fn cmd(&self, program: &str) -> Command {
+        let mut c = Command::new(program);
+        c.env("SSH_AUTH_SOCK", &self.socket);
+        c
+    }
+}
+
+impl Drop for ReferenceAgent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Run `ssh-add` with `flag` against `cmd`'s agent, answering the prompt with
+/// `passphrase` through SSH_ASKPASS. Returns whether it succeeded.
+fn askpass(cmd: &mut Command, dir: &Path, flag: &str, passphrase: &str) -> bool {
+    let script = dir.join("askpass.sh");
+    std::fs::write(&script, format!("#!/bin/sh\necho '{passphrase}'\n")).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    cmd.arg(flag)
+        .env("SSH_ASKPASS", &script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Run `ssh-add -l` against either agent, returning its exit status and stdout.
+fn list_output(mut cmd: Command) -> (bool, String) {
+    let out = cmd.arg("-l").output().unwrap();
+    (out.status.success(), String::from_utf8(out.stdout).unwrap())
+}
+
+/// The same commands must produce the same observable results from okagent as
+/// from a real OpenSSH `ssh-agent`: an empty list, loading a plain key,
+/// listing it, removing it, clearing everything and locking the agent.
+#[test]
+fn matches_openssh_agent_for_common_operations() {
+    if !have("ssh-agent") || !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let reference = ReferenceAgent::start();
+    let ours = Harness::start(Vec::new());
+
+    let empty_ref = list_output(reference.cmd("ssh-add"));
+    let empty_ours = list_output(ours.cmd("ssh-add"));
+    assert_eq!(empty_ref, empty_ours);
+
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_ed25519");
+    let generated = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "diff@example.com", "-f"])
+        .arg(&key_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(generated.success(), "ssh-keygen failed");
+
+    let added_ref = ssh_add_file_cmd(reference.cmd("ssh-add"), &key_path);
+    let added_ours = ssh_add_file(&ours, &key_path);
+    assert!(added_ref && added_ours, "both agents load the key");
+
+    let list_ref = list_output(reference.cmd("ssh-add"));
+    let list_ours = list_output(ours.cmd("ssh-add"));
+    assert_eq!(list_ref, list_ours, "listings match after loading a key");
+
+    let sign_ref = signing_lines(reference.cmd("ssh-add"));
+    let sign_ours = signing_lines(ours.cmd("ssh-add"));
+    assert_eq!(sign_ref, sign_ours, "authorized_keys lines match");
+
+    let removed_ref = ssh_add_file_cmd(reference.cmd("ssh-add"), &key_path);
+    let removed_ours = ssh_add_file(&ours, &key_path);
+    assert!(removed_ref && removed_ours);
+    assert_eq!(
+        list_output(reference.cmd("ssh-add")),
+        list_output(ours.cmd("ssh-add")),
+        "listings match after removal",
+    );
+
+    // Lock and unlock with a passphrase; both agents must agree on each step.
+    assert!(ssh_add_file_cmd(reference.cmd("ssh-add"), &key_path));
+    assert!(ssh_add_file(&ours, &key_path));
+    askpass(&mut reference.cmd("ssh-add"), dir.path(), "-x", "hunter2");
+    askpass(&mut ours.cmd("ssh-add"), dir.path(), "-x", "hunter2");
+    let locked_ref = list_output(reference.cmd("ssh-add"));
+    let locked_ours = list_output(ours.cmd("ssh-add"));
+    assert_eq!(locked_ref, locked_ours, "a locked agent hides its keys");
+    assert!(!locked_ref.0, "a locked agent fails to list keys");
+
+    let wrong_ref = {
+        let mut c = reference.cmd("ssh-add");
+        askpass(&mut c, dir.path(), "-X", "wrong")
+    };
+    let wrong_ours = {
+        let mut c = ours.cmd("ssh-add");
+        askpass(&mut c, dir.path(), "-X", "wrong")
+    };
+    assert_eq!(wrong_ref, wrong_ours, "a wrong passphrase fails on both");
+    assert!(!wrong_ref, "a wrong passphrase does not unlock");
+
+    let right_ref = {
+        let mut c = reference.cmd("ssh-add");
+        askpass(&mut c, dir.path(), "-X", "hunter2")
+    };
+    let right_ours = {
+        let mut c = ours.cmd("ssh-add");
+        askpass(&mut c, dir.path(), "-X", "hunter2")
+    };
+    assert_eq!(right_ref, right_ours, "the right passphrase unlocks both");
+    assert!(right_ref, "the right passphrase unlocks");
+    assert_eq!(
+        list_output(reference.cmd("ssh-add")),
+        list_output(ours.cmd("ssh-add")),
+        "listings agree once unlocked",
+    );
+
+    ours.cmd("ssh-add").arg("-D").status().unwrap();
+    reference.cmd("ssh-add").arg("-D").status().unwrap();
+    assert_eq!(
+        list_output(reference.cmd("ssh-add")),
+        list_output(ours.cmd("ssh-add")),
+    );
+}
+
+/// `ssh-add FILE` against a command that already names its agent.
+fn ssh_add_file_cmd(mut cmd: Command, path: &Path) -> bool {
+    cmd.arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The authorized_keys lines from `ssh-add -L`, which ssh-add prints itself.
+fn signing_lines(mut cmd: Command) -> String {
+    let out = cmd.arg("-L").output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The `restrict-destination-v00@openssh.com` constraint extension for
+/// allowing a key on `to_host`, identified by `hostkey`.
+fn destination_constraint(to_host: &str, hostkey: &ssh_key::PublicKey) -> Vec<u8> {
+    let mut keyspec = Vec::new();
+    hostkey.to_bytes().unwrap().encode(&mut keyspec).unwrap();
+    keyspec.push(0);
+
+    let mut from = Vec::new();
+    "".encode(&mut from).unwrap();
+    "".encode(&mut from).unwrap();
+    Vec::<u8>::new().encode(&mut from).unwrap();
+
+    let mut to = Vec::new();
+    "".encode(&mut to).unwrap();
+    to_host.encode(&mut to).unwrap();
+    Vec::<u8>::new().encode(&mut to).unwrap();
+    to.extend_from_slice(&keyspec);
+
+    let mut one = Vec::new();
+    from.encode(&mut one).unwrap();
+    to.encode(&mut one).unwrap();
+    Vec::<u8>::new().encode(&mut one).unwrap();
+
+    let mut list = Vec::new();
+    one.encode(&mut list).unwrap();
+
+    let mut out = Vec::new();
+    wire::SSH_AGENT_CONSTRAIN_EXTENSION
+        .encode(&mut out)
+        .unwrap();
+    "restrict-destination-v00@openssh.com"
+        .encode(&mut out)
+        .unwrap();
+    list.encode(&mut out).unwrap();
+    out
+}
+
+/// A `publickey` userauth request over `session_id` for `user` and `keyblob`,
+/// the shape a `session-bind`ed client signs.
+fn userauth_request(session_id: &[u8], user: &str, keyblob: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    session_id.encode(&mut data).unwrap();
+    data.push(50); // SSH2_MSG_USERAUTH_REQUEST
+    user.encode(&mut data).unwrap();
+    "ssh-connection".encode(&mut data).unwrap();
+    "publickey".encode(&mut data).unwrap();
+    data.push(1); // signature follows
+    "ssh-ed25519".encode(&mut data).unwrap();
+    keyblob.encode(&mut data).unwrap();
+    data
+}
+
+fn sign_body(keyblob: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut body = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+    keyblob.encode(&mut body).unwrap();
+    data.encode(&mut body).unwrap();
+    0u32.encode(&mut body).unwrap();
+    body
+}
+
+fn session_bind_body(
+    hostkey: &ssh_key::PublicKey,
+    session_id: &[u8],
+    signature: &[u8],
+    forwarding: bool,
+) -> Vec<u8> {
+    let mut body = vec![wire::SSH_AGENTC_EXTENSION];
+    "session-bind@openssh.com".encode(&mut body).unwrap();
+    hostkey.to_bytes().unwrap().encode(&mut body).unwrap();
+    session_id.encode(&mut body).unwrap();
+    signature.encode(&mut body).unwrap();
+    body.push(forwarding as u8);
+    body
+}
+
+/// A key added with `ssh-add -c` asks the sink before every signature and is
+/// refused when the user does not confirm.
+#[test]
+fn confirm_constrained_key_asks_before_each_signature() {
+    let h = Harness::start(Vec::new());
+
+    let pair = ssh_key::private::Ed25519Keypair::from_seed(&[0x31; 32]);
+    let public = ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::Ed25519(pair.public),
+        "confirmed@example.com",
+    );
+    let keyblob = public.to_bytes().unwrap();
+
+    let mut add = vec![wire::SSH2_AGENTC_ADD_ID_CONSTRAINED];
+    "ssh-ed25519".encode(&mut add).unwrap();
+    pair.encode(&mut add).unwrap();
+    "confirmed@example.com".encode(&mut add).unwrap();
+    wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+    assert_eq!(roundtrip(&h.socket, &add), vec![wire::SSH_AGENT_SUCCESS]);
+
+    // The user declines (no answer is queued): the signature is refused.
+    assert_eq!(
+        roundtrip(&h.socket, &sign_body(&keyblob, b"data")),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+    // The user agrees: the signature is served.
+    h.sink.2.lock().unwrap().push_back(true);
+    let reply = roundtrip(&h.socket, &sign_body(&keyblob, b"data"));
+    assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+}
+
+/// `query` advertises `session-bind@openssh.com`, and a valid bind is
+/// accepted; an invalid one is refused and poisons the connection.
+#[test]
+fn session_bind_is_verified_and_query_lists_it() {
+    use signature::Signer;
+
+    let h = Harness::start(Vec::new());
+
+    // The `query` extension answers with the supported extension names.
+    let mut query = vec![wire::SSH_AGENTC_EXTENSION];
+    "query".encode(&mut query).unwrap();
+    let reply = roundtrip(&h.socket, &query);
+    assert_eq!(reply[0], 29, "SSH_AGENT_EXTENSION_RESPONSE");
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.contains("session-bind@openssh.com"), "{text}");
+
+    let host = ssh_key::private::PrivateKey::new(
+        ssh_key::private::KeypairData::Ed25519(ssh_key::private::Ed25519Keypair::from_seed(
+            &[9; 32],
+        )),
+        "host",
+    )
+    .unwrap();
+    let hostkey = host.public_key().clone();
+    let session_id = b"a session identifier";
+    let signature = Signer::sign(&host, session_id);
+    let mut signature_bytes = Vec::new();
+    signature.encode(&mut signature_bytes).unwrap();
+
+    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let bind = session_bind_body(&hostkey, session_id, &signature_bytes, false);
+    wire::write_frame(&mut stream, &bind).unwrap();
+    assert_eq!(
+        wire::read_frame(&mut stream).unwrap().unwrap(),
+        vec![wire::SSH_AGENT_SUCCESS]
+    );
+    // A connection already bound for authentication cannot be bound again,
+    // as OpenSSH refuses it.
+    wire::write_frame(&mut stream, &bind).unwrap();
+    assert_eq!(
+        wire::read_frame(&mut stream).unwrap().unwrap(),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+
+    // A bad signature is refused.
+    let mut bad = UnixStream::connect(&h.socket).unwrap();
+    let tampered = session_bind_body(&hostkey, session_id, b"not a signature", false);
+    wire::write_frame(&mut bad, &tampered).unwrap();
+    assert_eq!(
+        wire::read_frame(&mut bad).unwrap().unwrap(),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+}
+
+/// A key added with a destination constraint is listed locally but signs only
+/// on a connection bound to the permitted host with a matching session.
+#[test]
+fn destination_constrained_key_signs_only_on_its_bound_host() {
+    use signature::Signer;
+
+    let h = Harness::start(Vec::new());
+
+    let pair = ssh_key::private::Ed25519Keypair::from_seed(&[0x21; 32]);
+    let public = ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::Ed25519(pair.public),
+        "constrained@example.com",
+    );
+    let keyblob = public.to_bytes().unwrap();
+
+    let host = ssh_key::private::PrivateKey::new(
+        ssh_key::private::KeypairData::Ed25519(ssh_key::private::Ed25519Keypair::from_seed(
+            &[9; 32],
+        )),
+        "host",
+    )
+    .unwrap();
+    let hostkey = host.public_key().clone();
+    let session_id = b"bound session";
+    let signature = Signer::sign(&host, session_id);
+    let mut signature_bytes = Vec::new();
+    signature.encode(&mut signature_bytes).unwrap();
+
+    // Add the key with a destination constraint on a fresh (local) connection.
+    let mut add = vec![wire::SSH2_AGENTC_ADD_ID_CONSTRAINED];
+    "ssh-ed25519".encode(&mut add).unwrap();
+    pair.encode(&mut add).unwrap();
+    "constrained@example.com".encode(&mut add).unwrap();
+    add.extend_from_slice(&destination_constraint("example.com", &hostkey));
+    assert_eq!(roundtrip(&h.socket, &add), vec![wire::SSH_AGENT_SUCCESS]);
+
+    // It is listed while the connection is local, as for `ssh-add -L`.
+    let listed = roundtrip(&h.socket, &[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
+    assert_eq!(listed[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
+    assert_eq!(u32::from_be_bytes(listed[1..5].try_into().unwrap()), 1);
+
+    // Signing on an unbound connection is refused, as OpenSSH refuses it.
+    let data = userauth_request(session_id, "ferris", &keyblob);
+    assert_eq!(
+        roundtrip(&h.socket, &sign_body(&keyblob, &data)),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+
+    // On a connection bound to the permitted host, the signature is served.
+    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let bind = session_bind_body(&hostkey, session_id, &signature_bytes, false);
+    wire::write_frame(&mut stream, &bind).unwrap();
+    assert_eq!(
+        wire::read_frame(&mut stream).unwrap().unwrap(),
+        vec![wire::SSH_AGENT_SUCCESS]
+    );
+    wire::write_frame(&mut stream, &sign_body(&keyblob, &data)).unwrap();
+    let reply = wire::read_frame(&mut stream).unwrap().unwrap();
+    assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+
+    // A request for a different session is refused.
+    let wrong = userauth_request(b"another session", "ferris", &keyblob);
+    wire::write_frame(&mut stream, &sign_body(&keyblob, &wrong)).unwrap();
+    assert_eq!(
+        wire::read_frame(&mut stream).unwrap().unwrap(),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+}
+
+/// For every key type `ssh-add FILE` accepts, okagent lists and serves the
+/// same key as OpenSSH's own agent.
+#[test]
+fn matches_openssh_agent_listing_for_each_key_type() {
+    if !have("ssh-agent") || !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let reference = ReferenceAgent::start();
+    let ours = Harness::start(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cases: &[(&str, &[&str])] = &[
+        ("ed25519-key", &["-t", "ed25519"]),
+        ("rsa2048-key", &["-t", "rsa", "-b", "2048"]),
+        ("ecdsa256-key", &["-t", "ecdsa", "-b", "256"]),
+        ("ecdsa384-key", &["-t", "ecdsa", "-b", "384"]),
+        ("ecdsa521-key", &["-t", "ecdsa", "-b", "521"]),
+    ];
+    for (name, args) in cases {
+        let key_path = dir.path().join(name);
+        let generated = Command::new("ssh-keygen")
+            .args(*args)
+            .args(["-N", "", "-C", name, "-f"])
+            .arg(&key_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(generated.success(), "ssh-keygen failed for {name}");
+
+        assert!(
+            ssh_add_file_cmd(reference.cmd("ssh-add"), &key_path),
+            "reference agent loads {name}"
+        );
+        assert!(ssh_add_file(&ours, &key_path), "okagent loads {name}");
+        assert_eq!(
+            list_output(reference.cmd("ssh-add")),
+            list_output(ours.cmd("ssh-add")),
+            "listings match for {name}"
+        );
+        assert_eq!(
+            signing_lines(reference.cmd("ssh-add")),
+            signing_lines(ours.cmd("ssh-add")),
+            "authorized_keys lines match for {name}"
+        );
+
+        reference.cmd("ssh-add").arg("-D").status().unwrap();
+        ours.cmd("ssh-add").arg("-D").status().unwrap();
+    }
 }
