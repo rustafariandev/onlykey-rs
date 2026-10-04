@@ -99,11 +99,25 @@ impl<T: HidTransport> CtapHid<T> {
         self.cid = CID_BROADCAST;
         let nonce = nonce()?;
         self.send(CTAPHID_INIT, &nonce)?;
-        let reply = self.receive(CTAPHID_INIT, &|| {})?;
-        if reply.len() < 17 || reply[..8] != nonce {
-            return Err(FidoError::Protocol("bad CTAPHID_INIT reply"));
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        let reply = loop {
+            let reply = self.receive(CTAPHID_INIT, &|| {})?;
+            if reply.len() >= 17 && reply[..8] == nonce {
+                break reply;
+            }
+            // Every process sees the broadcast channel: a reply to another
+            // one's INIT is not ours, and the spec says to skip it.
+            if Instant::now() >= deadline {
+                return Err(FidoError::Timeout);
+            }
+        };
+        let cid = u32::from_be_bytes(reply[8..12].try_into().expect("slice of four"));
+        if cid == 0 || cid == CID_BROADCAST {
+            return Err(FidoError::Protocol(
+                "reserved channel id in CTAPHID_INIT reply",
+            ));
         }
-        self.cid = u32::from_be_bytes(reply[8..12].try_into().expect("slice of four"));
+        self.cid = cid;
         Ok(())
     }
 
@@ -354,6 +368,62 @@ mod tests {
         assert_eq!(CTAPHID_INIT, 0x86);
         assert_eq!(CTAPHID_CBOR, 0x90);
         assert_eq!(CTAPHID_KEEPALIVE, 0xBB);
+    }
+
+    /// Answers `CTAPHID_INIT` with a reply to another process's nonce first,
+    /// then one to ours allocating `cid`.
+    struct InitEcho {
+        cid: u32,
+        replies: std::collections::VecDeque<Report>,
+    }
+
+    impl HidTransport for InitEcho {
+        fn write_report(
+            &mut self,
+            report: &Report,
+        ) -> Result<(), crate::transport::TransportError> {
+            let reply = |nonce: &[u8], cid: u32| {
+                let mut p = [0u8; 64];
+                p[..4].copy_from_slice(&CID_BROADCAST.to_be_bytes());
+                p[4] = CTAPHID_INIT;
+                p[6] = 17;
+                p[7..15].copy_from_slice(nonce);
+                p[15..19].copy_from_slice(&cid.to_be_bytes());
+                p
+            };
+            if report[4] == CTAPHID_INIT {
+                let theirs: Vec<u8> = report[7..15].iter().map(|b| !b).collect();
+                self.replies.push_back(reply(&theirs, 0x0bad_0bad));
+                self.replies.push_back(reply(&report[7..15], self.cid));
+            }
+            Ok(())
+        }
+
+        fn read_report(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<Option<Report>, crate::transport::TransportError> {
+            Ok(self.replies.pop_front())
+        }
+    }
+
+    /// A reply to another process's INIT is skipped, and the channel is the
+    /// one our nonce was answered with; a reserved channel id is refused.
+    #[test]
+    fn init_skips_other_nonces_and_refuses_reserved_channels() {
+        let mut hid = CtapHid::new(InitEcho {
+            cid: 7,
+            replies: Default::default(),
+        });
+        hid.init().unwrap();
+        assert_eq!(hid.channel(), 7);
+        for reserved in [0, CID_BROADCAST] {
+            let mut hid = CtapHid::new(InitEcho {
+                cid: reserved,
+                replies: Default::default(),
+            });
+            assert!(matches!(hid.init(), Err(FidoError::Protocol(_))));
+        }
     }
 
     /// A device that replies on a schedule, measured from the first write,

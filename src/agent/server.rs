@@ -1336,8 +1336,14 @@ impl Agent {
         touch: &TouchRequest,
     ) -> Result<(PinProtocol, Zeroizing<Vec<u8>>), AgentError> {
         let prompt = self.pin_prompt.as_ref().ok_or(FidoError::UvRequired)?;
+        // Name the device: with several attached, the one that answered the
+        // probe gets the PIN, and only the user can tell if it is theirs.
+        let action = match hid.transport().id() {
+            Some(device) => format!("sign as {} with {device}", touch.identity),
+            None => format!("sign as {}", touch.identity),
+        };
         let request = PinRequest {
-            action: format!("sign as {}", touch.identity),
+            action,
             subject: touch.subject.clone(),
             retries: None,
             problem: None,
@@ -1393,7 +1399,10 @@ impl Agent {
         }
         for (index, mut hid) in devices.into_iter().enumerate() {
             match key.is_held_by(&mut hid) {
-                Ok(true) => return Ok(hid),
+                Ok(true) => {
+                    tracing::info!(device = hid.transport().id(), "security key chosen");
+                    return Ok(hid);
+                }
                 Ok(false) => tracing::debug!(index, "security key does not hold the credential"),
                 Err(e) => tracing::warn!(index, error = %e, "cannot probe security key"),
             }
@@ -3195,7 +3204,10 @@ mod tests {
         );
         let requests = prompt.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].action, "sign as uv@example.com");
+        assert_eq!(
+            requests[0].action,
+            "sign as uv@example.com with /dev/hidraw9"
+        );
         assert_eq!(requests[0].retries, Some(8));
         assert_eq!(requests[0].problem, None);
         assert_eq!(setup.sink.1.lock().unwrap().len(), 1);

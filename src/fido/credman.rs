@@ -180,7 +180,7 @@ fn enumerate_rps<T: HidTransport>(
     };
     let (rp, total) = parse_rp(&first)?;
     let mut rps = vec![rp];
-    for _ in 1..total.unwrap_or(1) {
+    for _ in 1..enumeration_count(total)? {
         let next = command(hid, &request(cmd, ENUMERATE_RPS_GET_NEXT, None, None)?)?;
         rps.push(parse_rp(&next)?.0);
     }
@@ -211,7 +211,7 @@ fn enumerate_credentials<T: HidTransport>(
     };
     let (credential, total) = parse_credential(&first, rp_id)?;
     let mut credentials = vec![credential];
-    for _ in 1..total.unwrap_or(1) {
+    for _ in 1..enumeration_count(total)? {
         let next = command(
             hid,
             &request(cmd, ENUMERATE_CREDENTIALS_GET_NEXT, None, None)?,
@@ -219,6 +219,20 @@ fn enumerate_credentials<T: HidTransport>(
         credentials.push(parse_credential(&next, rp_id)?.0);
     }
     Ok(credentials)
+}
+
+/// Most RPs, or credentials of one RP, an enumeration follows; real
+/// authenticators hold a few dozen resident credentials at most.
+const MAX_ENUMERATED: u64 = 256;
+
+/// How many items the first reply of an enumeration announced (one when it
+/// did not say). A count past [`MAX_ENUMERATED`] is refused, so a bad device
+/// cannot keep the loop asking for more.
+fn enumeration_count(total: Option<u64>) -> Result<u64, FidoError> {
+    match total.unwrap_or(1) {
+        n if n > MAX_ENUMERATED => Err(FidoError::Protocol("too many resident credentials")),
+        n => Ok(n),
+    }
 }
 
 /// `subCommandParams` for enumerating one RP's credentials: `{1: rpIDHash}`.
@@ -353,6 +367,16 @@ fn parse_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enumeration_counts_are_capped() {
+        assert_eq!(enumeration_count(None).unwrap(), 1);
+        assert_eq!(
+            enumeration_count(Some(MAX_ENUMERATED)).unwrap(),
+            MAX_ENUMERATED
+        );
+        assert!(enumeration_count(Some(u64::MAX)).is_err());
+    }
 
     #[test]
     fn command_byte_prefers_ctap_2_1() {

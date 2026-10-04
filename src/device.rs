@@ -296,10 +296,16 @@ impl<T: HidTransport> OnlyKey<T> {
     }
 
     /// Wait for a multi-report reply: the first report within `timeout`, then
-    /// more until the token has been quiet for [`Timeouts::gap`].
+    /// more until the token has been quiet for [`Timeouts::gap`]. The only
+    /// such replies are RSA values, so one longer than the longest of those
+    /// is refused rather than read for as long as the device keeps sending.
     fn await_data_all(&mut self, timeout: Duration) -> Result<Vec<u8>, DeviceError> {
+        let max = RSA_LENGTHS.iter().copied().max().unwrap_or_default();
         let mut out = self.await_data(timeout)?.to_vec();
         loop {
+            if out.len() > max {
+                return Err(DeviceError::RsaLength(out.len()));
+            }
             match await_response(&mut self.transport, &self.timeouts, self.timeouts.gap) {
                 Ok(Response::Data(report)) => out.extend_from_slice(&report),
                 Ok(Response::DeviceError(text)) => return Err(firmware_error(text)),
@@ -648,6 +654,27 @@ mod tests {
         (0..n)
             .map(|i| std::array::from_fn(|j| seed ^ (i as u8) ^ (j as u8)))
             .collect()
+    }
+
+    /// A device that keeps sending data stops being read once the reply is
+    /// longer than any RSA value.
+    #[test]
+    fn rsa_reply_longer_than_any_rsa_value_is_cut_short() {
+        let id: Identity = "ferris@example.com".parse().unwrap();
+        let hash = id.derivation_hash();
+        let mut steps = vec![
+            Step::ExpectWrite(protocol::settime_report(1)),
+            Step::Reply(text("UNLOCKEDv3.0.4-prodc")),
+            Step::ExpectWrite(protocol::getpubkey_report(1, 0x00, &hash)),
+        ];
+        // Nine reports are read; the tenth onwards are never asked for.
+        steps.extend(numbered_reports(9, 0x30).iter().map(|r| Step::Reply(*r)));
+        let mut ok = OnlyKey::handshake(ScriptedTransport::new(steps), fast(), 1).unwrap();
+        assert!(matches!(
+            ok.public_key(&rsa(1)),
+            Err(DeviceError::RsaLength(576))
+        ));
+        ok.into_transport().assert_done();
     }
 
     #[test]
