@@ -200,8 +200,9 @@ impl Connection {
         &self.bindings
     }
 
-    /// Whether the client sent a `session-bind@openssh.com` request that
-    /// failed.
+    /// Whether the client sent any `session-bind@openssh.com` request, as
+    /// `ssh` does on a connection it forwards or authenticates with. With no
+    /// [`Self::bindings`], the bind failed.
     pub fn bind_attempted(&self) -> bool {
         self.bind_attempted
     }

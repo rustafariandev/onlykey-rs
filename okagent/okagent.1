@@ -211,6 +211,8 @@ are stored and enforced: the
 extension OpenSSH sends is verified against the server's host-key signature
 and recorded per connection, and the key signs only on a connection bound to
 a permitted host.
+As in OpenSSH, a connection that sent a session binding (one forwarded from
+a remote host) cannot add or remove token keys.
 .BI "ssh-add \-s " "provider certificate" \fR...
 also serves the given OpenSSH certificates of the key, each as an identity
 of its own that the token signs for; certificates of other keys are skipped.

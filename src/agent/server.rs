@@ -122,7 +122,9 @@ pub struct Agent {
     pin_tokens: Mutex<HashMap<String, CachedPin>>,
     cache: Mutex<HashMap<KeySpec, PublicKey>>,
     /// The `ssh-add -c`/`-h` constraints of added keys, by their public key
-    /// blob. Entries are cleared when the key is re-added or removed.
+    /// blob, shared with the certificates the key signs for. Entries are
+    /// replaced when the key is re-added, and cleared when it is removed
+    /// unless a certificate it signs for is still served.
     meta: Mutex<HashMap<Vec<u8>, KeyMeta>>,
     /// Lifetime applied to keys added without their own `ssh-add -t`, as
     /// `ssh-agent -t` does; `None` keeps them until removed.
@@ -455,10 +457,14 @@ impl Agent {
     /// Stop serving the certificate whose blob is `blob`. Returns whether
     /// anything was removed.
     pub fn remove_cert(&self, blob: &[u8]) -> bool {
+        self.take_cert(blob).is_some()
+    }
+
+    /// Stop serving the certificate whose blob is `blob`, and return it.
+    fn take_cert(&self, blob: &[u8]) -> Option<CertIdentity> {
         let mut certs = lock(&self.certs);
-        let before = certs.len();
-        certs.retain(|e| e.item.cert.blob() != blob);
-        certs.len() != before
+        let at = certs.iter().position(|e| e.item.cert.blob() == blob)?;
+        Some(certs.remove(at).item)
     }
 
     /// Stop serving the key added with `ssh-add FILE` whose public key blob is
@@ -893,10 +899,13 @@ impl Agent {
                     return wire::failure();
                 }
                 if self.remove_key(&key_blob) {
-                    lock(&self.meta).remove(&key_blob);
+                    self.forget_meta(&key_blob);
                     tracing::info!("removed added key");
                     wire::success()
-                } else if self.remove_cert(&key_blob) {
+                } else if let Some(identity) = self.take_cert(&key_blob) {
+                    if let CertSigner::Held(key) = &identity.signer {
+                        self.forget_meta(&key.key_blob());
+                    }
                     tracing::info!("removed certificate");
                     wire::success()
                 } else if let Some((spec, _)) = self.device_key(&key_blob)
@@ -914,6 +923,15 @@ impl Agent {
                 tracing::info!("removed every identity");
                 wire::success()
             }
+            // As OpenSSH refuses remote provider adds: a forwarded hop needs
+            // only a key's label to re-add it, which would drop its
+            // `ssh-add -c`/`-h` constraints.
+            Request::AddSmartcardKey { .. } | Request::RemoveSmartcardKey { .. }
+                if connection.bind_attempted() =>
+            {
+                tracing::warn!("refused: token keys are managed only on a local connection");
+                wire::failure()
+            }
             Request::AddSmartcardKey {
                 provider,
                 lifetime,
@@ -923,10 +941,6 @@ impl Agent {
                 ..
             } => match self.provider_spec(&provider) {
                 Ok(spec) => {
-                    if !self.spec_may_manage(&spec, connection) {
-                        tracing::warn!("refused: key not permitted on this connection");
-                        return wire::failure();
-                    }
                     let identity = spec.identity.to_string();
                     let lifetime = lifetime.or(self.default_lifetime);
                     let added = match certs {
@@ -958,10 +972,6 @@ impl Agent {
                 }
             },
             Request::RemoveSmartcardKey { provider } => match self.provider_spec(&provider) {
-                Ok(spec) if !self.spec_may_manage(&spec, connection) => {
-                    tracing::warn!("refused: key not permitted on this connection");
-                    wire::failure()
-                }
                 Ok(spec) if self.remove(&spec) => {
                     tracing::info!(identity = %spec.identity, key = %spec.kind, "removed key");
                     wire::success()
@@ -1082,26 +1092,27 @@ impl Agent {
         }
     }
 
+    /// Clear the constraints of the added key `key_blob` once nothing signs
+    /// with it: its certificate is served on its own and keeps them after
+    /// the plain key is removed.
+    fn forget_meta(&self, key_blob: &[u8]) {
+        let in_use = lock(&self.held)
+            .iter()
+            .any(|e| e.item.key_blob() == key_blob)
+            || lock(&self.certs).iter().any(
+                |e| matches!(&e.item.signer, CertSigner::Held(key) if key.key_blob() == key_blob),
+            );
+        if !in_use {
+            lock(&self.meta).remove(key_blob);
+        }
+    }
+
     /// Whether this connection may add, replace or remove the key with
     /// `key_blob`, which a destination constraint can forbid even though the
     /// key is served.
     fn may_manage(&self, key_blob: &[u8], connection: &Connection) -> bool {
         let meta = self.meta_for(key_blob);
         meta.destination.is_empty() || connection.permits(&meta.destination, None)
-    }
-
-    /// The same for a token key named by `spec`, while it is cached.
-    fn spec_may_manage(&self, spec: &KeySpec, connection: &Connection) -> bool {
-        if connection.bindings().is_empty() {
-            return true;
-        }
-        let blob = lock(&self.cache)
-            .get(spec)
-            .and_then(|key| key.to_bytes().ok());
-        match blob {
-            Some(blob) => self.may_manage(&blob, connection),
-            None => true,
-        }
     }
 
     /// Drop every identity: token-backed entries, their cached keys, and the

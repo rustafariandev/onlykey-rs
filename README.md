@@ -489,7 +489,8 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   stored and enforced: the OpenSSH client's `session-bind@openssh.com`
   extension is verified against the server's host-key signature and recorded
   per connection, and a constrained key signs only on a connection bound to a
-  permitted host.
+  permitted host. As in OpenSSH, a forwarded connection cannot add or remove
+  token keys.
   `SSH2_AGENTC_ADD_IDENTITY` (and its constrained form) backs `ssh-add FILE`,
   which loads a plain ed25519, RSA or ECDSA (or, with the `dsa` feature, DSA)
   private key into the agent, and its `*-cert-v01@openssh.com` certificate;

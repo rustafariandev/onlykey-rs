@@ -1362,6 +1362,147 @@ fn destination_constrained_key_signs_only_on_its_bound_host() {
     );
 }
 
+/// A connection bound with `session-bind@openssh.com` for forwarding, as the
+/// agent connection `ssh -A` relays from a remote host looks.
+fn forwarded_connection(h: &Harness) -> UnixStream {
+    use signature::Signer;
+
+    let host = ssh_key::private::PrivateKey::new(
+        ssh_key::private::KeypairData::Ed25519(ssh_key::private::Ed25519Keypair::from_seed(
+            &[9; 32],
+        )),
+        "host",
+    )
+    .unwrap();
+    let session_id = b"forwarded session";
+    let signature = Signer::sign(&host, session_id);
+    let mut signature_bytes = Vec::new();
+    signature.encode(&mut signature_bytes).unwrap();
+
+    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let bind = session_bind_body(host.public_key(), session_id, &signature_bytes, true);
+    assert_eq!(exchange(&mut stream, &bind), vec![wire::SSH_AGENT_SUCCESS]);
+    stream
+}
+
+/// Send one request on an open connection and read its reply.
+fn exchange(stream: &mut UnixStream, body: &[u8]) -> Vec<u8> {
+    wire::write_frame(stream, body).unwrap();
+    wire::read_frame(stream).unwrap().unwrap()
+}
+
+/// The key blobs a local connection lists, in order.
+fn identity_blobs(h: &Harness) -> Vec<Vec<u8>> {
+    let reply = roundtrip(&h.socket, &[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
+    assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
+    let mut rest = &reply[1..];
+    let count = u32::decode(&mut rest).unwrap();
+    (0..count)
+        .map(|_| {
+            let blob = Vec::<u8>::decode(&mut rest).unwrap();
+            String::decode(&mut rest).unwrap();
+            blob
+        })
+        .collect()
+}
+
+/// A forwarded connection can neither re-add nor remove a token key: the
+/// key's label is all a remote host would need to re-add it without the
+/// constraints the user gave it locally.
+#[test]
+fn forwarded_connection_cannot_manage_token_keys() {
+    let h = Harness::start(Vec::new());
+    let provider = "ferris@example.com";
+
+    let mut add = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED];
+    provider.encode(&mut add).unwrap();
+    "".encode(&mut add).unwrap();
+    wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+    assert_eq!(roundtrip(&h.socket, &add), vec![wire::SSH_AGENT_SUCCESS]);
+    let keys = identity_blobs(&h);
+    assert_eq!(keys.len(), 1);
+
+    let mut forwarded = forwarded_connection(&h);
+    let mut readd = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY];
+    provider.encode(&mut readd).unwrap();
+    "".encode(&mut readd).unwrap();
+    assert_eq!(
+        exchange(&mut forwarded, &readd),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+    let mut remove = vec![wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY];
+    provider.encode(&mut remove).unwrap();
+    "".encode(&mut remove).unwrap();
+    assert_eq!(
+        exchange(&mut forwarded, &remove),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+
+    // The key is still served, and still asks before each signature.
+    assert_eq!(identity_blobs(&h), keys);
+    assert_eq!(
+        roundtrip(&h.socket, &sign_body(&keys[0], b"data")),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+    h.sink.2.lock().unwrap().push_back(true);
+    let reply = roundtrip(&h.socket, &sign_body(&keys[0], b"data"));
+    assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+}
+
+/// `ssh-add -c FILE` constrains the key and its certificate alike; removing
+/// the plain key leaves the certificate served, still asking before each
+/// signature.
+#[test]
+fn certificate_keeps_its_constraints_when_its_key_is_removed() {
+    if !have("ssh-add") || !have("ssh-keygen") {
+        eprintln!("OpenSSH tools not installed; skipping");
+        return;
+    }
+    let h = Harness::start(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_ed25519");
+    let made = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "cert@example.com"])
+        .arg("-f")
+        .arg(&key_path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let pub_path = key_path.with_extension("pub");
+    let cert_line = certify(dir.path(), &pub_path);
+    let added = h
+        .cmd("ssh-add")
+        .arg("-c")
+        .arg(&key_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(added.success());
+
+    let plain = ssh_key::PublicKey::read_openssh_file(&pub_path)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    let cert = ssh_key::Certificate::from_openssh(&cert_line)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+    plain.encode(&mut remove).unwrap();
+    assert_eq!(roundtrip(&h.socket, &remove), vec![wire::SSH_AGENT_SUCCESS]);
+    assert_eq!(identity_blobs(&h), vec![cert.clone()]);
+
+    assert_eq!(
+        roundtrip(&h.socket, &sign_body(&cert, b"data")),
+        vec![wire::SSH_AGENT_FAILURE]
+    );
+    h.sink.2.lock().unwrap().push_back(true);
+    let reply = roundtrip(&h.socket, &sign_body(&cert, b"data"));
+    assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+}
+
 /// For every key type `ssh-add FILE` accepts, okagent lists and serves the
 /// same key as OpenSSH's own agent.
 #[test]
