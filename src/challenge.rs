@@ -69,32 +69,7 @@ impl TouchRequest {
     }
 }
 
-/// One use of a key that the `ssh-add -c` confirm constraint asks the user
-/// to allow.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfirmRequest {
-    /// Comment of the key being used, e.g. `ferris@example.com`.
-    pub identity: String,
-    /// The key's SHA-256 fingerprint, as `SHA256:…`.
-    pub fingerprint: String,
-    /// What is being signed, if the request could be summarised.
-    pub subject: Option<String>,
-}
-
-impl ConfirmRequest {
-    /// One-line human-readable prompt.
-    pub fn message(&self) -> String {
-        let subject = self
-            .subject
-            .as_deref()
-            .map(|s| format!(" ({s})"))
-            .unwrap_or_default();
-        printable(&format!(
-            "Allow use of key {}{subject}? Key fingerprint {}. (yes/no)",
-            self.identity, self.fingerprint
-        ))
-    }
-}
+pub use ssh_agent_kit::policy::ConfirmRequest;
 
 /// Something a FIDO security key needs its PIN for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,25 +110,7 @@ impl PinRequest {
     }
 }
 
-/// `text` with control characters and bidirectional overrides escaped, so a
-/// prompt stays one line that says what it seems to. Key comments and the
-/// signed data's description come from clients, which could otherwise move
-/// the cursor, rewrite the prompt or send terminal escape sequences.
-fn printable(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        let reorders = matches!(
-            c,
-            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-        );
-        if c.is_control() || reorders || c == '\u{2028}' || c == '\u{2029}' {
-            out.extend(c.escape_unicode());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+use ssh_agent_kit::policy::printable;
 
 /// What a [`PinPrompt`] got from the user.
 pub enum PinAnswer {

@@ -3,18 +3,30 @@
 //! An `sk-` private key holds no secret: it carries the credential's public
 //! key, application and key handle, and every signature is produced by the
 //! attached FIDO device. `ssh-add FILE` loads one through
-//! `SSH2_AGENTC_ADD_IDENTITY`, decoded here; signing goes through
-//! [`crate::fido`].
+//! `SSH2_AGENTC_ADD_IDENTITY`, decoded here by [`SkDecoder`]; signing goes
+//! through [`crate::fido`], with the authenticators, PIN prompt and PIN-token
+//! cache of an [`SkBackend`].
 
-use super::keytype::KeyDecodeError;
+use super::server::AgentError;
+use crate::challenge::{ChallengeSink, PinPrompt, PinRequest, TouchRequest};
 use crate::fido;
 use crate::fido::ctaphid::CtapHid;
-use crate::transport::HidTransport;
+use crate::fido::{FidoError, PinAuth, PinProtocol, pin};
+use crate::transport::{HidTransport, HidapiTransport};
 use sha2::{Digest, Sha256};
+use ssh_agent_kit::backend::Lifecycle;
+use ssh_agent_kit::keytype::{KeyDecodeError, KeyDecoder};
+use ssh_agent_kit::signer::{BoxError, Signer, SignerRef};
+use ssh_agent_kit::wire;
 use ssh_encoding::{Decode, Encode, Reader};
+use ssh_key::HashAlg;
 use ssh_key::private::{SkEcdsaSha2NistP256, SkEd25519};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, Mpint, PublicKey, Signature};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /// `sk-ssh-ed25519@openssh.com`, from OpenSSH's `PROTOCOL.u2f`.
 pub const SK_SSH_ED25519: &str = "sk-ssh-ed25519@openssh.com";
@@ -278,6 +290,325 @@ impl SkKey {
     }
 }
 
+/// How the agent obtains the FIDO authenticators for each security-key
+/// signature. With more than one, the agent asks each which holds the key.
+pub type SkOpener = Arc<dyn Fn() -> Result<Vec<Box<dyn HidTransport>>, FidoError> + Send + Sync>;
+
+/// The default: every attached FIDO security key, discovered over hidraw.
+fn default_sk_opener() -> SkOpener {
+    Arc::new(|| {
+        Ok(HidapiTransport::open_all_fido(None)?
+            .into_iter()
+            .map(|t| Box::new(t) as Box<dyn HidTransport>)
+            .collect())
+    })
+}
+
+/// Lock `mutex`, carrying on if a thread panicked while holding it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// What signing with security keys needs: the authenticators, a way to ask
+/// for the PIN, and the PIN tokens kept for reuse. Shared by every
+/// [`SkKey`] the agent serves; its settings can change while it serves.
+pub struct SkBackend {
+    settings: RwLock<SkSettings>,
+    sink: Arc<dyn ChallengeSink>,
+    /// Serialises FIDO operations, which also wait for a touch.
+    sk_lock: Mutex<()>,
+    /// PIN tokens kept by device id while `pin_cache` allows.
+    pin_tokens: Mutex<HashMap<String, CachedPin>>,
+}
+
+#[derive(Clone)]
+struct SkSettings {
+    opener: SkOpener,
+    /// Asks for a security key's PIN; without one, keys enrolled with user
+    /// verification required cannot sign.
+    pin_prompt: Option<Arc<dyn PinPrompt>>,
+    /// How long a PIN token is kept for reuse; `None` asks every time.
+    pin_cache: Option<Duration>,
+}
+
+/// A PIN token kept for reuse on one device.
+struct CachedPin {
+    protocol: PinProtocol,
+    token: Zeroizing<Vec<u8>>,
+    expires: Instant,
+}
+
+impl SkBackend {
+    /// Sign with every attached security key, telling the user to touch it
+    /// through `sink`. No PIN prompt and no PIN cache until set.
+    pub fn new(sink: Arc<dyn ChallengeSink>) -> Self {
+        SkBackend {
+            settings: RwLock::new(SkSettings {
+                opener: default_sk_opener(),
+                pin_prompt: None,
+                pin_cache: None,
+            }),
+            sink,
+            sk_lock: Mutex::new(()),
+            pin_tokens: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn settings(&self) -> SkSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn update(&self, change: impl FnOnce(&mut SkSettings)) {
+        change(&mut self.settings.write().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    /// Replace how FIDO authenticators are opened (for tests and for a fixed
+    /// `--fido-device` path).
+    pub fn set_opener(&self, opener: SkOpener) {
+        self.update(|s| s.opener = opener);
+    }
+
+    /// Ask for security key PINs with `prompt`, so keys enrolled with user
+    /// verification required (`ssh-keygen -O verify-required`) can sign.
+    pub fn set_pin_prompt(&self, prompt: Arc<dyn PinPrompt>) {
+        self.update(|s| s.pin_prompt = Some(prompt));
+    }
+
+    /// Keep a security key's PIN token for `duration` after the PIN is
+    /// entered, so signatures within that time ask only for a touch. Zero
+    /// keeps nothing, which is the default. The tokens are dropped when the
+    /// agent is locked or every identity is removed.
+    pub fn set_pin_cache(&self, duration: Duration) {
+        self.update(|s| s.pin_cache = (!duration.is_zero()).then_some(duration));
+    }
+
+    /// Drop every kept PIN token.
+    pub fn forget_pins(&self) {
+        lock(&self.pin_tokens).clear();
+    }
+
+    /// Sign with a FIDO credential, waiting for the authenticator's touch.
+    ///
+    /// As in OpenSSH, a credential whose application is not `ssh:` signs only
+    /// SSH userauth requests and SSHSIG blobs, so the agent cannot be used to
+    /// mint assertions for the website such a credential may belong to.
+    pub fn sign(&self, key: &SkKey, data: &[u8]) -> Result<Signature, AgentError> {
+        if !key.is_ssh_application() && wire::classify_data(data) == wire::SignedData::Other {
+            return Err(AgentError::NotWebSafe(key.application().to_owned()));
+        }
+        let settings = self.settings();
+        let _guard = lock(&self.sk_lock);
+        // Refuse before opening the device when no prompt can ask for the PIN.
+        if key.needs_verification() && !settings.pin_prompt.as_ref().is_some_and(|p| p.available())
+        {
+            return Err(FidoError::UvRequired.into());
+        }
+        let mut hid = self.authenticator_for(&settings, key)?;
+        let request = TouchRequest {
+            identity: key.display_name(),
+            subject: wire::describe_data(data),
+        };
+        let on_presence = || {
+            tracing::info!("security key is waiting for a touch");
+            self.sink.present_touch(&request);
+        };
+        let sig = if key.needs_verification() {
+            self.sign_verified(&settings, key, &mut hid, data, &request, &on_presence)?
+        } else {
+            key.sign_with(&mut hid, data, None, &on_presence)?
+        };
+        tracing::info!(
+            comment = key.public_key().comment(),
+            algorithm = %sig.algorithm(),
+            "signed with security key"
+        );
+        Ok(sig)
+    }
+
+    /// Sign with a key that needs the user verified: with a cached PIN token
+    /// if one is kept for the device, else with one from the user's PIN. A
+    /// cached token the device refuses (it was replugged) is dropped and the
+    /// PIN asked for instead.
+    fn sign_verified(
+        &self,
+        settings: &SkSettings,
+        key: &SkKey,
+        hid: &mut CtapHid<Box<dyn HidTransport>>,
+        data: &[u8],
+        touch: &TouchRequest,
+        on_presence: &dyn Fn(),
+    ) -> Result<Signature, AgentError> {
+        let device = hid.transport().id();
+        if let Some((protocol, token)) = self.cached_pin(settings, device.as_deref()) {
+            let auth = PinAuth {
+                protocol,
+                token: &token,
+            };
+            match key.sign_with(hid, data, Some(auth), on_presence) {
+                Err(FidoError::PinAuthInvalid) => {
+                    tracing::info!("cached PIN token was refused; asking for the PIN");
+                    self.forget_pin(device.as_deref());
+                }
+                result => return Ok(result?),
+            }
+        }
+        let (protocol, token) = self.pin_token(settings, hid, key, touch)?;
+        let auth = PinAuth {
+            protocol,
+            token: &token,
+        };
+        let sig = key.sign_with(hid, data, Some(auth), on_presence)?;
+        self.keep_pin(settings, device, protocol, token);
+        Ok(sig)
+    }
+
+    /// Ask the user for the PIN and exchange it for a PIN token allowed to
+    /// sign for `key`'s application.
+    fn pin_token(
+        &self,
+        settings: &SkSettings,
+        hid: &mut CtapHid<Box<dyn HidTransport>>,
+        key: &SkKey,
+        touch: &TouchRequest,
+    ) -> Result<(PinProtocol, Zeroizing<Vec<u8>>), AgentError> {
+        let prompt = settings.pin_prompt.as_ref().ok_or(FidoError::UvRequired)?;
+        // Name the device: with several attached, the one that answered the
+        // probe gets the PIN, and only the user can tell if it is theirs.
+        let action = match hid.transport().id() {
+            Some(device) => format!("sign as {} with {device}", touch.identity),
+            None => format!("sign as {}", touch.identity),
+        };
+        let request = PinRequest {
+            action,
+            subject: touch.subject.clone(),
+            retries: None,
+            problem: None,
+        };
+        let permissions = pin::Permissions {
+            bits: pin::PERMISSION_GET_ASSERTION,
+            rp_id: Some(key.application()),
+        };
+        Ok(pin::pin_token_interactive(
+            hid,
+            prompt.as_ref(),
+            &request,
+            permissions,
+        )?)
+    }
+
+    /// The PIN token kept for `device`, if the cache is on and it is fresh.
+    fn cached_pin(
+        &self,
+        settings: &SkSettings,
+        device: Option<&str>,
+    ) -> Option<(PinProtocol, Zeroizing<Vec<u8>>)> {
+        settings.pin_cache?;
+        let mut tokens = lock(&self.pin_tokens);
+        let now = Instant::now();
+        tokens.retain(|_, cached| cached.expires > now);
+        tokens
+            .get(device?)
+            .map(|cached| (cached.protocol, cached.token.clone()))
+    }
+
+    fn keep_pin(
+        &self,
+        settings: &SkSettings,
+        device: Option<String>,
+        protocol: PinProtocol,
+        token: Zeroizing<Vec<u8>>,
+    ) {
+        let (Some(ttl), Some(device)) = (settings.pin_cache, device) else {
+            return;
+        };
+        let cached = CachedPin {
+            protocol,
+            token,
+            expires: Instant::now() + ttl,
+        };
+        lock(&self.pin_tokens).insert(device, cached);
+    }
+
+    fn forget_pin(&self, device: Option<&str>) {
+        if let Some(device) = device {
+            lock(&self.pin_tokens).remove(device);
+        }
+    }
+
+    /// The attached authenticator to sign with `key`. A lone device is used
+    /// as is; among several, the first that answers a silent probe for the
+    /// credential is chosen, so no touch is asked of the others.
+    fn authenticator_for(
+        &self,
+        settings: &SkSettings,
+        key: &SkKey,
+    ) -> Result<CtapHid<Box<dyn HidTransport>>, AgentError> {
+        let mut devices: Vec<_> = (settings.opener)()?.into_iter().map(CtapHid::new).collect();
+        if devices.len() <= 1 {
+            return devices.pop().ok_or(AgentError::Fido(FidoError::NoDevice));
+        }
+        for (index, mut hid) in devices.into_iter().enumerate() {
+            match key.is_held_by(&mut hid) {
+                Ok(true) => {
+                    tracing::info!(device = hid.transport().id(), "security key chosen");
+                    return Ok(hid);
+                }
+                Ok(false) => tracing::debug!(index, "security key does not hold the credential"),
+                Err(e) => tracing::warn!(index, error = %e, "cannot probe security key"),
+            }
+        }
+        Err(FidoError::NoCredential.into())
+    }
+}
+
+/// PIN tokens do not outlive a lock or an `ssh-add -D`.
+impl Lifecycle for SkBackend {
+    fn locked(&self) {
+        self.forget_pins();
+    }
+
+    fn cleared(&self) {
+        self.forget_pins();
+    }
+}
+
+/// Decodes the FIDO `sk-` key types of `ssh-add FILE` into keys that sign
+/// through an [`SkBackend`].
+pub struct SkDecoder(pub Arc<SkBackend>);
+
+impl KeyDecoder for SkDecoder {
+    fn key_types(&self) -> &[&str] {
+        &[SK_SSH_ED25519, SK_ECDSA_P256]
+    }
+
+    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<SignerRef, KeyDecodeError> {
+        let key = decode(key_type, reader)?;
+        Ok(SignerRef::new(SkSigner {
+            key,
+            backend: Arc::clone(&self.0),
+        }))
+    }
+}
+
+/// A security key the agent serves, signed through its backend.
+struct SkSigner {
+    key: SkKey,
+    backend: Arc<SkBackend>,
+}
+
+impl Signer for SkSigner {
+    fn public_key(&self) -> &PublicKey {
+        self.key.public_key()
+    }
+
+    fn sign(&self, data: &[u8], _hash: HashAlg) -> Result<Signature, BoxError> {
+        Ok(self.backend.sign(&self.key, data)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +785,77 @@ mod tests {
         keys::verify(key.public_key(), b"hello", &sig).unwrap();
         // The signature carries the UV flag the server checks.
         assert_eq!(sig.as_bytes()[64] & USER_VERIFICATION, USER_VERIFICATION);
+    }
+
+    /// A registry with okagent's security-key decoder.
+    fn registry() -> ssh_agent_kit::KeyRegistry {
+        let sink = Arc::new(crate::challenge::RecordingSink::default());
+        let mut registry = ssh_agent_kit::KeyRegistry::builtin();
+        registry.register(SkDecoder(Arc::new(SkBackend::new(sink))));
+        registry
+    }
+
+    /// `ssh-add FILE` of a security key decodes through [`SkDecoder`], with
+    /// or without the `sk-provider@openssh.com` constraint ssh-add attaches.
+    #[test]
+    fn security_key_adds_parse_with_the_decoder() {
+        use ssh_agent_kit::wire::{self, Request, WireError};
+        let device = FakeFido::new(&[0x42; 32], "ssh:", &[1, 2, 3], 0x01);
+        let mut add = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        SK_SSH_ED25519.encode(&mut add).unwrap();
+        add.extend(add_body(&device, "ferris@example.com"));
+        match wire::parse_request_with(&registry(), &add).unwrap() {
+            Request::AddIdentity { key, lifetime, .. } => {
+                assert_eq!(key.comment(), "ferris@example.com");
+                assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519);
+                assert_eq!(lifetime, None);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        let mut constrained = add.clone();
+        constrained[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_EXTENSION
+            .encode(&mut constrained)
+            .unwrap();
+        "sk-provider@openssh.com".encode(&mut constrained).unwrap();
+        "internal".encode(&mut constrained).unwrap();
+        assert!(matches!(
+            wire::parse_request_with(&registry(), &constrained).unwrap(),
+            Request::AddIdentity { .. }
+        ));
+
+        // A malformed body is a decode error, not a crash.
+        let mut truncated = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        SK_SSH_ED25519.encode(&mut truncated).unwrap();
+        assert!(matches!(
+            wire::parse_request_with(&registry(), &truncated),
+            Err(WireError::Key(KeyDecodeError::Malformed(_)))
+        ));
+    }
+
+    /// A security key's certificate decodes through [`SkDecoder`] as well.
+    #[test]
+    fn decodes_a_security_key_certificate_add() {
+        use ssh_agent_kit::testing::{cert_body, certify};
+        use ssh_key::public::{Ed25519PublicKey, SkEd25519};
+        let public = SkEd25519::new(Ed25519PublicKey([0x42; 32]), "ssh:");
+        let cert = certify(&KeyData::SkEd25519(public));
+        // Without the public key and application: flags, handle, reserved.
+        let mut private = Vec::new();
+        0x01u8.encode(&mut private).unwrap();
+        [1u8, 2, 3].as_slice().encode(&mut private).unwrap();
+        b"".as_slice().encode(&mut private).unwrap();
+        let body = cert_body(&cert, &private, "ferris@example.com");
+        let mut r = body.as_slice();
+        let (key, _) = ssh_agent_kit::cert::decode_cert_add(
+            &registry(),
+            "sk-ssh-ed25519-cert-v01@openssh.com",
+            &mut r,
+        )
+        .unwrap();
+        assert!(r.is_empty());
+        assert_eq!(key.public_key().algorithm(), Algorithm::SkEd25519);
+        assert!(cert.certifies(key.public_key()));
     }
 }

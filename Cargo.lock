@@ -742,6 +742,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signature",
+ "ssh-agent-kit",
  "ssh-encoding",
  "ssh-key",
  "tempfile",
@@ -1130,6 +1131,22 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "ssh-agent-kit"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "rand_core",
+ "rsa",
+ "sha2",
+ "signature",
+ "ssh-encoding",
+ "ssh-key",
+ "thiserror",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

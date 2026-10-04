@@ -30,9 +30,11 @@ serde = ["dep:serde"]
 test-util = []
 # Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`. Off by default:
 # OpenSSH disabled DSA in 9.8 and removed it in 10.0.
-dsa = ["ssh-key/dsa"]
+dsa = ["ssh-key/dsa", "ssh-agent-kit/dsa"]
 
 [dependencies]
+# The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
+ssh-agent-kit = { path = "../ssh-agent-kit" }
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
 ssh-encoding = { version = "0.2", features = ["base64"] }
 signature = "2"
@@ -62,6 +64,7 @@ hidapi = { version = "2.6", default-features = false, features = ["linux-native-
 hidapi = { version = "2.6", default-features = false }
 
 [dev-dependencies]
+ssh-agent-kit = { path = "../ssh-agent-kit", features = ["test-util"] }
 serde_json = "1"
 tempfile = "3"
 ed25519-dalek = "2"

@@ -14,7 +14,7 @@
 //! `ssh-add FILE`; the agent signs with it in memory, with no token and no
 //! challenge. The key types the agent can load
 //! are pluggable: implement [`agent::KeyDecoder`] and register it with
-//! [`agent::Agent::register_key_type`]. In-memory keys are signed by a
+//! [`agent::Agent::with_key_type`]. In-memory keys are signed by a
 //! [`agent::local::LocalKey`] implementation.
 //!
 //! FIDO security-key SSH keys (`sk-ssh-ed25519@openssh.com` and
@@ -79,8 +79,10 @@
 //! - [`challenge`]: how the 3-digit challenge reaches the user.
 //! - [`fido`]: the CTAPHID/CTAP2 client that signs with a FIDO authenticator
 //!   when an `sk-` key is served.
-//! - [`agent`]: the SSH agent wire protocol and unix-socket server;
-//!   [`agent::Extension`] lets callers answer protocol extension requests and
+//! - [`agent`]: the SSH agent, built on the [`ssh_agent_kit`] framework,
+//!   which provides the wire protocol and unix-socket server; this crate adds
+//!   the OnlyKey and FIDO backends. [`agent::Extension`] lets callers answer
+//!   protocol extension requests and
 //!   [`agent::KeyDecoder`] lets them add key types. The built-in
 //!   [`agent::destination`] support verifies `session-bind@openssh.com` and
 //!   enforces `ssh-add -h` destination constraints, and `ssh-add -c`
