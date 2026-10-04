@@ -22,11 +22,11 @@ use ssh_encoding::Decode;
 use ssh_key::HashAlg;
 use ssh_key::PublicKey;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -879,18 +879,18 @@ impl Agent {
                     tracing::warn!("refused: key not permitted on this connection");
                     return wire::failure();
                 }
-                let lifetime = lifetime.or(self.default_lifetime);
-                match cert {
-                    Some(cert) => self.add_cert_key(key, *cert, lifetime),
-                    None => self.add_key(key, lifetime),
-                }
-                self.set_meta(
-                    blob,
-                    KeyMeta {
-                        confirm,
-                        destination,
-                    },
-                );
+                let lifetime = self.lifetime_for(lifetime);
+                let meta = KeyMeta {
+                    confirm,
+                    destination,
+                };
+                let _ = self.publish_constrained(blob, meta, || {
+                    match cert {
+                        Some(cert) => self.add_cert_key(key, *cert, lifetime),
+                        None => self.add_key(key, lifetime),
+                    }
+                    Ok(())
+                });
                 wire::success()
             }
             Request::RemoveIdentity { key_blob } => {
@@ -942,24 +942,21 @@ impl Agent {
             } => match self.provider_spec(&provider) {
                 Ok(spec) => {
                     let identity = spec.identity.to_string();
-                    let lifetime = lifetime.or(self.default_lifetime);
-                    let added = match certs {
-                        Some(certs) => self.add_with_certs(spec, lifetime, certs),
-                        None => self.add(spec, lifetime),
+                    let lifetime = self.lifetime_for(lifetime);
+                    let meta = KeyMeta {
+                        confirm,
+                        destination,
                     };
+                    // Fetch the key first: its blob names the constraints.
+                    let added = self.derive_one(&spec).and_then(|key| {
+                        let blob = key.to_bytes().map_err(keys::KeyError::InvalidPublicKey)?;
+                        self.publish_constrained(blob, meta, || match certs {
+                            Some(certs) => self.add_with_certs(spec, lifetime, certs),
+                            None => self.add(spec, lifetime),
+                        })
+                    });
                     match added {
-                        Ok(key) => {
-                            if let Ok(blob) = key.to_bytes() {
-                                self.set_meta(
-                                    blob,
-                                    KeyMeta {
-                                        confirm,
-                                        destination,
-                                    },
-                                );
-                            }
-                            wire::success()
-                        }
+                        Ok(_) => wire::success(),
                         Err(e) => {
                             tracing::warn!(identity, error = %e, "cannot add key");
                             wire::failure()
@@ -1083,6 +1080,31 @@ impl Agent {
             return meta.clone();
         }
         KeyMeta::default()
+    }
+
+    /// The lifetime of a key added with `lifetime` from `ssh-add -t`: the
+    /// agent's default without one. A zero, which `ssh-add` never sends, also
+    /// gets the default rather than escaping it.
+    fn lifetime_for(&self, lifetime: Option<u32>) -> Option<u32> {
+        lifetime.filter(|secs| *secs > 0).or(self.default_lifetime)
+    }
+
+    /// Record `meta` for the key `blob` before `publish` serves it, so a sign
+    /// on another connection never finds the key without its constraints.
+    /// If publishing fails, the key's previous constraints are put back.
+    fn publish_constrained<T>(
+        &self,
+        blob: Vec<u8>,
+        meta: KeyMeta,
+        publish: impl FnOnce() -> Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        let previous = lock(&self.meta).get(&blob).cloned();
+        self.set_meta(blob.clone(), meta);
+        let published = publish();
+        if published.is_err() {
+            self.set_meta(blob, previous.unwrap_or_default());
+        }
+        published
     }
 
     /// Record or clear the constraints of an added key.
@@ -1448,6 +1470,8 @@ fn session_bind(data: &[u8], connection: &mut Connection) -> Result<(), destinat
 /// Serve one client connection until it closes.
 pub fn handle_connection(agent: &Agent, mut stream: UnixStream) {
     let _ = stream.set_nonblocking(false);
+    // A client that stops reading must not hold the thread forever.
+    let _ = stream.set_write_timeout(Some(FRAME_TIMEOUT));
     let mut reader = match stream.try_clone() {
         Ok(r) => r,
         Err(e) => {
@@ -1459,8 +1483,21 @@ pub fn handle_connection(agent: &Agent, mut stream: UnixStream) {
     // keep them across the requests that arrive on it.
     let mut connection = Connection::default();
     loop {
+        // A connection may sit idle between requests for as long as its SSH
+        // session lasts, but once a request starts it must arrive whole.
+        let _ = reader.set_read_timeout(None);
+        let mut first = [0u8; 1];
+        match reader.read(&mut first) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "connection closed");
+                return;
+            }
+        }
+        let _ = reader.set_read_timeout(Some(FRAME_TIMEOUT));
         // A request may carry a private key (`ssh-add FILE`): wipe it after.
-        let body = match wire::read_frame(&mut reader) {
+        let body = match wire::read_frame(&mut first.as_slice().chain(&mut reader)) {
             Ok(Some(body)) => Zeroizing::new(body),
             Ok(None) => return,
             Err(e) => {
@@ -1479,6 +1516,39 @@ pub fn handle_connection(agent: &Agent, mut stream: UnixStream) {
 /// How often [`serve`] drops keys whose lifetime has run out.
 const PURGE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a started request may take to arrive, and a reply to be read.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections served at once; more are closed until some end, so idle or
+/// stalled clients cannot exhaust threads and memory.
+const MAX_CONNECTIONS: usize = 128;
+
+/// Counts a connection while its thread runs.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether the peer runs as this user or root, as OpenSSH's agent checks:
+/// socket permissions are the first line, this the second.
+fn peer_allowed(stream: &UnixStream) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let peer = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map(|cred| cred.uid());
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let peer = nix::unistd::getpeereid(stream).map(|(uid, _)| uid.as_raw());
+    match peer {
+        Ok(uid) => uid == nix::unistd::getuid().as_raw() || uid == 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot get peer credentials");
+            false
+        }
+    }
+}
+
 /// Accept connections until `shutdown` is set. Each connection runs on its
 /// own thread. Keys whose lifetime has run out are dropped as it goes.
 pub fn serve(
@@ -1488,6 +1558,7 @@ pub fn serve(
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let mut last_purge = Instant::now();
+    let active = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::SeqCst) {
         // Drop keys whose `ssh-add -t` lifetime has run out even when no
         // client is talking to the agent, so their secrets do not linger.
@@ -1497,8 +1568,21 @@ pub fn serve(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                if !peer_allowed(&stream) {
+                    tracing::warn!("refused a connection from another user");
+                    continue;
+                }
+                if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    tracing::warn!(limit = MAX_CONNECTIONS, "too many connections; refused one");
+                    continue;
+                }
+                let slot = ConnectionSlot(Arc::clone(&active));
                 let agent = Arc::clone(&agent);
-                std::thread::spawn(move || handle_connection(&agent, stream));
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    handle_connection(&agent, stream)
+                });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25));
@@ -2811,6 +2895,32 @@ mod tests {
             .expires
             .expect("the explicit lifetime was set");
         assert!(expires < Instant::now() + Duration::from_secs(5));
+
+        // A zero lifetime does not escape the default.
+        let (mut zero, _) = local_key(0x14, "zero@example.com");
+        zero[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut zero)
+            .unwrap();
+        0u32.encode(&mut zero).unwrap();
+        assert_eq!(agent.handle(&zero), wire::success());
+        let expires = agent.held.lock().unwrap()[1]
+            .expires
+            .expect("the default set a lifetime");
+        assert!(expires > Instant::now() + Duration::from_secs(30));
+    }
+
+    /// A constraint given twice is refused, as OpenSSH refuses it.
+    #[test]
+    fn a_duplicate_constraint_is_refused() {
+        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
+        let (mut add, _) = local_key(0x15, "twice@example.com");
+        add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        assert_eq!(agent.handle(&add), wire::failure());
+        assert!(agent.held.lock().unwrap().is_empty());
     }
 
     /// A security key enrolled for a website, not `ssh:`, signs SSH data only:

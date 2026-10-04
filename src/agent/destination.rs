@@ -48,6 +48,10 @@ pub enum ConstraintError {
     TooMany,
     #[error("the destination-constraint user pattern is too long")]
     UserTooLong,
+    #[error(
+        "a destination-constraint hop names only certificate authorities; host certificates are not supported, so the key could never be used there"
+    )]
+    CertificateAuthorityOnly,
 }
 
 /// One host key of a constraint hop: a plain key to match exactly, or a CA
@@ -146,6 +150,13 @@ pub fn parse_constraints(
         }
         if constraint.to.hostname.is_none() || constraint.to.hostkeys.is_empty() {
             return Err(ConstraintError::IncompleteTo);
+        }
+        // CA keys never match (see `permits`), so a hop with nothing else
+        // would make the key unusable without saying why.
+        for hop in [&constraint.from, &constraint.to] {
+            if !hop.hostkeys.is_empty() && hop.hostkeys.iter().all(|spec| spec.is_ca) {
+                return Err(ConstraintError::CertificateAuthorityOnly);
+            }
         }
         constraints.push(constraint);
     }
@@ -490,6 +501,22 @@ mod tests {
         let mut out = Vec::new();
         body.encode(&mut out).unwrap();
         out
+    }
+
+    /// Host certificates are not supported, so a hop with only CA keys is
+    /// refused when the key is added; one with a plain key too is kept.
+    #[test]
+    fn a_hop_with_only_ca_keys_is_refused() {
+        let ca = keyspec(&public(1), true);
+        let payload = extension(&[constraint("", &[], "", "example.com", &ca)]);
+        assert!(matches!(
+            parse_constraints(&mut payload.as_slice()),
+            Err(ConstraintError::CertificateAuthorityOnly)
+        ));
+        let mut mixed = ca.clone();
+        mixed.extend(keyspec(&public(2), false));
+        let payload = extension(&[constraint("", &[], "", "example.com", &mixed)]);
+        assert_eq!(parse_constraints(&mut payload.as_slice()).unwrap().len(), 1);
     }
 
     #[test]

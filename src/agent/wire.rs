@@ -78,6 +78,8 @@ pub enum WireError {
     UnsupportedConstraint(u8),
     #[error("unsupported key constraint extension {0:?}")]
     UnsupportedExtension(String),
+    #[error("key constraint {0} given twice")]
+    DuplicateConstraint(&'static str),
     #[error(transparent)]
     Constraint(#[from] destination::ConstraintError),
     #[error("frame of {0} bytes exceeds the {MAX_FRAME}-byte limit")]
@@ -306,18 +308,37 @@ struct Constraints {
 /// rejected so it is not silently dropped.
 fn parse_constraints(rest: &mut &[u8]) -> Result<Constraints, WireError> {
     let mut constraints = Constraints::default();
+    // As OpenSSH, a constraint given twice is refused rather than the later
+    // one silently winning.
+    let mut seen = Vec::new();
+    let mut once = |name: &'static str| {
+        if seen.contains(&name) {
+            return Err(WireError::DuplicateConstraint(name));
+        }
+        seen.push(name);
+        Ok(())
+    };
     while !rest.is_empty() {
         let kind = u8::decode(rest)?;
         match kind {
-            SSH_AGENT_CONSTRAIN_LIFETIME => constraints.lifetime = Some(u32::decode(rest)?),
-            SSH_AGENT_CONSTRAIN_CONFIRM => constraints.confirm = true,
+            SSH_AGENT_CONSTRAIN_LIFETIME => {
+                once("lifetime")?;
+                constraints.lifetime = Some(u32::decode(rest)?);
+            }
+            SSH_AGENT_CONSTRAIN_CONFIRM => {
+                once("confirm")?;
+                constraints.confirm = true;
+            }
             SSH_AGENT_CONSTRAIN_EXTENSION => {
                 let name = String::decode(rest)?;
                 if name == "sk-provider@openssh.com" {
+                    once("sk-provider@openssh.com")?;
                     let _provider = String::decode(rest)?;
                 } else if name == cert::ASSOCIATED_CERTS {
+                    once(cert::ASSOCIATED_CERTS)?;
                     constraints.certs = Some(cert::parse_associated_certs(rest)?);
                 } else if name == destination::RESTRICT_DESTINATION {
+                    once(destination::RESTRICT_DESTINATION)?;
                     constraints.destination = destination::parse_constraints(rest)?;
                 } else {
                     return Err(WireError::UnsupportedExtension(name));

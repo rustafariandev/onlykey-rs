@@ -1503,6 +1503,39 @@ fn certificate_keeps_its_constraints_when_its_key_is_removed() {
     assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
 }
 
+/// At most 128 connections are served at once: another is closed unanswered
+/// until one of them ends.
+#[test]
+fn connections_beyond_the_limit_are_closed() {
+    let h = Harness::start(Vec::new());
+    let list = [wire::SSH2_AGENTC_REQUEST_IDENTITIES];
+    let mut open: Vec<UnixStream> = (0..128)
+        .map(|_| {
+            let mut stream = UnixStream::connect(&h.socket).unwrap();
+            exchange(&mut stream, &list);
+            stream
+        })
+        .collect();
+
+    let mut extra = UnixStream::connect(&h.socket).unwrap();
+    let _ = wire::write_frame(&mut extra, &list);
+    assert!(!matches!(wire::read_frame(&mut extra), Ok(Some(_))));
+
+    // Once one ends, a new connection is served again.
+    drop(open.pop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut stream = UnixStream::connect(&h.socket).unwrap();
+        let _ = wire::write_frame(&mut stream, &list);
+        if let Ok(Some(reply)) = wire::read_frame(&mut stream) {
+            assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never served again");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// For every key type `ssh-add FILE` accepts, okagent lists and serves the
 /// same key as OpenSSH's own agent.
 #[test]
