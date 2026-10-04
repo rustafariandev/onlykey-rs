@@ -533,6 +533,19 @@ Differences from the Python agent:
 
 ## Development
 
+The agent is built on [ssh-agent-kit](https://github.com/rustafariandev/ssh-agent-kit),
+which is not on crates.io yet. Check it out next to this repository and point
+Cargo at it with a `.cargo/config.toml` (git-ignored):
+
+```sh
+git clone https://github.com/rustafariandev/ssh-agent-kit ../ssh-agent-kit
+mkdir -p .cargo
+cat > .cargo/config.toml <<'TOML'
+[patch.crates-io]
+ssh-agent-kit = { path = "../ssh-agent-kit" }
+TOML
+```
+
 ```sh
 cargo test --workspace          # unit tests plus end-to-end tests with ssh-add / ssh-keygen
 cargo clippy --workspace --all-targets
