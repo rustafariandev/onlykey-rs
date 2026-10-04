@@ -1,8 +1,8 @@
 //! Moving 64-byte reports to and from the device.
 //!
 //! [`HidTransport`] is the seam between the protocol logic and the USB stack:
-//! [`HidapiTransport`] talks to real hardware, [`fake::ScriptedTransport`]
-//! replays a scripted exchange in tests.
+//! [`HidapiTransport`] talks to real hardware, and `fake::ScriptedTransport`
+//! (with the `test-util` feature) replays a scripted exchange in tests.
 
 use crate::protocol::{REPORT_SIZE, Report};
 use hidapi::{DeviceInfo, HidApi, HidDevice, HidError};
@@ -316,7 +316,8 @@ impl HidTransport for HidapiTransport {
     }
 }
 
-/// Test doubles.
+/// Test doubles, built only for tests and the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
 pub mod fake {
     use super::*;
     use std::collections::VecDeque;

@@ -600,8 +600,10 @@ impl Identity {
         deunicode::deunicode(&joined)
     }
 
-    /// True if transliteration changed the identity, which is worth a warning
-    /// because different transliteration tables could derive different keys.
+    /// True if transliteration changed the identity, which is worth a warning:
+    /// different transliteration tables could derive different keys, and
+    /// every identity that transliterates to the same ASCII (`а` and `a`,
+    /// `é` and `e`, fullwidth `＠` and `@`) derives the same key.
     pub fn is_transliterated(&self) -> bool {
         !self.to_string().is_ascii()
     }

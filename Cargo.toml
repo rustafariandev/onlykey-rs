@@ -25,6 +25,9 @@ readme = "README.md"
 default = []
 # `serde` derives on `Curve`, for config files.
 serde = ["dep:serde"]
+# Test doubles: a scripted HID transport (`transport::fake`) and a software
+# FIDO authenticator (`fido::fake`), for testing code built on this crate.
+test-util = []
 # Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`. Off by default:
 # OpenSSH disabled DSA in 9.8 and removed it in 10.0.
 dsa = ["ssh-key/dsa"]

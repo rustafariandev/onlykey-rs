@@ -17,6 +17,10 @@ pub mod credman;
 pub mod ctap;
 pub mod ctaphid;
 pub(crate) mod der;
+/// A software authenticator for tests. Built only for tests and the
+/// `test-util` feature, so release builds carry no authenticator with a
+/// fixed seed.
+#[cfg(any(test, feature = "test-util"))]
 pub mod fake;
 pub mod pin;
 

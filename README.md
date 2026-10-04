@@ -421,7 +421,9 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
 
 - The identity is transliterated to ASCII and hashed with SHA-256. A
   `scheme://`, `:port` or `/path` is accepted and ignored, as in the Python
-  agent.
+  agent. Identities that transliterate alike (Cyrillic `а` and Latin `a`,
+  `é` and `e`) therefore derive the same key; a warning is logged when an
+  identity is transliterated.
 - Public key: `OKGETPUBKEY` with slot 132 and payload `curve tag || hash`.
 - Signature: `OKSIGN` with slot 201 (ed25519) or 202 (nistp256) and payload
   `data || hash`, split into 57-byte HID reports. The device strips the hash,

@@ -145,7 +145,10 @@ suffix and a
 .BI / path
 suffix are accepted and ignored.
 Non-ASCII characters are transliterated to ASCII before the identity is
-hashed; a warning is logged when this happens.
+hashed, as the Python agent does; a warning is logged when this happens.
+Identities that transliterate alike derive the same key: a Cyrillic
+lookalike and the Latin letter it resembles, or an accented letter and its
+plain one.
 Identities may be omitted from the command line when the configuration file
 lists them (see
 .BR "CONFIGURATION FILE" ),

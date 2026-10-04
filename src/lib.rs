@@ -70,7 +70,8 @@
 //!
 //! - [`protocol`]: encoding and classification of the raw 64-byte HID reports.
 //! - [`transport`]: [`HidTransport`], the seam between protocol and USB stack;
-//!   [`transport::HidapiTransport`] for hardware, [`transport::fake`] for tests.
+//!   [`transport::HidapiTransport`] for hardware, and `transport::fake` for
+//!   tests (with the `test-util` feature).
 //! - [`device`]: [`OnlyKey`], the handshake and the two operations the agent
 //!   needs, [`OnlyKey::public_key`] and [`OnlyKey::sign`].
 //! - [`identity`], [`keys`]: identity parsing and hashing, curves and slots

@@ -1457,7 +1457,11 @@ impl Agent {
     /// derived ed25519 key.
     fn provider_spec(&self, provider: &[u8]) -> Result<KeySpec, AgentError> {
         let text = std::str::from_utf8(provider).map_err(|_| AgentError::BadProvider)?;
-        Ok(KeySpec::parse_arg(text)?)
+        let spec = KeySpec::parse_arg(text)?;
+        if spec.identity.is_transliterated() {
+            tracing::warn!(identity = %spec.identity, ascii = spec.identity.derivation_input(), "identity was transliterated to ASCII before hashing: it derives the same key as the ASCII identity, and as any other that transliterates to it");
+        }
+        Ok(spec)
     }
 }
 
@@ -1634,7 +1638,7 @@ impl Drop for SocketGuard {
 /// Create the listening socket with owner-only permissions.
 ///
 /// A missing directory is created owner-only. An existing one must be safe
-/// from other users (see [`check_socket_dir`]), since whoever can rename
+/// from other users (see `check_socket_dir`), since whoever can rename
 /// the socket can put their own in its place and receive the keys `ssh-add`
 /// sends. A stale socket file is replaced; a live one, or a file that is
 /// not a socket, is an error.

@@ -350,7 +350,19 @@ pub fn pin_token<T: HidTransport>(
         }
     }
     let encrypted = encrypted.ok_or(FidoError::Protocol("getPINToken reply without a token"))?;
-    protocol.decrypt(&secret, &encrypted)
+    let token = protocol.decrypt(&secret, &encrypted)?;
+    if !token_length_ok(protocol, token.len()) {
+        return Err(FidoError::Protocol("PIN token of the wrong length"));
+    }
+    Ok(token)
+}
+
+/// CTAP2: a protocol 1 token is 16 or 32 bytes, a protocol 2 one 32.
+fn token_length_ok(protocol: PinProtocol, len: usize) -> bool {
+    match protocol {
+        PinProtocol::V1 => len == 16 || len == 32,
+        PinProtocol::V2 => len == 32,
+    }
 }
 
 /// The authenticator's key agreement public key, from `getKeyAgreement`.
@@ -650,6 +662,15 @@ mod tests {
         assert!(PinProtocol::V1.decrypt(&[0; 32], &[0; 17]).is_err());
         assert!(PinProtocol::V2.decrypt(&[0; 64], &[0; 16]).is_err());
         assert!(PinProtocol::V2.encrypt(&[0; 32], &[0; 16]).is_err());
+    }
+
+    #[test]
+    fn pin_token_lengths_follow_the_protocol() {
+        assert!(token_length_ok(PinProtocol::V1, 16));
+        assert!(token_length_ok(PinProtocol::V1, 32));
+        assert!(!token_length_ok(PinProtocol::V1, 48));
+        assert!(token_length_ok(PinProtocol::V2, 32));
+        assert!(!token_length_ok(PinProtocol::V2, 16));
     }
 
     /// pinHashEnc under protocol 1 for fixed keys and PIN "1234", checked

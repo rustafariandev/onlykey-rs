@@ -237,6 +237,14 @@ impl SkKey {
             pin,
             on_presence,
         )?;
+        // The authenticator data's presence bit is the same bit as the
+        // key's. sshd checks it too; this catches a device that skipped the
+        // touch before its signature goes anywhere.
+        if up && assertion.flags & USER_PRESENCE == 0 {
+            return Err(fido::FidoError::Protocol(
+                "the security key signed without the user's touch",
+            ));
+        }
         if self.needs_verification() && assertion.flags & USER_VERIFICATION == 0 {
             return Err(fido::FidoError::Protocol(
                 "the security key signed without verifying the user",
@@ -303,6 +311,19 @@ mod tests {
         assert_eq!(sig.algorithm(), Algorithm::SkEd25519);
         keys::verify(key.public_key(), b"hello", &sig).unwrap();
         assert!(keys::verify(key.public_key(), b"other", &sig).is_err());
+    }
+
+    /// A key that requires a touch refuses an assertion that reports none.
+    #[test]
+    fn an_assertion_without_presence_is_refused() {
+        let reference = FakeFido::new(&[0x42; 32], "ssh:", &[9, 8, 7], 0x01);
+        let body = add_body(&reference, "ferris@example.com");
+        let key = decode(SK_SSH_ED25519, &mut body.as_slice()).unwrap();
+        let untouched = FakeFido::new(&[0x42; 32], "ssh:", &[9, 8, 7], 0x00);
+        assert!(matches!(
+            key.sign(untouched, b"hello", &|| {}),
+            Err(fido::FidoError::Protocol(_))
+        ));
     }
 
     /// A resident credential becomes an `ADD_IDENTITY` body that decodes to

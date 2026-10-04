@@ -345,7 +345,7 @@ impl Context_ {
         }
         for e in &entries {
             if e.identity.is_transliterated() {
-                tracing::warn!(identity = %e.identity, ascii = e.identity.derivation_input(), "identity was transliterated to ASCII before hashing");
+                tracing::warn!(identity = %e.identity, ascii = e.identity.derivation_input(), "identity was transliterated to ASCII before hashing: it derives the same key as the ASCII identity, and as any other that transliterates to it");
             }
         }
         Ok(entries)
