@@ -23,7 +23,7 @@ clap_complete = "4.5"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 signal-hook = "0.3"
-nix = { version = "0.30", features = ["process", "fs"] }
+nix = { version = "0.30", features = ["process", "fs", "user"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

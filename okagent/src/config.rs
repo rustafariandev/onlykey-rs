@@ -72,6 +72,10 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "refusing {path}: {reason}; it names programs to run, so only you (or root) may be able to change it"
+    )]
+    Unsafe { path: PathBuf, reason: &'static str },
     #[error("cannot parse {path}: {source}")]
     Parse {
         path: PathBuf,
@@ -94,13 +98,24 @@ impl Config {
                 None => return Ok(Config::default()),
             },
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Config::default());
             }
             Err(source) => return Err(ConfigError::Read { path, source }),
         };
+        let meta = match file.metadata() {
+            Ok(meta) => meta,
+            Err(source) => return Err(ConfigError::Read { path, source }),
+        };
+        if let Err(reason) = check_owner(&meta) {
+            return Err(ConfigError::Unsafe { path, reason });
+        }
+        let mut text = String::new();
+        if let Err(source) = std::io::Read::read_to_string(&mut file, &mut text) {
+            return Err(ConfigError::Read { path, source });
+        }
         Self::parse(&text).map_err(|source| ConfigError::Parse { path, source })
     }
 
@@ -141,6 +156,22 @@ pub fn default_path() -> Option<PathBuf> {
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
     Some(base.join("okagent").join("config.toml"))
+}
+
+/// As ssh checks its config: the file must belong to this user or root and
+/// not be writable by anyone else, since `askpass` and `notify-command` name
+/// programs okagent runs.
+fn check_owner(meta: &std::fs::Metadata) -> Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = nix::unistd::getuid().as_raw();
+    if meta.uid() != uid && meta.uid() != 0 {
+        return Err("it is owned by another user");
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err("other users can write to it");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,6 +264,26 @@ mod tests {
             let text = format!("[[identity]]\nname = \"a@b\"\nslot = {bad}");
             assert!(Config::parse(&text).is_err(), "{bad}");
         }
+    }
+
+    /// A config other users could change is refused, as ssh refuses its own.
+    #[test]
+    fn a_config_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "askpass = \"/bin/true\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(
+            Config::load(Some(&path)),
+            Err(ConfigError::Unsafe { .. })
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            Config::load(Some(&path)).unwrap().askpass.as_deref(),
+            Some("/bin/true")
+        );
     }
 
     #[test]

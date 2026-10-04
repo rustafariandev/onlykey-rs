@@ -1006,6 +1006,10 @@ for the user to export.
 .TP
 .I $XDG_CONFIG_HOME/okagent/config.toml
 Default configuration file.
+Like
+.BR ssh_config ,
+it must belong to the user or root and not be writable by anyone else,
+since it names programs okagent runs; otherwise okagent refuses it.
 .TP
 .I $XDG_RUNTIME_DIR/okagent/agent.sock
 Default socket for

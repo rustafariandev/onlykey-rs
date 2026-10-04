@@ -754,8 +754,23 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
 fn agent_env_snippet(socket: &Path, pid: u32) -> String {
     format!(
         "SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID={pid}; export SSH_AGENT_PID;\n",
-        socket.display()
+        shell_quote(&socket.display().to_string())
     )
+}
+
+/// `text` as one shell word: unchanged when it is plain, else single-quoted,
+/// so a socket path from `--socket` or the environment cannot run commands
+/// under `eval "$(okagent serve --daemon)"`.
+fn shell_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 /// Fork into the background. The parent prints the shell snippet and exits;
@@ -893,12 +908,20 @@ fn destination(
     port: Option<u16>,
     host: Option<&str>,
 ) -> Result<(Identity, Option<u16>)> {
-    let Some(host) = host else {
-        return Ok((identity.clone(), port));
+    let (dest, port) = match host {
+        None => (identity.clone(), port),
+        Some(host) => {
+            let (dest, dest_port) = Identity::parse_with_port(host)?;
+            let user = dest.user.or_else(|| identity.user.clone());
+            (Identity::new(user.as_deref(), &dest.host), dest_port)
+        }
     };
-    let (dest, dest_port) = Identity::parse_with_port(host)?;
-    let user = dest.user.or_else(|| identity.user.clone());
-    Ok((Identity::new(user.as_deref(), &dest.host), dest_port))
+    // ssh, mosh and ssh-copy-id would read such a word as an option, such as
+    // -oProxyCommand=...
+    if dest.host.starts_with('-') || dest.user.as_deref().is_some_and(|u| u.starts_with('-')) {
+        bail!("destination {dest} must not start with '-'");
+    }
+    Ok((dest, port))
 }
 
 /// Install the identity's public key on the remote host by running
@@ -1050,6 +1073,33 @@ mod tests {
             }
             other => panic!("unexpected command {other:?}"),
         }
+    }
+
+    /// A path the shell would split or expand is single-quoted, so `eval`
+    /// sets it literally.
+    #[test]
+    fn env_snippet_quotes_a_path_the_shell_would_change() {
+        let path = "/tmp/a b;$(touch x)'q";
+        let snippet = agent_env_snippet(Path::new(path), 42);
+        assert!(snippet.starts_with(r"SSH_AUTH_SOCK='/tmp/a b;$(touch x)'\''q';"));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{snippet}printf %s \"$SSH_AUTH_SOCK\""))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+    }
+
+    /// A destination ssh would read as an option is refused.
+    #[test]
+    fn a_destination_starting_with_a_dash_is_refused() {
+        let identity: Identity = "ferris@example.com".parse().unwrap();
+        assert!(destination(&identity, None, Some("-oProxyCommand=x")).is_err());
+        assert!(destination(&identity, None, Some("-oProxyCommand=x@host")).is_err());
+        if let Ok(identity) = "-oProxyCommand=x".parse::<Identity>() {
+            assert!(destination(&identity, None, None).is_err());
+        }
+        assert!(destination(&identity, None, Some("server-1.example")).is_ok());
     }
 
     #[test]
