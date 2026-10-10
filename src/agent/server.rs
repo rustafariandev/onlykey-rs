@@ -11,7 +11,7 @@ use crate::keys;
 use ssh_agent_kit::destination::Connection;
 use ssh_agent_kit::policy::Confirm;
 use ssh_agent_kit::server::Handler;
-use ssh_agent_kit::{CertKey, Extension, KeyDecoder};
+use ssh_agent_kit::{Extension, KeyDecoder};
 use ssh_key::PublicKey;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -122,23 +122,15 @@ impl Agent {
 
     /// Register a protocol extension handler. A later registration under the
     /// same name wins.
-    pub fn with_extension(self, extension: impl Extension + 'static) -> Self {
-        self.kit.register_extension(extension);
+    pub fn with_extension(mut self, extension: impl Extension + 'static) -> Self {
+        self.kit = self.kit.with_extension(extension);
         self
     }
 
     /// Register a key-type decoder for `ssh-add FILE`. A later registration
     /// under a name wins.
-    pub fn with_key_type(self, decoder: impl KeyDecoder + 'static) -> Self {
-        self.kit.register_key_type(decoder);
-        self
-    }
-
-    /// Serve certificates for token keys, loaded with `--cert-file`. Each is
-    /// listed, under its file's comment (else its key id), while a served key
-    /// it certifies is known and it has not expired.
-    pub fn with_certificates(mut self, certs: impl IntoIterator<Item = CertKey>) -> Self {
-        self.kit = self.kit.with_certificates(certs);
+    pub fn with_key_type(mut self, decoder: impl KeyDecoder + 'static) -> Self {
+        self.kit = self.kit.with_key_type(decoder);
         self
     }
 
@@ -214,7 +206,7 @@ pub fn ephemeral_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{ExtensionContext, ExtensionReply};
+    use crate::agent::{CertKey, ExtensionContext, ExtensionReply};
     use crate::challenge::RecordingSink;
     use crate::device::OnlyKey;
     use crate::device::Timeouts;
@@ -452,9 +444,9 @@ mod tests {
     #[test]
     fn last_extension_registered_under_a_name_wins() {
         let opener: Opener = Arc::new(|| panic!("device must not be opened"));
-        let agent =
-            Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default())).with_extension(Ping);
-        agent.register_extension(PingOverride);
+        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()))
+            .with_extension(Ping)
+            .with_extension(PingOverride);
         let mut body = vec![wire::SSH_AGENTC_EXTENSION];
         "ping@example.com".encode(&mut body).unwrap();
         assert_eq!(agent.handle(&body), vec![7]);
@@ -843,7 +835,7 @@ mod tests {
         (body, public)
     }
 
-    /// A key type registered with `register_key_type` is served end to end:
+    /// A key type registered with `with_key_type` is served end to end:
     /// the agent decodes, lists and signs with it through the registry.
     #[test]
     fn a_registered_key_type_is_served_end_to_end() {
@@ -1209,40 +1201,6 @@ mod tests {
             .unwrap();
         assert_eq!(agent.handle(&remove), wire::success());
         assert!(listing(&agent).is_empty());
-    }
-
-    #[test]
-    fn certificate_files_match_served_keys() {
-        use ssh_agent_kit::testing::{certify, certify_until};
-        let (agent, key) = preloaded_agent(vec![entry()]);
-        let cert = certify(key.key_data());
-        let line = cert.to_openssh("ferris-cert");
-        let from_file = CertKey::from_openssh_line(&line).unwrap();
-        let expired = certify_until(key.key_data(), 1);
-        let unserved = certify(&ssh_key::public::KeyData::Ed25519(
-            ssh_key::public::Ed25519PublicKey([0x99; 32]),
-        ));
-        let agent = agent.with_certificates([from_file, expired.clone(), unserved.clone()]);
-        assert_eq!(agent.preload([key.clone()]), 1);
-        assert_eq!(
-            listing(&agent),
-            vec![
-                wire::listed(&key),
-                (cert.blob().to_vec(), "ferris-cert".to_owned())
-            ]
-        );
-        assert!(matches!(
-            agent.signer_for(cert.blob()),
-            Ok(signer) if signer.public_key() == &key
-        ));
-        assert!(agent.signer_for(expired.blob()).is_err());
-        assert!(agent.signer_for(unserved.blob()).is_err());
-        assert_eq!(agent.certificates_for(&key).len(), 1);
-
-        // Once the key is no longer served, neither is its certificate.
-        assert!(agent.remove(&entry()));
-        assert!(listing(&agent).is_empty());
-        assert!(agent.signer_for(cert.blob()).is_err());
     }
 
     #[test]

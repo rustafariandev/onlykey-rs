@@ -220,15 +220,13 @@ listed as an identity of its own and signs with the key it certifies:
 - `ssh-add -s IDENTITY CERT…` attaches certificates to an OnlyKey key in a
   running agent (`-C` serves the certificates without the plain key);
   `ssh-add -e IDENTITY` removes the key and its certificates.
-- `--cert-file FILE` (repeatable; `cert-file = [...]` in the config) loads
-  certificates at startup. Each one is served with whichever OnlyKey key it
-  certifies, so no identity needs naming.
 
 ```sh
 okagent pubkey ferris@example.com > ~/.ssh/onlykey.pub
 ssh-keygen -s ca -I ferris -n ferris ~/.ssh/onlykey.pub   # writes onlykey-cert.pub
-okagent serve --cert-file ~/.ssh/onlykey-cert.pub ferris@example.com &
-okagent ssh ferris@example.com     # offers the certificate as well
+eval "$(okagent serve --daemon)"
+ssh-add -s ferris@example.com ~/.ssh/onlykey-cert.pub   # serves the key and its certificate
+ssh ferris@example.com             # offers the certificate as well
 ```
 
 The agent checks each certificate's CA signature when it is loaded;
@@ -275,7 +273,6 @@ notify-command = "notify-send OnlyKey"  # optional
 # askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs and ssh-add -c confirmation
 # pin-cache = 300                       # seconds to reuse a PIN; 0 asks every time
 # key-lifetime = 600                    # default lifetime for keys added later; 0 = until removed
-# cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]  # certificates for token keys
 
 [[identity]]
 name = "ferris@example.com"
@@ -502,7 +499,7 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The key
   types the agent can load are pluggable: implement
   `onlykey_agent::agent::KeyDecoder` and register it with
-  `Agent::with_key_type` (or `register_key_type`); the built-in ed25519, RSA,
+  `Agent::with_key_type`; the built-in ed25519, RSA,
   ECDSA, FIDO `sk-` and (with the `dsa` feature) DSA types are registered the same way, and a later
   registration under a name wins. An in-memory key is signed by a
   `LocalKey` implementation. RSA keys are signed with the `rsa` crate, whose
@@ -512,7 +509,7 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   key. Prefer ed25519 or ECDSA for keys loaded into the agent, or keep RSA
   keys on the OnlyKey. SSH protocol extension
   requests are pluggable too: implement `onlykey_agent::agent::Extension` and
-  register it with `Agent::with_extension` (or `register_extension`), and the
+  register it with `Agent::with_extension`, and the
   handler answers the `SSH_AGENTC_EXTENSION` requests whose name it matches,
   seeing whether the agent is locked through `ExtensionContext`. A handler is
   not refused automatically while locked, so it decides for itself.

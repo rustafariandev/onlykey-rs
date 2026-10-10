@@ -893,8 +893,8 @@ fn ssh_add_loads_a_key_with_its_certificate() {
     assert_eq!(h.challenges(), 0, "local keys must not touch the token");
 }
 
-/// A certificate for a token key, attached with `ssh-add -s IDENTITY CERT`
-/// or loaded at startup (`--cert-file`), signs through the token.
+/// A certificate for a token key, attached with `ssh-add -s IDENTITY CERT`,
+/// signs through the token.
 #[test]
 fn token_keys_serve_certificates() {
     if !have("ssh-add") || !have("ssh-keygen") {
@@ -939,17 +939,6 @@ fn token_keys_serve_certificates() {
     assert_eq!(listed_keys(&h), 2);
     assert!(ssh_add_card(&h, dir.path(), "-e", "ferris@example.com"));
     assert_eq!(listed_keys(&h), 0);
-
-    // At startup, a certificate file goes with the key it certifies.
-    let sink = Arc::new(RecordingSink::default());
-    let opener: Opener = Arc::new(|| Ok(SigningFake::open()));
-    let certs = agent::CertKey::read_file(&cert_path).unwrap();
-    let agent = Agent::new(entries(), opener, sink.clone()).with_certificates(certs);
-    let h = Harness::serve(agent, sink);
-    let lines = listing(&h);
-    assert_eq!(lines.len(), 3, "two keys and a certificate: {lines:?}");
-    assert!(lines[2].starts_with("ssh-ed25519-cert-v01@openssh.com "));
-    sign_and_check(&h, dir.path(), &cert_line, "startup-cert");
 }
 
 /// A real OpenSSH `ssh-agent` on a private socket, so the same commands can be

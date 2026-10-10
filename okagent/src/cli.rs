@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
-use onlykey_agent::agent::{self, Agent, CertKey, Opener, SkOpener};
+use onlykey_agent::agent::{self, Agent, Opener, SkOpener};
 use onlykey_agent::agent::{client, sk};
 use onlykey_agent::challenge::{
     AskpassConfirm, AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt,
@@ -80,12 +80,6 @@ pub struct Cli {
     /// do not give their own `-t`; 0 (the default) keeps them until removed.
     #[arg(long, global = true, value_name = "SECONDS")]
     pub key_lifetime: Option<u32>,
-
-    /// File of OpenSSH certificates (`-cert.pub` lines) for OnlyKey keys;
-    /// each is served next to the key it certifies. Repeatable, and added to
-    /// the config's `cert-file` list.
-    #[arg(long = "cert-file", global = true, value_name = "FILE")]
-    pub cert_files: Vec<PathBuf>,
 
     #[command(subcommand)]
     pub command: Cmd,
@@ -370,18 +364,11 @@ impl Context_ {
                 .map(|t| Box::new(t) as Box<dyn HidTransport>)
                 .collect())
         });
-        let mut certs = Vec::new();
-        for path in &self.config.cert_file {
-            let loaded = CertKey::read_file(path)?;
-            tracing::info!(count = loaded.len(), path = %path.display(), "loaded certificates");
-            certs.extend(loaded);
-        }
         let agent = Agent::new(entries, opener, Arc::clone(&self.sink))
             .with_sk_opener(sk_opener)
             .with_pin_prompt(Arc::clone(&self.pin_prompt))
             .with_pin_cache(self.pin_cache)
-            .with_default_lifetime(self.key_lifetime)
-            .with_certificates(certs);
+            .with_default_lifetime(self.key_lifetime);
         if let Some(path) = pubkey_file {
             let matched = agent.preload(keys);
             tracing::info!(matched, path = %path.display(), "preloaded public keys");
@@ -467,8 +454,7 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
     if let Cmd::Completions(args) = &cli.command {
         return completions(args);
     }
-    let mut config = Config::load(cli.config.as_deref())?;
-    config.cert_file.extend(cli.cert_files.iter().cloned());
+    let config = Config::load(cli.config.as_deref())?;
     init_logging(
         cli.verbose,
         cli.log_file.as_deref().or(config.log_file.as_deref()),
@@ -858,13 +844,6 @@ fn connect(ctx: &Context_, args: SshArgs, remote: Remote) -> Result<ExitCode> {
         "-o".into(),
         format!("IdentityFile={}", pub_path.display()),
     ];
-    // With IdentitiesOnly, ssh offers a certificate only when named.
-    if let Some(cert) = agent.certificates_for(&key).first() {
-        let cert_path = dir.path().join("id-cert.pub");
-        std::fs::write(&cert_path, format!("{}\n", cert.to_openssh(key.comment())))?;
-        ssh.push("-o".into());
-        ssh.push(format!("CertificateFile={}", cert_path.display()));
-    }
     if let Some(port) = port {
         ssh.push("-p".into());
         ssh.push(port.to_string());
@@ -1296,23 +1275,6 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.socket.as_deref(), Some(Path::new("/tmp/a.sock")));
-    }
-
-    #[test]
-    fn cert_file_is_global_and_repeatable() {
-        let cli = Cli::try_parse_from([
-            "okagent",
-            "serve",
-            "--cert-file",
-            "a-cert.pub",
-            "--cert-file",
-            "b-cert.pub",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.cert_files,
-            [Path::new("a-cert.pub"), Path::new("b-cert.pub")]
-        );
     }
 
     #[test]

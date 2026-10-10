@@ -644,21 +644,6 @@ The same value can be set with the
 .B key-lifetime
 config key.
 .TP
-.BI \-\-cert\-file " file"
-A file of OpenSSH certificates, one per line as
-.B ssh-keygen \-s
-writes them, for OnlyKey keys.
-Each certificate is served next to whichever of the agent's keys it
-certifies, listed under the file's comment, until it expires; one for a key
-the agent does not serve is ignored.
-.BR "okagent ssh" " and " "okagent mosh"
-also hand
-.B ssh
-the primary key's certificate.
-Repeat the option for several files; they add to the
-.B cert-file
-config key.
-.TP
 .BR \-v ", " \-\-verbose
 Log more.
 Once for informational messages, twice for debug output, three times for
@@ -901,10 +886,6 @@ See
 See
 .BR \-\-key\-lifetime .
 .TP
-.BI cert-file " = [\(dq" file \(dq ", ...]"
-See
-.BR \-\-cert\-file .
-.TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
 line.
@@ -943,7 +924,6 @@ notify-command = "notify-send OnlyKey"
 # askpass = "/usr/libexec/openssh/ssh-askpass"
 # pin-cache = 300
 # key-lifetime = 600
-# cert-file = ["/home/ferris/.ssh/onlykey-cert.pub"]
 
 [[identity]]
 name = "ferris@example.com"
