@@ -1,8 +1,8 @@
 //! The SSH agent: [`ssh_agent_kit`]'s protocol and server, serving OnlyKey
 //! keys ([`onlykey::OnlyKeyBackend`]) and FIDO security keys ([`sk`]).
 //!
-//! The protocol modules are re-exported from the kit under their old names,
-//! so `agent::wire`, `agent::cert` and the rest keep working.
+//! The kit's modules and main types are re-exported here, so callers can
+//! write `agent::wire` or `agent::CertKey` without depending on the kit.
 
 pub mod onlykey;
 pub mod server;
