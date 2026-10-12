@@ -7,6 +7,7 @@
 //! through [`crate::fido`], with the authenticators, PIN prompt and PIN-token
 //! cache of an [`SkBackend`].
 
+use super::lock;
 use super::server::AgentError;
 use crate::challenge::{ChallengeSink, PinPrompt, PinRequest, TouchRequest};
 use crate::fido;
@@ -24,7 +25,7 @@ use ssh_key::private::{SkEcdsaSha2NistP256, SkEd25519};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, Mpint, PublicKey, Signature};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -175,11 +176,6 @@ impl SkKey {
         self.application.starts_with("ssh:")
     }
 
-    /// Wire blob used to match sign and remove requests.
-    pub fn key_blob(&self) -> Vec<u8> {
-        self.public.to_bytes().expect("vec write")
-    }
-
     /// Whether the credential was enrolled with user verification required.
     pub fn needs_verification(&self) -> bool {
         self.flags & USER_VERIFICATION != 0
@@ -304,11 +300,6 @@ fn default_sk_opener() -> SkOpener {
     })
 }
 
-/// Lock `mutex`, carrying on if a thread panicked while holding it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|p| p.into_inner())
-}
-
 /// What signing with security keys needs: the authenticators, a way to ask
 /// for the PIN, and the PIN tokens kept for reuse. Shared by every
 /// [`SkKey`] the agent serves; its settings can change while it serves.
@@ -386,7 +377,7 @@ impl SkBackend {
     }
 
     /// Drop every kept PIN token.
-    pub fn forget_pins(&self) {
+    fn forget_pins(&self) {
         lock(&self.pin_tokens).clear();
     }
 

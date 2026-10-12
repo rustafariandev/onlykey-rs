@@ -2,6 +2,7 @@
 //! `--identity`, plus those `ssh-add -s LABEL` adds, each signed on the
 //! token after the user enters its challenge.
 
+use super::lock;
 use super::server::AgentError;
 use crate::challenge::ChallengeSink;
 use crate::device::{DeviceError, OnlyKey};
@@ -13,20 +14,13 @@ use ssh_agent_kit::signer::{BoxError, Signer, SignerRef};
 use ssh_agent_kit::wire;
 use ssh_key::{HashAlg, PublicKey, Signature};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 /// A device the agent can open on demand.
 pub type Device = OnlyKey<Box<dyn HidTransport>>;
 /// How the agent obtains a device for each operation.
 pub type Opener = Arc<dyn Fn() -> Result<Device, DeviceError> + Send + Sync>;
-
-/// Lock `mutex`, carrying on if a thread panicked while holding it: each
-/// value guarded here is left consistent between statements, so a poisoned
-/// lock still holds usable state.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|p| p.into_inner())
-}
 
 /// What signing on the token needs, shared with each key's [`Signer`].
 struct Token {
@@ -145,7 +139,7 @@ impl OnlyKeyBackend {
     /// Entries whose key cannot be fetched (device absent or locked, empty
     /// slot, wrong curve) are skipped with a warning so the client still sees
     /// the rest.
-    pub fn public_keys(&self) -> Vec<(KeySpec, PublicKey)> {
+    fn public_keys(&self) -> Vec<(KeySpec, PublicKey)> {
         let entries = self.entries();
         let missing: Vec<KeySpec> = {
             let cache = lock(&self.cache);

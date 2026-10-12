@@ -75,7 +75,8 @@ impl Agent {
     }
 
     /// The OnlyKey backend.
-    pub fn onlykey(&self) -> &OnlyKeyBackend {
+    #[cfg(test)]
+    pub(crate) fn onlykey(&self) -> &OnlyKeyBackend {
         &self.onlykey
     }
 
@@ -109,12 +110,6 @@ impl Agent {
         self
     }
 
-    /// Wait `backoff` longer after each wrong unlock passphrase.
-    pub fn with_unlock_backoff(mut self, backoff: Duration) -> Self {
-        self.kit = self.kit.with_unlock_backoff(backoff);
-        self
-    }
-
     /// Register a protocol extension handler. A later registration under the
     /// same name wins.
     pub fn with_extension(mut self, extension: impl Extension + 'static) -> Self {
@@ -132,23 +127,6 @@ impl Agent {
     /// The token identities currently served, in order.
     pub fn entries(&self) -> Vec<KeySpec> {
         self.onlykey.entries()
-    }
-
-    /// Serve the token key `spec`, fetching its public key unless it is
-    /// cached. `lifetime` is the `ssh-add -t` constraint in seconds, if any.
-    pub fn add(&self, spec: KeySpec, lifetime: Option<u32>) -> Result<PublicKey, AgentError> {
-        self.onlykey.add(spec, lifetime)
-    }
-
-    /// Stop serving the token key `spec`, along with the certificates
-    /// `ssh-add -s` attached to it. Returns whether anything was removed.
-    pub fn remove(&self, spec: &KeySpec) -> bool {
-        let removed = self.onlykey.remove(spec);
-        let mut any = removed.served;
-        if let Some(blob) = removed.key_blob {
-            any |= self.kit.release(&blob, removed.served);
-        }
-        any
     }
 
     /// Seed the token key cache from previously exported public keys,
@@ -406,6 +384,12 @@ mod tests {
         assert_eq!(agent.handle(&unlock), wire::success());
         assert_eq!(agent.entries(), vec![e]);
         assert_eq!(agent.public_keys(), vec![key]);
+        // Unlocked, the same removal goes through.
+        assert_eq!(
+            agent.handle(&provider(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY)),
+            wire::success()
+        );
+        assert!(agent.entries().is_empty());
     }
 
     #[test]
@@ -547,57 +531,6 @@ mod tests {
         assert_eq!(agent.handle(&constrained), wire::success());
         assert_eq!(agent.public_keys(), vec![key]);
         assert_eq!(agent.entries(), vec![e]);
-    }
-
-    #[test]
-    fn add_of_an_unknown_key_fails_when_the_device_is_absent() {
-        let opener: Opener = Arc::new(|| Err(DeviceError::Locked));
-        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
-        let mut add = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY];
-        b"ferris@example.com".as_slice().encode(&mut add).unwrap();
-        b"".as_slice().encode(&mut add).unwrap();
-        assert_eq!(agent.handle(&add), wire::failure());
-        assert!(agent.entries().is_empty());
-    }
-
-    #[test]
-    fn add_smartcard_key_is_refused_while_locked() {
-        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
-        let agent = Agent::new(Vec::new(), opener, Arc::new(RecordingSink::default()));
-        let mut lock = vec![wire::SSH_AGENTC_LOCK];
-        b"hunter2".as_slice().encode(&mut lock).unwrap();
-        assert_eq!(agent.handle(&lock), wire::success());
-
-        let mut add = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY];
-        b"ferris@example.com".as_slice().encode(&mut add).unwrap();
-        b"".as_slice().encode(&mut add).unwrap();
-        assert_eq!(agent.handle(&add), wire::failure());
-        assert!(agent.entries().is_empty());
-    }
-
-    #[test]
-    fn remove_smartcard_key_is_refused_while_locked() {
-        let e = entry();
-        let opener: Opener = Arc::new(|| panic!("device must not be opened"));
-        let agent = Agent::new(vec![e.clone()], opener, Arc::new(RecordingSink::default()));
-        let mut lock = vec![wire::SSH_AGENTC_LOCK];
-        b"hunter2".as_slice().encode(&mut lock).unwrap();
-        assert_eq!(agent.handle(&lock), wire::success());
-
-        let mut remove = vec![wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY];
-        b"ferris@example.com"
-            .as_slice()
-            .encode(&mut remove)
-            .unwrap();
-        b"".as_slice().encode(&mut remove).unwrap();
-        assert_eq!(agent.handle(&remove), wire::failure());
-        assert_eq!(agent.entries(), vec![e]);
-
-        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
-        b"hunter2".as_slice().encode(&mut unlock).unwrap();
-        assert_eq!(agent.handle(&unlock), wire::success());
-        assert_eq!(agent.handle(&remove), wire::success());
-        assert!(agent.entries().is_empty());
     }
 
     /// `ssh-add -d` of a token key's public key removes it, as it does for

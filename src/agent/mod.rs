@@ -26,3 +26,12 @@ pub use ssh_agent_kit::{
 pub use ssh_agent_kit::{
     EcdsaLocalKey, Ed25519LocalKey, LocalKey, LocalKeyError, LocalKeyRef, RsaLocalKey,
 };
+
+use std::sync::{Mutex, MutexGuard};
+
+/// Lock `mutex`, carrying on if a thread panicked while holding it: each
+/// value guarded in this module is left consistent between statements, so a
+/// poisoned lock still holds usable state.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}

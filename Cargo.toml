@@ -30,17 +30,17 @@ serde = ["dep:serde"]
 test-util = []
 # Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`. Off by default:
 # OpenSSH disabled DSA in 9.8 and removed it in 10.0.
-dsa = ["ssh-key/dsa", "ssh-agent-kit/dsa"]
+dsa = ["ssh-agent-kit/dsa"]
 
 [dependencies]
 # The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
 # Until it is on crates.io, build against a local checkout with a git-ignored
 # `.cargo/config.toml`; see "Development" in the README.
 ssh-agent-kit = "1.0.0"
-ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
-ssh-encoding = { version = "0.2", features = ["base64"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
+ssh-encoding = "0.2"
 signature = "2"
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = "0.10"
 deunicode = "1"
 hex = "0.4"
 thiserror = "2"
