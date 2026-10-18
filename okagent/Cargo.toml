@@ -20,7 +20,7 @@ default = []
 dsa = ["ssh-agent-kit/dsa"]
 
 [dependencies]
-onlykey-agent = { path = "..", version = "1.0.1", features = ["serde"] }
+onlykey-agent = { path = "..", version = "2.0.0", features = ["serde"] }
 # The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
 # Until it is on crates.io, build against a local checkout with a git-ignored
 # `.cargo/config.toml`; see "Development" in the README.
@@ -43,7 +43,7 @@ anyhow = "1"
 tempfile = "3"
 
 [dev-dependencies]
-onlykey-agent = { path = "..", version = "1.0.1", features = ["serde", "test-util"] }
+onlykey-agent = { path = "..", version = "2.0.0", features = ["serde", "test-util"] }
 ssh-agent-kit = { version = "1.0.0", features = ["test-util"] }
 tempfile = "3"
 rsa = "0.9"
