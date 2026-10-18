@@ -222,7 +222,7 @@ impl SkKey {
     /// A key that [needs verification](Self::needs_verification) signs only
     /// with a PIN token in `pin`, and only if the authenticator reports the
     /// user verified; without one it fails with
-    /// [`FidoError::UvRequired`](fido::FidoError::UvRequired) before the
+    /// [`FidoError::UvRequired`] before the
     /// device is asked.
     pub fn sign_with<T: HidTransport>(
         &self,

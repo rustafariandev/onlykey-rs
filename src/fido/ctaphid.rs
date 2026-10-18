@@ -125,7 +125,7 @@ impl<T: HidTransport> CtapHid<T> {
     /// if the device asks the user to touch it.
     ///
     /// The request is sent once. A device that says nothing for
-    /// [`RESPONSE_TIMEOUT`], goes quiet for [`PACKET_GAP`] after it has
+    /// three seconds, goes quiet for two seconds after it has
     /// answered, or is not touched in time gets a `CTAPHID_CANCEL`, and the
     /// call fails with [`FidoError::Timeout`].
     pub fn transact(
