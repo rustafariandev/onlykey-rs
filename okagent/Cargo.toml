@@ -7,6 +7,9 @@ repository.workspace = true
 description = "SSH agent backed by an OnlyKey hardware token"
 readme = "../README.md"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "okagent"
 path = "src/main.rs"
@@ -14,10 +17,19 @@ path = "src/main.rs"
 [features]
 default = []
 # Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`.
-dsa = ["onlykey-agent/dsa"]
+dsa = ["ssh-agent-kit/dsa"]
 
 [dependencies]
 onlykey-agent = { path = "..", version = "1.0.1", features = ["serde"] }
+# The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
+# Until it is on crates.io, build against a local checkout with a git-ignored
+# `.cargo/config.toml`; see "Development" in the README.
+ssh-agent-kit = "1.0.0"
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
+ssh-encoding = "0.2"
+sha2 = "0.10"
+zeroize = "1"
+p256 = "0.13"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +43,14 @@ anyhow = "1"
 tempfile = "3"
 
 [dev-dependencies]
+onlykey-agent = { path = "..", version = "1.0.1", features = ["serde", "test-util"] }
+ssh-agent-kit = { version = "1.0.0", features = ["test-util"] }
 tempfile = "3"
+rsa = "0.9"
+signature = "2"
+ed25519-dalek = "2"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lints]
 workspace = true

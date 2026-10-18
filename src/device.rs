@@ -335,7 +335,7 @@ impl<T: HidTransport> OnlyKey<T> {
         self.transport
     }
 
-    /// Erase the transport type, e.g. to build an [`crate::agent::Opener`].
+    /// Erase the transport type, e.g. to build okagent's `agent::Opener`.
     pub fn boxed(self) -> OnlyKey<Box<dyn HidTransport>>
     where
         T: 'static,

@@ -4,8 +4,8 @@ use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use nix::unistd::{ForkResult, fork, setsid};
-use onlykey_agent::agent::{self, Agent, Opener, SkOpener};
-use onlykey_agent::agent::{client, sk};
+use okagent::agent::{self, Agent, Opener, SkOpener};
+use okagent::agent::{client, sk};
 use onlykey_agent::challenge::{
     AskpassConfirm, AskpassPin, ChainPin, ChallengeSink, CommandNotifier, MultiSink, PinPrompt,
     PinRequest, TtyPin, TtyPrompt,

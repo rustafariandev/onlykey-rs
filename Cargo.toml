@@ -16,7 +16,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Derive SSH keys and sign with an OnlyKey hardware token, plus an SSH agent built on it"
+description = "Derive SSH keys and sign with an OnlyKey hardware token"
 keywords = ["onlykey", "ssh", "ssh-agent", "hardware-token", "hid"]
 categories = ["authentication", "cryptography", "hardware-support"]
 readme = "README.md"
@@ -28,14 +28,11 @@ serde = ["dep:serde"]
 # Test doubles: a scripted HID transport (`transport::fake`) and a software
 # FIDO authenticator (`fido::fake`), for testing code built on this crate.
 test-util = []
-# Accept plain DSA (`ssh-dss`) keys with `ssh-add FILE`. Off by default:
-# OpenSSH disabled DSA in 9.8 and removed it in 10.0.
-dsa = ["ssh-agent-kit/dsa"]
 
 [dependencies]
-# The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
-# Until it is on crates.io, build against a local checkout with a git-ignored
-# `.cargo/config.toml`; see "Development" in the README.
+# Challenge confirmation types shared with the agent. Until it is on crates.io,
+# build against a local checkout with a git-ignored `.cargo/config.toml`; see
+# "Development" in the README.
 ssh-agent-kit = "1.0.0"
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
 ssh-encoding = "0.2"
@@ -65,7 +62,6 @@ hidapi = { version = "2.6", default-features = false, features = ["linux-native-
 hidapi = { version = "2.6", default-features = false }
 
 [dev-dependencies]
-ssh-agent-kit = { version = "1.0.0", features = ["test-util"] }
 serde_json = "1"
 tempfile = "3"
 rsa = "0.9"

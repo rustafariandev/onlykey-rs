@@ -4,11 +4,11 @@
 
 use super::lock;
 use super::server::AgentError;
-use crate::challenge::ChallengeSink;
-use crate::device::{DeviceError, OnlyKey};
-use crate::identity::KeySpec;
-use crate::keys;
-use crate::transport::HidTransport;
+use onlykey_agent::challenge::ChallengeSink;
+use onlykey_agent::device::{DeviceError, OnlyKey};
+use onlykey_agent::identity::KeySpec;
+use onlykey_agent::keys;
+use onlykey_agent::transport::HidTransport;
 use ssh_agent_kit::backend::{Backend, Expiring, Removed, SmartcardProvider};
 use ssh_agent_kit::signer::{BoxError, Signer, SignerRef};
 use ssh_agent_kit::wire;

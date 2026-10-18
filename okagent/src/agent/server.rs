@@ -3,11 +3,11 @@
 
 use super::onlykey::{OnlyKeyBackend, Opener};
 use super::sk::{SkBackend, SkDecoder, SkOpener};
-use crate::challenge::{ChallengeSink, ConfirmRequest, PinPrompt};
-use crate::device::DeviceError;
-use crate::fido::FidoError;
-use crate::identity::KeySpec;
-use crate::keys;
+use onlykey_agent::challenge::{ChallengeSink, ConfirmRequest, PinPrompt};
+use onlykey_agent::device::DeviceError;
+use onlykey_agent::fido::FidoError;
+use onlykey_agent::identity::KeySpec;
+use onlykey_agent::keys;
 use ssh_agent_kit::destination::Connection;
 use ssh_agent_kit::policy::Confirm;
 use ssh_agent_kit::server::Handler;
@@ -31,7 +31,7 @@ pub enum AgentError {
     #[error(transparent)]
     Fido(#[from] FidoError),
     #[error(transparent)]
-    Identity(#[from] crate::identity::IdentityError),
+    Identity(#[from] onlykey_agent::identity::IdentityError),
     #[error(
         "refusing to sign non-SSH data with security key for application {0:?}; only ssh: keys sign arbitrary data"
     )]
@@ -180,13 +180,13 @@ pub fn ephemeral_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use crate::agent::CertKey;
-    use crate::challenge::RecordingSink;
-    use crate::device::OnlyKey;
-    use crate::device::Timeouts;
-    use crate::identity::{Curve, EccSlot};
-    use crate::protocol::{self, Report};
-    use crate::transport::HidTransport;
-    use crate::transport::fake::{ScriptedTransport, Step};
+    use onlykey_agent::challenge::RecordingSink;
+    use onlykey_agent::device::OnlyKey;
+    use onlykey_agent::device::Timeouts;
+    use onlykey_agent::identity::{Curve, EccSlot};
+    use onlykey_agent::protocol::{self, Report};
+    use onlykey_agent::transport::HidTransport;
+    use onlykey_agent::transport::fake::{ScriptedTransport, Step};
     use ssh_agent_kit::wire;
     use ssh_encoding::Decode;
     use std::sync::Mutex;
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn a_non_ssh_security_key_signs_only_ssh_data() {
         use crate::agent::sk::SK_SSH_ED25519;
-        use crate::fido::fake::FakeFido;
+        use onlykey_agent::fido::fake::FakeFido;
         use ssh_key::private::SkEd25519;
         use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
         use std::sync::atomic::AtomicUsize;
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn the_authenticator_holding_the_credential_signs() {
         use crate::agent::sk::SK_SSH_ED25519;
-        use crate::fido::fake::FakeFido;
+        use onlykey_agent::fido::fake::FakeFido;
         use ssh_key::private::SkEd25519;
         use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
 
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn security_key_adds_lists_signs_and_removes() {
         use crate::agent::sk::SK_SSH_ED25519;
-        use crate::fido::fake::FakeFido;
+        use onlykey_agent::fido::fake::FakeFido;
         use ssh_key::private::SkEd25519;
         use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
 
@@ -887,15 +887,18 @@ mod tests {
     struct UvSetup {
         agent: Agent,
         key_blob: Vec<u8>,
-        device: Arc<Mutex<crate::fido::fake::FakeFido>>,
+        device: Arc<Mutex<onlykey_agent::fido::fake::FakeFido>>,
         opens: Arc<std::sync::atomic::AtomicUsize>,
         sink: Arc<RecordingSink>,
     }
 
     impl UvSetup {
-        fn new(prompt: Option<Arc<crate::challenge::RecordingPin>>, cache: Duration) -> Self {
+        fn new(
+            prompt: Option<Arc<onlykey_agent::challenge::RecordingPin>>,
+            cache: Duration,
+        ) -> Self {
             use crate::agent::sk::SK_SSH_ED25519;
-            use crate::fido::fake::FakeFido;
+            use onlykey_agent::fido::fake::FakeFido;
             use ssh_key::private::SkEd25519;
             use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519 as SkEd25519Public};
 
@@ -965,8 +968,8 @@ mod tests {
         }
     }
 
-    fn pins(pins: &[&str]) -> Arc<crate::challenge::RecordingPin> {
-        Arc::new(crate::challenge::RecordingPin::new(pins))
+    fn pins(pins: &[&str]) -> Arc<onlykey_agent::challenge::RecordingPin> {
+        Arc::new(onlykey_agent::challenge::RecordingPin::new(pins))
     }
 
     /// The PIN is asked for, naming the key and the tries left, and the
@@ -1023,8 +1026,8 @@ mod tests {
 
     #[test]
     fn a_cancelled_pin_fails_without_a_touch() {
-        let prompt = Arc::new(crate::challenge::RecordingPin::answering(vec![
-            crate::challenge::PinAnswer::Cancelled,
+        let prompt = Arc::new(onlykey_agent::challenge::RecordingPin::answering(vec![
+            onlykey_agent::challenge::PinAnswer::Cancelled,
         ]));
         let setup = UvSetup::new(Some(prompt), Duration::ZERO);
         let result = setup.sign();
@@ -1056,7 +1059,7 @@ mod tests {
         let setup = UvSetup::new(None, Duration::ZERO);
         let agent = setup
             .agent
-            .with_pin_prompt(Arc::new(crate::challenge::ChainPin::default()));
+            .with_pin_prompt(Arc::new(onlykey_agent::challenge::ChainPin::default()));
         let result = agent
             .sign(&setup.key_blob, b"data", 0, &Connection::default())
             .map_err(backend_error);
@@ -1072,9 +1075,9 @@ mod tests {
     /// adds it, the device hides it and signing fails.
     #[test]
     fn a_resident_key_signs_only_with_its_verify_flag() {
-        use crate::fido::credman::{CRED_PROTECT_UV_REQUIRED, ResidentCredential};
-        use crate::fido::fake::FakeFido;
-        use crate::fido::pin::CosePublicKey;
+        use onlykey_agent::fido::credman::{CRED_PROTECT_UV_REQUIRED, ResidentCredential};
+        use onlykey_agent::fido::fake::FakeFido;
+        use onlykey_agent::fido::pin::CosePublicKey;
 
         for verify in [true, false] {
             let device = FakeFido::new(&[0x42; 32], "ssh:okagent-test-uv", &[9, 8, 7], 0x01)

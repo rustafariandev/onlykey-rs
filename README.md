@@ -498,7 +498,7 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   the agent signs with it in memory, with no token and no challenge, and `SSH2_AGENTC_REMOVE_IDENTITY`
   / `SSH_AGENTC_REMOVE_ALL_IDENTITIES` back `ssh-add -d` and `-D`. The key
   types the agent can load are pluggable: implement
-  `onlykey_agent::agent::KeyDecoder` and register it with
+  `okagent::agent::KeyDecoder` and register it with
   `Agent::with_key_type`; the built-in ed25519, RSA,
   ECDSA, FIDO `sk-` and (with the `dsa` feature) DSA types are registered the same way, and a later
   registration under a name wins. An in-memory key is signed by a
@@ -508,7 +508,7 @@ Examples: `cargo run --example pubkey -- ferris@example.com` and
   signatures, such as a host the agent is forwarded to, may learn about the
   key. Prefer ed25519 or ECDSA for keys loaded into the agent, or keep RSA
   keys on the OnlyKey. SSH protocol extension
-  requests are pluggable too: implement `onlykey_agent::agent::Extension` and
+  requests are pluggable too: implement `okagent::agent::Extension` and
   register it with `Agent::with_extension`, and the
   handler answers the `SSH_AGENTC_EXTENSION` requests whose name it matches,
   seeing whether the agent is locked through `ExtensionContext`. A handler is

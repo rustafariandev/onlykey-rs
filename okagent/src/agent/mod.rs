@@ -3,6 +3,34 @@
 //!
 //! The kit's modules and main types are re-exported here, so callers can
 //! write `agent::wire` or `agent::CertKey` without depending on the kit.
+//!
+//! A plain ed25519, RSA or ECDSA (nistp256/384/521) private key, or a DSA one
+//! with the `dsa` feature, can also be loaded with `ssh-add FILE`; the agent
+//! signs with it in memory, with no token and no challenge. The key types the
+//! agent can load are pluggable: implement [`KeyDecoder`] and register it with
+//! [`Agent::with_key_type`]. In-memory keys are signed by a
+//! [`local::LocalKey`] implementation. [`Extension`] lets callers answer
+//! protocol extension requests, the built-in [`destination`] support
+//! verifies `session-bind@openssh.com` and enforces `ssh-add -h` destination
+//! constraints, and `ssh-add -c` confirmation goes through the
+//! [`ChallengeSink`](onlykey_agent::ChallengeSink).
+//!
+//! ```no_run
+//! use okagent::agent::{self, Agent, Opener};
+//! use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt};
+//! use std::sync::{Arc, atomic::AtomicBool};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let entries = vec![KeySpec::derived("ferris@example.com".parse()?, Curve::Ed25519)];
+//! let opener: Opener = Arc::new(|| Ok(OnlyKey::open()?.boxed()));
+//! let agent = Arc::new(Agent::new(entries, opener, Arc::new(TtyPrompt)));
+//!
+//! let path = agent::default_socket_path();
+//! let (listener, _guard) = agent::bind_socket(&path)?;   // owner-only socket, unlinked on drop
+//! println!("SSH_AUTH_SOCK={}", path.display());
+//! agent::serve(listener, agent, Arc::new(AtomicBool::new(false)))?;
+//! # Ok(()) }
+//! ```
 
 pub mod onlykey;
 pub mod server;

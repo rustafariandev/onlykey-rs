@@ -4,16 +4,16 @@
 //! key, application and key handle, and every signature is produced by the
 //! attached FIDO device. `ssh-add FILE` loads one through
 //! `SSH2_AGENTC_ADD_IDENTITY`, decoded here by [`SkDecoder`]; signing goes
-//! through [`crate::fido`], with the authenticators, PIN prompt and PIN-token
+//! through [`onlykey_agent::fido`], with the authenticators, PIN prompt and PIN-token
 //! cache of an [`SkBackend`].
 
 use super::lock;
 use super::server::AgentError;
-use crate::challenge::{ChallengeSink, PinPrompt, PinRequest, TouchRequest};
-use crate::fido;
-use crate::fido::ctaphid::CtapHid;
-use crate::fido::{FidoError, PinAuth, PinProtocol, pin};
-use crate::transport::{HidTransport, HidapiTransport};
+use onlykey_agent::challenge::{ChallengeSink, PinPrompt, PinRequest, TouchRequest};
+use onlykey_agent::fido;
+use onlykey_agent::fido::ctaphid::CtapHid;
+use onlykey_agent::fido::{FidoError, PinAuth, PinProtocol, pin};
+use onlykey_agent::transport::{HidTransport, HidapiTransport};
 use sha2::{Digest, Sha256};
 use ssh_agent_kit::backend::Lifecycle;
 use ssh_agent_kit::keytype::{KeyDecodeError, KeyDecoder};
@@ -603,8 +603,8 @@ impl Signer for SkSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fido::fake::FakeFido;
-    use crate::keys;
+    use onlykey_agent::fido::fake::FakeFido;
+    use onlykey_agent::keys;
 
     /// Build the `ADD_IDENTITY` body for an Ed25519 security key backed by
     /// `device`, as `ssh-add` would send it.
@@ -780,7 +780,7 @@ mod tests {
 
     /// A registry with okagent's security-key decoder.
     fn registry() -> ssh_agent_kit::KeyRegistry {
-        let sink = Arc::new(crate::challenge::RecordingSink::default());
+        let sink = Arc::new(onlykey_agent::challenge::RecordingSink::default());
         let mut registry = ssh_agent_kit::KeyRegistry::builtin();
         registry.register(SkDecoder(Arc::new(SkBackend::new(sink))));
         registry

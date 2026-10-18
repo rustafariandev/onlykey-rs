@@ -3,8 +3,8 @@
 mod common;
 
 use common::SigningFake;
-use onlykey_agent::agent::wire;
-use onlykey_agent::agent::{self, Agent, Extension, ExtensionContext, ExtensionReply, Opener};
+use okagent::agent::wire;
+use okagent::agent::{self, Agent, Extension, ExtensionContext, ExtensionReply, Opener};
 use onlykey_agent::challenge::RecordingSink;
 use onlykey_agent::identity::{Curve, EccSlot, KeySource, KeySpec, RsaSlot, Slot};
 use ssh_encoding::Decode;

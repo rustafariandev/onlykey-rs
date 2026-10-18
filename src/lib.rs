@@ -1,5 +1,5 @@
 //! Talk to an [OnlyKey](https://onlykey.io) hardware token to derive SSH keys
-//! and sign with them, and run an SSH agent on top of that.
+//! and sign with them. The `okagent` crate runs an SSH agent on top of this.
 //!
 //! The OnlyKey derives a key pair on the device from an identity string such
 //! as `ferris@example.com`; the private key never leaves the token, and every
@@ -9,18 +9,10 @@
 //! token's ECC or RSA slots with the OnlyKey app ("stored keys") can be used
 //! the same way; see [`KeySpec::stored`] and [`KeySpec::rsa`].
 //!
-//! A plain ed25519, RSA or ECDSA (nistp256/384/521) private key, or a DSA one
-//! with the `dsa` feature, can also be loaded into a running agent with
-//! `ssh-add FILE`; the agent signs with it in memory, with no token and no
-//! challenge. The key types the agent can load
-//! are pluggable: implement [`agent::KeyDecoder`] and register it with
-//! [`agent::Agent::with_key_type`]. In-memory keys are signed by a
-//! [`agent::local::LocalKey`] implementation.
-//!
-//! FIDO security-key SSH keys (`sk-ssh-ed25519@openssh.com` and
-//! `sk-ecdsa-sha2-nistp256@openssh.com`) can be loaded the same way; the agent
-//! signs with the attached authenticator through a small pure-Rust CTAP2
-//! client in [`fido`], touch required, no C library involved.
+//! The [`fido`] module is a small pure-Rust CTAP2 client for FIDO
+//! security-key SSH keys (`sk-ssh-ed25519@openssh.com` and
+//! `sk-ecdsa-sha2-nistp256@openssh.com`): touch required, no C library
+//! involved.
 //!
 //! # Deriving a key and signing
 //!
@@ -47,25 +39,6 @@
 //! # Ok(()) }
 //! ```
 //!
-//! # Running an agent
-//!
-//! ```no_run
-//! use onlykey_agent::agent::{self, Agent, Opener};
-//! use onlykey_agent::{Curve, KeySpec, OnlyKey, challenge::TtyPrompt};
-//! use std::sync::{Arc, atomic::AtomicBool};
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let entries = vec![KeySpec::derived("ferris@example.com".parse()?, Curve::Ed25519)];
-//! let opener: Opener = Arc::new(|| Ok(OnlyKey::open()?.boxed()));
-//! let agent = Arc::new(Agent::new(entries, opener, Arc::new(TtyPrompt)));
-//!
-//! let path = agent::default_socket_path();
-//! let (listener, _guard) = agent::bind_socket(&path)?;   // owner-only socket, unlinked on drop
-//! println!("SSH_AUTH_SOCK={}", path.display());
-//! agent::serve(listener, agent, Arc::new(AtomicBool::new(false)))?;
-//! # Ok(()) }
-//! ```
-//!
 //! # Layers
 //!
 //! - [`protocol`]: encoding and classification of the raw 64-byte HID reports.
@@ -79,19 +52,10 @@
 //! - [`challenge`]: how the 3-digit challenge reaches the user.
 //! - [`fido`]: the CTAPHID/CTAP2 client that signs with a FIDO authenticator
 //!   when an `sk-` key is served.
-//! - [`agent`]: the SSH agent, built on the [`ssh_agent_kit`] framework,
-//!   which provides the wire protocol and unix-socket server; this crate adds
-//!   the OnlyKey and FIDO backends. [`agent::Extension`] lets callers answer
-//!   protocol extension requests and
-//!   [`agent::KeyDecoder`] lets them add key types. The built-in
-//!   [`agent::destination`] support verifies `session-bind@openssh.com` and
-//!   enforces `ssh-add -h` destination constraints, and `ssh-add -c`
-//!   confirmation goes through the [`ChallengeSink`].
 //!
 //! Any [`HidTransport`] implementation can stand in for the hardware, which is
-//! how the test suite drives the full agent with a fake token.
+//! how okagent's test suite drives the full agent with a fake token.
 
-pub mod agent;
 pub mod challenge;
 pub mod device;
 pub mod fido;
