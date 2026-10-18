@@ -517,6 +517,31 @@ Read
 instead of the default configuration file.
 A missing explicit file is an error; a missing default file is not.
 .TP
+.BR \-v ", " \-\-verbose
+Log more.
+Once for informational messages, twice for debug output, three times for
+trace output.
+Log output goes to standard error unless
+.B \-\-log\-file
+is given.
+.TP
+.BI \-\-log\-file " file"
+Append log output to
+.I file
+instead of standard error.
+The file is created readable by the owner only.
+Useful for a background agent, whose standard error is usually lost.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.PP
+The
+.BR pubkey ", " run ", " shell ", " serve ", " ssh ", " mosh " and " ssh-copy-id
+commands also accept the following options, after the command name:
+.TP
 .BI \-\-curve " curve"
 Curve for identities given on the command line, and the default for
 configuration entries without one.
@@ -557,6 +582,10 @@ This option applies only to identities on the command line; configuration
 entries carry their own
 .B slot
 key.
+.PP
+The
+.BR run ", " shell ", " serve ", " ssh ", " mosh " and " ssh-copy-id
+commands, which run an agent, also accept:
 .TP
 .BI \-\-notify\-command " command"
 Run
@@ -568,6 +597,40 @@ is split on whitespace; the first word is the program.
 The prompt is still written to the terminal as well.
 See
 .BR "CHALLENGE PROMPT" .
+.TP
+.BI \-\-pin\-cache " seconds"
+Reuse a security key's PIN for this many seconds after it is entered, so
+signatures in that time ask only for a touch.
+The default, 0, asks for the PIN at every signature.
+While a PIN is cached, anything that can use the agent's socket can sign
+with the key after a touch alone.
+The cache is per device and is cleared when the agent is locked with
+.BR "ssh-add \-x" ,
+when
+.B ssh-add \-D
+removes every identity; a device that was replugged asks for the PIN again.
+The same value can be set with the
+.B pin-cache
+config key.
+.TP
+.BI \-\-key\-lifetime " seconds"
+Give keys added later with
+.B ssh-add
+a lifetime of
+.I seconds
+when they do not give their own
+.BR "ssh-add \-t" ,
+as
+.B ssh-agent \-t
+does.
+The default, 0, keeps them until they are removed.
+The same value can be set with the
+.B key-lifetime
+config key.
+.PP
+Those commands and
+.B load-resident
+also accept:
 .TP
 .BI \-\-fido\-device " path"
 Use the FIDO security key whose hidraw or HID path contains
@@ -613,57 +676,6 @@ config key, then
 .BR SSH_ASKPASS .
 Without any, or when the program cannot be run, the PIN is read from the
 terminal with echo off.
-.TP
-.BI \-\-pin\-cache " seconds"
-Reuse a security key's PIN for this many seconds after it is entered, so
-signatures in that time ask only for a touch.
-The default, 0, asks for the PIN at every signature.
-While a PIN is cached, anything that can use the agent's socket can sign
-with the key after a touch alone.
-The cache is per device and is cleared when the agent is locked with
-.BR "ssh-add \-x" ,
-when
-.B ssh-add \-D
-removes every identity; a device that was replugged asks for the PIN again.
-The same value can be set with the
-.B pin-cache
-config key.
-.TP
-.BI \-\-key\-lifetime " seconds"
-Give keys added later with
-.B ssh-add
-a lifetime of
-.I seconds
-when they do not give their own
-.BR "ssh-add \-t" ,
-as
-.B ssh-agent \-t
-does.
-The default, 0, keeps them until they are removed.
-The same value can be set with the
-.B key-lifetime
-config key.
-.TP
-.BR \-v ", " \-\-verbose
-Log more.
-Once for informational messages, twice for debug output, three times for
-trace output.
-Log output goes to standard error unless
-.B \-\-log\-file
-is given.
-.TP
-.BI \-\-log\-file " file"
-Append log output to
-.I file
-instead of standard error.
-The file is created readable by the owner only.
-Useful for a background agent, whose standard error is usually lost.
-.TP
-.BR \-h ", " \-\-help
-Print usage and exit.
-.TP
-.BR \-V ", " \-\-version
-Print the version and exit.
 .PP
 The
 .BR pubkey ", " run ", " shell ", " serve ", " ssh ", " mosh " and " ssh-copy-id

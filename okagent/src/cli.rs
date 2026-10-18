@@ -34,55 +34,83 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "okagent", version, about)]
 pub struct Cli {
     /// More log output (repeat for more).
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "Global options")]
     pub verbose: u8,
 
     /// Append log output to this file instead of stderr.
-    #[arg(long, global = true, value_name = "FILE")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        help_heading = "Global options"
+    )]
     pub log_file: Option<PathBuf>,
 
     /// Config file (default: $XDG_CONFIG_HOME/okagent/config.toml).
-    #[arg(long, global = true, env = "OKAGENT_CONFIG")]
+    #[arg(
+        long,
+        global = true,
+        env = "OKAGENT_CONFIG",
+        help_heading = "Global options"
+    )]
     pub config: Option<PathBuf>,
 
+    #[command(subcommand)]
+    pub command: Cmd,
+}
+
+/// How identities given on the command line map to OnlyKey keys.
+#[derive(Debug, Args, Default, Clone)]
+#[command(next_help_heading = "Key options")]
+pub struct KeyArgs {
     /// Curve for identities given on the command line: ed25519 or nistp256.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub curve: Option<Curve>,
 
     /// Use the key stored in this slot (ECC1 to ECC16, or RSA1 to RSA4) for
     /// identities given on the command line, instead of deriving one.
-    #[arg(long, global = true, value_name = "SLOT")]
+    #[arg(long, value_name = "SLOT")]
     pub slot: Option<Slot>,
+}
 
-    /// Command run with the challenge prompt as its last argument
-    /// (e.g. "notify-send OnlyKey"); also used when no terminal is available.
-    #[arg(long, global = true)]
-    pub notify_command: Option<String>,
-
+/// Which FIDO security key signs for `sk-` keys, and how its PIN is asked.
+#[derive(Debug, Args, Default, Clone)]
+#[command(next_help_heading = "Security key options")]
+pub struct SkArgs {
     /// FIDO security key to use for `sk-` keys, by hidraw path substring.
     /// Defaults to whichever attached authenticator, other than the OnlyKey,
     /// holds the key.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, value_name = "PATH")]
     pub fido_device: Option<String>,
 
     /// Program that asks for a security key's PIN, for `sk-` keys enrolled
     /// with verify-required (default: the config's `askpass`, then
     /// $SSH_ASKPASS). Without one, the PIN is read from the terminal.
-    #[arg(long, global = true, value_name = "PROGRAM")]
+    #[arg(long, value_name = "PROGRAM")]
     pub askpass: Option<String>,
+}
+
+/// Options for commands that run an agent.
+#[derive(Debug, Args, Default, Clone)]
+#[command(next_help_heading = "Agent options")]
+pub struct AgentArgs {
+    /// Command run with the challenge prompt as its last argument
+    /// (e.g. "notify-send OnlyKey"); also used when no terminal is available.
+    #[arg(long)]
+    pub notify_command: Option<String>,
 
     /// Seconds to reuse a security key's PIN before asking again; 0 (the
     /// default) asks for every signature.
-    #[arg(long, global = true, value_name = "SECONDS")]
+    #[arg(long, value_name = "SECONDS")]
     pub pin_cache: Option<u64>,
 
     /// Default lifetime in seconds for keys added later with `ssh-add` that
     /// do not give their own `-t`; 0 (the default) keeps them until removed.
-    #[arg(long, global = true, value_name = "SECONDS")]
+    #[arg(long, value_name = "SECONDS")]
     pub key_lifetime: Option<u32>,
 
-    #[command(subcommand)]
-    pub command: Cmd,
+    #[command(flatten)]
+    pub sk: SkArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,7 +120,7 @@ pub enum Cmd {
     /// List attached OnlyKeys and FIDO security keys.
     Devices(DevicesArgs),
     /// Print public keys in authorized_keys format.
-    Pubkey(IdentityArgs),
+    Pubkey(PubkeyArgs),
     /// Add the SSH keys stored on FIDO security keys (resident keys) to the
     /// agent, keeping whether each needs its PIN (unlike `ssh-add -K`).
     LoadResident(LoadResidentArgs),
@@ -101,7 +129,7 @@ pub enum Cmd {
     /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Run(RunArgs),
     /// Start $SHELL with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
-    Shell(ExtraIdentityArgs),
+    Shell(ShellArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
     /// Connect with mosh, whose ssh step uses the identity's key.
@@ -142,6 +170,27 @@ pub struct ExtraIdentityArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct PubkeyArgs {
+    #[command(flatten)]
+    pub identities: IdentityArgs,
+
+    #[command(flatten)]
+    pub key: KeyArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct ShellArgs {
+    #[command(flatten)]
+    pub identities: ExtraIdentityArgs,
+
+    #[command(flatten)]
+    pub key: KeyArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
+}
+
+#[derive(Debug, Args)]
 pub struct ServeArgs {
     #[command(flatten)]
     pub identities: ExtraIdentityArgs,
@@ -155,6 +204,12 @@ pub struct ServeArgs {
     /// SSH_AUTH_SOCK and SSH_AGENT_PID.
     #[arg(long, short)]
     pub daemon: bool,
+
+    #[command(flatten)]
+    pub key: KeyArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 #[derive(Debug, Args)]
@@ -165,6 +220,12 @@ pub struct RunArgs {
     /// Command to run after "--".
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+
+    #[command(flatten)]
+    pub key: KeyArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 #[derive(Debug, Args)]
@@ -192,6 +253,12 @@ pub struct SshArgs {
     /// Extra arguments passed after the destination (a remote command).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+
+    #[command(flatten)]
+    pub key: KeyArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 #[derive(Debug, Args)]
@@ -214,6 +281,12 @@ pub struct SshCopyIdArgs {
     /// the destination.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+
+    #[command(flatten)]
+    pub key: KeyArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 /// Which remote-shell program `SshArgs` drives.
@@ -232,6 +305,10 @@ pub struct DebugSignArgs {
     /// Digest for an RSA key: sha256 or sha512.
     #[arg(long, default_value = "sha512")]
     pub hash: String,
+    #[command(flatten)]
+    pub key: KeyArgs,
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 #[derive(Debug, Args)]
@@ -240,6 +317,9 @@ pub struct LoadResidentArgs {
     /// config's `socket`, then okagent's default socket).
     #[arg(long)]
     pub socket: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub sk: SkArgs,
 }
 
 #[derive(Debug, Args)]
@@ -459,9 +539,60 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         cli.verbose,
         cli.log_file.as_deref().or(config.log_file.as_deref()),
     )?;
-    let curve = cli.curve.or(config.curve).unwrap_or_default();
+    let (key, opts) = cli.command.options();
+    let ctx = context(config, &key, &opts)?;
+
+    match cli.command {
+        Cmd::Status => status(&ctx),
+        Cmd::Devices(args) => devices(&args),
+        Cmd::Pubkey(args) => pubkey(&ctx, &args.identities),
+        Cmd::LoadResident(args) => load_resident(&ctx, &args),
+        Cmd::Serve(args) => serve(&ctx, args),
+        Cmd::Run(args) => run(&ctx, &args.identities, args.command),
+        Cmd::Shell(args) => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            run(&ctx, &args.identities, vec![shell])
+        }
+        Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
+        Cmd::Mosh(args) => connect(&ctx, args, Remote::Mosh),
+        Cmd::SshCopyId(args) => ssh_copy_id(&ctx, args),
+        Cmd::DebugSign(args) => debug_sign(&ctx, args),
+        Cmd::Completions(args) => completions(&args),
+    }
+}
+
+impl Cmd {
+    /// The key and agent options this command takes; defaults for the ones
+    /// it does not, so the config file still fills them in.
+    fn options(&self) -> (KeyArgs, AgentArgs) {
+        match self {
+            Cmd::Pubkey(args) => (args.key.clone(), AgentArgs::default()),
+            Cmd::LoadResident(args) => (
+                KeyArgs::default(),
+                AgentArgs {
+                    sk: args.sk.clone(),
+                    ..AgentArgs::default()
+                },
+            ),
+            Cmd::Serve(ServeArgs { key, agent, .. })
+            | Cmd::Run(RunArgs { key, agent, .. })
+            | Cmd::Shell(ShellArgs { key, agent, .. })
+            | Cmd::Ssh(SshArgs { key, agent, .. })
+            | Cmd::Mosh(SshArgs { key, agent, .. })
+            | Cmd::SshCopyId(SshCopyIdArgs { key, agent, .. })
+            | Cmd::DebugSign(DebugSignArgs { key, agent, .. }) => (key.clone(), agent.clone()),
+            Cmd::Status | Cmd::Devices(_) | Cmd::Completions(_) => {
+                (KeyArgs::default(), AgentArgs::default())
+            }
+        }
+    }
+}
+
+/// Resolve the command's options against the config file and defaults.
+fn context(config: Config, key: &KeyArgs, opts: &AgentArgs) -> Result<Context_> {
+    let curve = key.curve.or(config.curve).unwrap_or_default();
     let mut sinks: Vec<Box<dyn ChallengeSink>> = vec![Box::new(TtyPrompt)];
-    if let Some(cmd) = cli
+    if let Some(cmd) = opts
         .notify_command
         .as_deref()
         .or(config.notify_command.as_deref())
@@ -470,11 +601,13 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
             CommandNotifier::parse(cmd).ok_or_else(|| anyhow!("empty notify command"))?;
         sinks.push(Box::new(notifier));
     }
-    let fido_device = cli
+    let fido_device = opts
+        .sk
         .fido_device
         .clone()
         .or_else(|| config.fido_device.clone());
-    let askpass = cli
+    let askpass = opts
+        .sk
         .askpass
         .clone()
         .or_else(|| config.askpass.clone())
@@ -485,38 +618,20 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
     if let Some(program) = askpass.clone() {
         sinks.push(Box::new(AskpassConfirm::new(program)));
     }
-    let pin_cache = Duration::from_secs(cli.pin_cache.or(config.pin_cache).unwrap_or(0));
-    let key_lifetime = cli.key_lifetime.or(config.key_lifetime);
-    let ctx = Context_ {
+    let pin_cache = Duration::from_secs(opts.pin_cache.or(config.pin_cache).unwrap_or(0));
+    let key_lifetime = opts.key_lifetime.or(config.key_lifetime);
+    Ok(Context_ {
         pin_prompt: Arc::new(pin_prompt(askpass)),
         pin_cache,
         key_lifetime,
         config,
         curve,
-        curve_given: cli.curve.is_some(),
-        slot: cli.slot,
+        curve_given: key.curve.is_some(),
+        slot: key.slot,
         sink: Arc::new(MultiSink(sinks)),
         timeouts: Timeouts::default(),
         fido_device,
-    };
-
-    match cli.command {
-        Cmd::Status => status(&ctx),
-        Cmd::Devices(args) => devices(&args),
-        Cmd::Pubkey(args) => pubkey(&ctx, &args),
-        Cmd::LoadResident(args) => load_resident(&ctx, &args),
-        Cmd::Serve(args) => serve(&ctx, args),
-        Cmd::Run(args) => run(&ctx, &args.identities, args.command),
-        Cmd::Shell(args) => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            run(&ctx, &args, vec![shell])
-        }
-        Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
-        Cmd::Mosh(args) => connect(&ctx, args, Remote::Mosh),
-        Cmd::SshCopyId(args) => ssh_copy_id(&ctx, args),
-        Cmd::DebugSign(args) => debug_sign(&ctx, args),
-        Cmd::Completions(args) => completions(&args),
-    }
+    })
 }
 
 /// Ask for PINs with the askpass program when there is one, else on the
@@ -1258,7 +1373,7 @@ mod tests {
             let cli = Cli::try_parse_from(argv).unwrap();
             let (base, additional) = match cli.command {
                 Cmd::Run(args) => (args.identities.base, args.identities.additional),
-                Cmd::Shell(args) => (args.base, args.additional),
+                Cmd::Shell(args) => (args.identities.base, args.identities.additional),
                 Cmd::Serve(args) => (args.identities.base, args.identities.additional),
                 other => panic!("unexpected command {other:?}"),
             };
@@ -1275,6 +1390,77 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.socket.as_deref(), Some(Path::new("/tmp/a.sock")));
+    }
+
+    /// Commands take only the options they use.
+    #[test]
+    fn commands_reject_options_they_do_not_use() {
+        for argv in [
+            &["okagent", "devices", "--curve", "ed25519"][..],
+            &["okagent", "status", "--pin-cache", "5"],
+            &["okagent", "completions", "bash", "--slot", "ECC1"],
+            &["okagent", "load-resident", "--key-lifetime", "5"],
+            &["okagent", "load-resident", "--curve", "ed25519"],
+            &["okagent", "pubkey", "--notify-command", "x"],
+            &["okagent", "--curve", "ed25519", "serve"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?} parsed");
+        }
+    }
+
+    #[test]
+    fn option_groups_parse_on_the_commands_that_use_them() {
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "load-resident",
+            "--fido-device",
+            "hidraw7",
+            "--askpass",
+            "ask",
+        ])
+        .unwrap();
+        let (_, opts) = cli.command.options();
+        assert_eq!(opts.sk.fido_device.as_deref(), Some("hidraw7"));
+        assert_eq!(opts.sk.askpass.as_deref(), Some("ask"));
+
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "serve",
+            "--curve",
+            "nistp256",
+            "--notify-command",
+            "notify-send OnlyKey",
+            "--pin-cache",
+            "30",
+        ])
+        .unwrap();
+        let (key, opts) = cli.command.options();
+        assert_eq!(key.curve, Some(Curve::NistP256));
+        assert_eq!(opts.notify_command.as_deref(), Some("notify-send OnlyKey"));
+        assert_eq!(opts.pin_cache, Some(30));
+
+        // Global options still go before the command.
+        let cli = Cli::try_parse_from(["okagent", "-v", "--config", "c.toml", "devices"]).unwrap();
+        assert_eq!(cli.verbose, 1);
+        assert_eq!(cli.config.as_deref(), Some(Path::new("c.toml")));
+    }
+
+    /// `--slot` after the identity is okagent's, not passed on to ssh.
+    #[test]
+    fn ssh_takes_slot_after_the_identity() {
+        let cli = Cli::try_parse_from([
+            "okagent",
+            "ssh",
+            "ferris@legacy.example.com",
+            "--slot",
+            "ECC3",
+        ])
+        .unwrap();
+        let Cmd::Ssh(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert_eq!(args.key.slot, Some("ECC3".parse().unwrap()));
+        assert!(args.args.is_empty());
     }
 
     #[test]
