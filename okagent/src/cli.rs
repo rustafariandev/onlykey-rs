@@ -881,20 +881,28 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     }
     let shutdown = shutdown_flag()?;
     #[cfg(windows)]
-    if let Some((listener, guard)) = cygwin {
+    let cygwin = cygwin.map(|(listener, guard)| {
         let (agent, shutdown) = (Arc::clone(&agent), Arc::clone(&shutdown));
         std::thread::spawn(move || {
             let _guard = guard;
             if let Err(e) = agent::serve(listener, agent, shutdown) {
                 tracing::error!("Cygwin socket: {e}");
             }
-        });
-    }
+        })
+    });
     #[cfg(windows)]
     if args.pageant || ctx.config.pageant.unwrap_or(false) {
         serve_as_pageant(&agent, &shutdown);
     }
-    agent::serve(listener, agent, shutdown)?;
+    let served = agent::serve(listener, agent, Arc::clone(&shutdown));
+    // The process exits without waiting for other threads, so wait for this
+    // one to remove its socket file.
+    #[cfg(windows)]
+    if let Some(cygwin) = cygwin {
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = cygwin.join();
+    }
+    served?;
     drop(guard);
     Ok(ExitCode::SUCCESS)
 }
