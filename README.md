@@ -419,7 +419,7 @@ with your user name in place of `USER`. A shortcut in `shell:startup` running
 - **Pageant.** `okagent serve --pageant` (or `pageant = true` in the config)
   also answers PuTTY, WinSCP, and other tools that talk to Pageant, on both
   Pageant's pipe and its window. Either is skipped, with a warning, when a
-  real Pageant is already running.
+  real Pageant is already running. See [PuTTY](#putty) below.
 - **Git Bash, MSYS2 and Cygwin.** The `ssh` and `ssh-add` these bundle
   cannot open a named pipe, so `serve` also listens on a Cygwin-style
   socket, `%LOCALAPPDATA%\okagent\agent.sock`. Only you can read it, and
@@ -454,6 +454,49 @@ with your user name in place of `USER`. A shortcut in `shell:startup` running
   so `sk-` keys need an elevated agent on Windows. OnlyKey keys, derived or
   stored, need nothing special.
 - **Config.** The config file is `%APPDATA%\okagent\config.toml`.
+
+#### PuTTY
+
+PuTTY, Plink, PSCP, PSFTP, WinSCP and FileZilla look for Pageant, so okagent
+stands in for it. Quit Pageant first: okagent will not take over a Pageant
+that is already running.
+
+1. Turn on Pageant support. The agent the installer starts at logon runs
+   plain `okagent serve --daemon`, so put it in the config,
+   `%APPDATA%\okagent\config.toml`, along with the keys to offer:
+
+   ```toml
+   pageant = true
+
+   [[identity]]
+   name = "ferris@example.com"
+   ```
+
+   Then restart the agent (or log off and on again):
+
+   ```powershell
+   Stop-Process -Name okagent
+   okagent serve --daemon | Invoke-Expression
+   ```
+
+   To try it without touching the config, run
+   `okagent serve --pageant ferris@example.com` in a console instead; it
+   serves in the foreground until Ctrl+C. Keys can also be added to a
+   running agent with `ssh-add -s ferris@example.com`.
+
+2. Put the public key on the server. `okagent pubkey ferris@example.com`
+   prints the line for its `~/.ssh/authorized_keys`.
+
+3. Connect. PuTTY asks Pageant for keys by default (Connection → SSH →
+   Auth → Credentials, "Attempt authentication using Pageant"), so set only
+   the host and user name, and leave the private key file empty. From the
+   command line, `plink ferris@example.com` works the same way, and
+   `GIT_SSH=C:\Program Files\PuTTY\plink.exe` makes Git (and TortoiseGit)
+   use it.
+
+On each login, press the button the OnlyKey lights up. The challenge digits
+show in the console the agent runs in; the agent started at logon has none,
+so add `notify-command` to the config to see them.
 
 ## The onlykey-agent library
 
