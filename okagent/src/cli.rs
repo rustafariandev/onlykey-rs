@@ -214,6 +214,12 @@ pub struct ServeArgs {
     #[arg(long, hide = cfg!(not(windows)))]
     pub pageant: bool,
 
+    /// Set by `serve --daemon` on the background copy it starts: the pipe
+    /// it waits on, so the copy binds that one and does not start another.
+    #[cfg(windows)]
+    #[arg(long, hide = true, value_name = "PIPE")]
+    pub detached: Option<PathBuf>,
+
     #[command(flatten)]
     pub key: KeyArgs,
 
@@ -865,9 +871,11 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     // A pipe cannot be handed to another process, so on Windows the
     // background copy binds it itself.
     #[cfg(windows)]
-    if args.daemon && std::env::var_os(DETACHED_ENV).is_none() {
-        return respawn_detached(&path);
-    }
+    let path = match args.detached {
+        Some(pipe) => pipe,
+        None if args.daemon => return respawn_detached(&path),
+        None => path,
+    };
     // Bound before the pipe, so the socket is ready by the time
     // respawn_detached sees the pipe answer and prints its path.
     #[cfg(windows)]
@@ -1036,10 +1044,6 @@ fn powershell_quote(text: &str) -> String {
     quoted
 }
 
-/// Set in the background copy that `serve --daemon` starts on Windows.
-#[cfg(windows)]
-const DETACHED_ENV: &str = "OKAGENT_DETACHED";
-
 /// Start this command again as a detached process with no console, wait
 /// until it answers on `socket`, then print the PowerShell snippet. Windows
 /// has no fork, and the console is what a detached agent must give up.
@@ -1070,7 +1074,10 @@ fn respawn_detached(socket: &Path) -> Result<ExitCode> {
     let exe = std::env::current_exe().context("finding okagent's own path")?;
     let mut child = Command::new(exe)
         .args(std::env::args_os().skip(1))
-        .env(DETACHED_ENV, "1")
+        // Passed on rather than resolved again, so the copy binds the pipe
+        // this process waits on.
+        .arg("--detached")
+        .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
