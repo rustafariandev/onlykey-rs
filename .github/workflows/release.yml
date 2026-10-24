@@ -175,10 +175,18 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
+      - name: Find release notes
+        # docs/releases/<tag>.md, when there is one, heads the generated notes.
+        id: notes
+        env:
+          NOTES: docs/releases/${{ github.ref_name }}.md
+        run: |
+          if [ -f "$NOTES" ]; then echo "path=$NOTES" >> "$GITHUB_OUTPUT"; fi
       - name: Publish release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: dist/*
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
