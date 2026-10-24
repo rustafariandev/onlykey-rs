@@ -960,10 +960,65 @@ fn bind_cygwin(pipe: &Path) -> Result<Option<(agent::CygwinListener, agent::Sock
 }
 
 /// Whether okagent was started from an MSYS2 shell, such as Git Bash, whose
-/// `ssh` reaches the agent only through a Cygwin-style socket.
+/// `ssh` reaches the agent only through a Cygwin-style socket. `MSYSTEM`
+/// says so, except that cmd and PowerShell started from Git Bash inherit
+/// it too, so it does not count when one of those started okagent.
 #[cfg(windows)]
 fn msys_shell() -> bool {
     std::env::var_os("MSYSTEM").is_some_and(|s| !s.is_empty())
+        && !launcher().is_some_and(|exe| {
+            ["cmd.exe", "powershell.exe", "pwsh.exe"]
+                .iter()
+                .any(|shell| exe.eq_ignore_ascii_case(shell))
+        })
+}
+
+/// The file name of the program that started okagent, looking past
+/// okagent itself, as the background copy of `serve --daemon` was started
+/// by another. `None` if it cannot be told.
+#[cfg(windows)]
+fn launcher() -> Option<String> {
+    use std::collections::HashMap;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: no pointers are passed; the result is checked.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // Each process's parent and file name.
+    let mut processes = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `snapshot` is open and `entry` is a PROCESSENTRY32W with its
+    // size set, as both calls require.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(260);
+        let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        processes.insert(entry.th32ProcessID, (entry.th32ParentProcessID, exe));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is open and not used again.
+    unsafe { CloseHandle(snapshot) };
+
+    let (mut parent, own) = processes.get(&std::process::id())?.clone();
+    // Bounded, in case reused process ids make a loop.
+    for _ in 0..processes.len() {
+        let (grandparent, exe) = processes.get(&parent)?;
+        if !exe.eq_ignore_ascii_case(&own) {
+            return Some(exe.clone());
+        }
+        parent = *grandparent;
+    }
+    None
 }
 
 /// `path` as MSYS2 and Cygwin take it in `SSH_AUTH_SOCK`: forward slashes.

@@ -430,9 +430,10 @@ with your user name in place of `USER`. A shortcut in `shell:startup` running
   ssh-add -L
   ```
 
-  okagent spots Git Bash and MSYS2 by `MSYSTEM`. From there, `serve` prints
-  sh instead of PowerShell, and `run`, `shell`, `ssh` and `ssh-copy-id`
-  hand their command a Cygwin socket rather than a pipe. An agent on another
+  okagent spots Git Bash and MSYS2 by `MSYSTEM`, unless it was started from
+  cmd or PowerShell, which inherit it when opened from Git Bash. From there,
+  `serve` prints sh instead of PowerShell, and `run`, `shell`, `ssh` and
+  `ssh-copy-id` hand their command a Cygwin socket rather than a pipe. An agent on another
   pipe (`--socket \\.\pipe\work`) gets a socket named after it, `work.sock`,
   next to `agent.sock`. Cygwin's own shell
   sets no `MSYSTEM`, so there, export
