@@ -854,6 +854,9 @@ fn shutdown_flag() -> Result<Arc<AtomicBool>> {
 }
 
 fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
+    // Built before `serve --daemon` respawns on Windows, though the copy
+    // builds it again: the copy has no stderr, so a bad identity or pubkey
+    // file is reported here rather than as an exit code.
     let agent = ctx.agent(&args.identities.base, &args.identities.additional)?;
     let path = args
         .socket
