@@ -788,7 +788,8 @@ output to
 log output still goes to standard error.
 On Windows the agent is instead started again as a detached process with
 no console, and the snippet is PowerShell, for
-.BR Invoke\-Expression .
+.BR Invoke\-Expression ,
+except from Git Bash or MSYS2, where it is sh naming the Cygwin socket.
 .TP
 .B \-\-pageant
 Windows only: also answer PuTTY, WinSCP and other Pageant clients, on
@@ -1165,6 +1166,36 @@ The agent listens on the named pipe
 by default, which Windows' OpenSSH reaches through
 .B SSH_AUTH_SOCK
 as it would a socket.
+.B serve
+also listens on a Cygwin-style socket,
+.IR %LOCALAPPDATA%\eokagent\eagent.sock ,
+for the
+.B ssh
+bundled with Git for Windows, MSYS2 and Cygwin, which cannot open a pipe.
+When
+.B MSYSTEM
+is set, as in Git Bash,
+.B serve
+prints sh that points at that socket, and
+.BR run ,
+.BR shell ,
+.B ssh
+and
+.B ssh\-copy\-id
+give their command a temporary one.
+Otherwise
+.B run
+and
+.B shell
+set
+.B GIT_SSH
+to Windows' OpenSSH, unless
+.B GIT_SSH
+or
+.B GIT_SSH_COMMAND
+is set, since Git runs its bundled
+.B ssh
+even from PowerShell.
 The configuration file is
 .IR %APPDATA%\eokagent\econfig.toml ,
 and its ownership is not checked.

@@ -1162,8 +1162,8 @@ dependencies = [
 
 [[package]]
 name = "ssh-agent-kit"
-version = "1.1.0"
-source = "git+https://github.com/rustafariandev/ssh-agent-kit#99d4f6135c6e561de2823350d15375013fe92e99"
+version = "1.2.0"
+source = "git+https://github.com/rustafariandev/ssh-agent-kit#0a2ec48344e027bc3297af2b5d8b523fca2b051f"
 dependencies = [
  "arc-swap",
  "nix",

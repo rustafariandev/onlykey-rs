@@ -408,6 +408,69 @@ fn ssh_add_lists_both_keys() {
     assert_eq!(h.challenges(), 0);
 }
 
+/// Git for Windows' own `ssh-add` and `ssh-keygen`, which reach the agent
+/// only through a Cygwin-style socket, list the token's keys and sign with
+/// them. Git's tools come from `$OKAGENT_GIT_OPENSSH`, else where Git for
+/// Windows installs them.
+#[cfg(windows)]
+#[test]
+fn git_for_windows_ssh_signs_over_the_cygwin_socket() {
+    let bin = std::env::var_os("OKAGENT_GIT_OPENSSH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Git\usr\bin"));
+    let git_tool = |name: &str| bin.join(format!("{name}.exe"));
+    if !git_tool("ssh-add").exists() || !git_tool("ssh-keygen").exists() {
+        eprintln!("Git for Windows' OpenSSH not installed; skipping");
+        return;
+    }
+    let sink = Arc::new(RecordingSink::default());
+    let opener: Opener = Arc::new(|| Ok(SigningFake::open()));
+    let agent = Arc::new(Agent::new(entries(), opener, sink.clone()));
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let (listener, guard) = agent::bind_cygwin_socket(&socket).unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server = {
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || agent::serve(listener, agent, shutdown))
+    };
+    let sock_env = socket.display().to_string().replace('\\', "/");
+
+    let out = Command::new(git_tool("ssh-add"))
+        .arg("-L")
+        .env("SSH_AUTH_SOCK", &sock_env)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.status.success(),
+        "ssh-add -L failed: {text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ed25519 = text.lines().next().unwrap();
+    assert!(ed25519.starts_with("ssh-ed25519 "), "{text}");
+
+    let pub_path = dir.path().join("id.pub");
+    std::fs::write(&pub_path, format!("{ed25519}\n")).unwrap();
+    let msg_path = dir.path().join("msg");
+    std::fs::write(&msg_path, b"the quick brown fox\n").unwrap();
+    let status = Command::new(git_tool("ssh-keygen"))
+        .args(["-Y", "sign", "-q", "-n", "okagent-test", "-f"])
+        .arg(&pub_path)
+        .arg(&msg_path)
+        .env("SSH_AUTH_SOCK", &sock_env)
+        .status()
+        .unwrap();
+    assert!(status.success(), "ssh-keygen -Y sign failed");
+    assert!(dir.path().join("msg.sig").exists());
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
+
+    shutdown.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    drop(guard);
+    assert!(!socket.exists(), "the socket file outlived its guard");
+}
+
 fn sign_and_check(h: &Harness, dir: &Path, pub_line: &str, name: &str) {
     let pub_path = dir.join(format!("{name}.pub"));
     std::fs::write(&pub_path, format!("{pub_line}\n")).unwrap();

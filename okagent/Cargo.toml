@@ -22,7 +22,7 @@ dsa = ["ssh-agent-kit/dsa"]
 [dependencies]
 onlykey-agent = { path = "..", version = "2.0.0", features = ["serde"] }
 # The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
-ssh-agent-kit = "1.1.0"
+ssh-agent-kit = "1.2.0"
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
 ssh-encoding = "0.2"
 sha2 = "0.10"
@@ -48,7 +48,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 onlykey-agent = { path = "..", version = "2.0.0", features = ["serde", "test-util"] }
-ssh-agent-kit = { version = "1.1.0", features = ["test-util"] }
+ssh-agent-kit = { version = "1.2.0", features = ["test-util"] }
 tempfile = "3"
 rsa = "0.9"
 signature = "2"

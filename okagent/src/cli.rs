@@ -205,7 +205,8 @@ pub struct ServeArgs {
     pub socket: Option<PathBuf>,
 
     /// Run in the background and print shell commands (PowerShell on
-    /// Windows) that set SSH_AUTH_SOCK and SSH_AGENT_PID.
+    /// Windows, except sh from Git Bash) that set SSH_AUTH_SOCK and
+    /// SSH_AGENT_PID.
     #[arg(long, short)]
     pub daemon: bool,
 
@@ -867,14 +868,28 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     if args.daemon && std::env::var_os(DETACHED_ENV).is_none() {
         return respawn_detached(&path);
     }
+    // Bound before the pipe, so the socket is ready by the time
+    // respawn_detached sees the pipe answer and prints its path.
+    #[cfg(windows)]
+    let cygwin = bind_cygwin()?;
     let (listener, guard) = agent::bind_socket(&path)?;
     if args.daemon {
         #[cfg(unix)]
         daemonize(&path)?;
     } else {
-        eprint!("{}", agent_env_snippet(&path, std::process::id()));
+        eprint!("{}", serve_env_snippet(&path, std::process::id()));
     }
     let shutdown = shutdown_flag()?;
+    #[cfg(windows)]
+    if let Some((listener, guard)) = cygwin {
+        let (agent, shutdown) = (Arc::clone(&agent), Arc::clone(&shutdown));
+        std::thread::spawn(move || {
+            let _guard = guard;
+            if let Err(e) = agent::serve(listener, agent, shutdown) {
+                tracing::error!("Cygwin socket: {e}");
+            }
+        });
+    }
     #[cfg(windows)]
     if args.pageant || ctx.config.pageant.unwrap_or(false) {
         serve_as_pageant(&agent, &shutdown);
@@ -912,20 +927,69 @@ fn serve_as_pageant(agent: &Arc<Agent>, shutdown: &Arc<AtomicBool>) {
     });
 }
 
+/// Bind the Cygwin-style socket that the ssh bundled with Git for Windows,
+/// MSYS2 and Cygwin reaches the agent on. From an MSYS2 shell such as Git
+/// Bash a failure is an error, since the snippet points there; elsewhere
+/// it is a warning, and the pipe still serves.
+#[cfg(windows)]
+fn bind_cygwin() -> Result<Option<(agent::CygwinListener, agent::SocketGuard)>> {
+    let path = agent::default_cygwin_socket_path();
+    match agent::bind_cygwin_socket(&path) {
+        Ok(bound) => Ok(Some(bound)),
+        Err(e) if msys_shell() => Err(e.into()),
+        Err(e) => {
+            tracing::warn!("not serving a Cygwin socket for Git Bash's ssh: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Whether okagent was started from an MSYS2 shell, such as Git Bash, whose
+/// `ssh` reaches the agent only through a Cygwin-style socket.
+#[cfg(windows)]
+fn msys_shell() -> bool {
+    std::env::var_os("MSYSTEM").is_some_and(|s| !s.is_empty())
+}
+
+/// `path` as MSYS2 and Cygwin take it in `SSH_AUTH_SOCK`: forward slashes.
+#[cfg(windows)]
+fn msys_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// What `serve` prints: on Windows, sh for an MSYS2 shell, whose ssh uses
+/// the Cygwin socket, else PowerShell for the pipe.
+#[cfg(unix)]
+fn serve_env_snippet(socket: &Path, pid: u32) -> String {
+    agent_env_snippet(socket, pid)
+}
+
+#[cfg(windows)]
+fn serve_env_snippet(pipe: &Path, pid: u32) -> String {
+    if msys_shell() {
+        sh_env_snippet(&msys_path(&agent::default_cygwin_socket_path()), pid)
+    } else {
+        agent_env_snippet(pipe, pid)
+    }
+}
+
 /// The lines `ssh-agent -s` would print: the socket and the agent's pid,
 /// so that `ssh-agent -k` can stop it.
 #[cfg(unix)]
 fn agent_env_snippet(socket: &Path, pid: u32) -> String {
+    sh_env_snippet(&socket.display().to_string(), pid)
+}
+
+fn sh_env_snippet(socket: &str, pid: u32) -> String {
     format!(
         "SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID={pid}; export SSH_AGENT_PID;\n",
-        shell_quote(&socket.display().to_string())
+        shell_quote(socket)
     )
 }
 
 /// `text` as one shell word: unchanged when it is plain, else single-quoted,
 /// so a socket path from `--socket` or the environment cannot run commands
 /// under `eval "$(okagent serve --daemon)"`.
-#[cfg(unix)]
 fn shell_quote(text: &str) -> String {
     let plain = !text.is_empty()
         && text
@@ -1019,7 +1083,7 @@ fn respawn_detached(socket: &Path) -> Result<ExitCode> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    print!("{}", agent_env_snippet(socket, child.id()));
+    print!("{}", serve_env_snippet(socket, child.id()));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1052,23 +1116,37 @@ fn daemonize(socket: &Path) -> Result<()> {
 /// and `SSH_AGENT_PID` set, and stop the agent when it exits.
 fn run(ctx: &Context_, identities: &ExtraIdentityArgs, command: Vec<String>) -> Result<ExitCode> {
     let agent = ctx.agent(&identities.base, &identities.additional)?;
-    let path = agent::ephemeral_socket_path();
-    let (listener, guard) = agent::bind_socket(&path)?;
-    let shutdown = shutdown_flag()?;
-    let server = {
-        let agent = Arc::clone(&agent);
-        let shutdown = Arc::clone(&shutdown);
-        std::thread::spawn(move || agent::serve(listener, agent, shutdown))
-    };
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("no command given"))?;
-    let status = Command::new(program)
+    let shutdown = shutdown_flag()?;
+    let mut child = Command::new(program);
+    child
         .args(args)
-        .env("SSH_AUTH_SOCK", guard.path())
-        .env("SSH_AGENT_PID", std::process::id().to_string())
-        .status()
-        .with_context(|| format!("running {program}"));
+        .env("SSH_AGENT_PID", std::process::id().to_string());
+    // From Git Bash, the command's ssh is Git's own, which reaches only a
+    // Cygwin-style socket.
+    #[cfg(windows)]
+    let (guard, server) = if msys_shell() {
+        let path = agent::ephemeral_cygwin_socket_path();
+        let (listener, guard) = agent::bind_cygwin_socket(&path)?;
+        child.env("SSH_AUTH_SOCK", msys_path(&path));
+        (guard, spawn_server(listener, &agent, &shutdown))
+    } else {
+        let (listener, guard) = agent::bind_socket(&agent::ephemeral_socket_path())?;
+        child.env("SSH_AUTH_SOCK", guard.path());
+        if let Some(ssh) = git_ssh() {
+            child.env("GIT_SSH", ssh);
+        }
+        (guard, spawn_server(listener, &agent, &shutdown))
+    };
+    #[cfg(unix)]
+    let (guard, server) = {
+        let (listener, guard) = agent::bind_socket(&agent::ephemeral_socket_path())?;
+        child.env("SSH_AUTH_SOCK", guard.path());
+        (guard, spawn_server(listener, &agent, &shutdown))
+    };
+    let status = child.status().with_context(|| format!("running {program}"));
     shutdown.store(true, Ordering::SeqCst);
     let _ = server.join();
     drop(guard);
@@ -1077,6 +1155,31 @@ fn run(ctx: &Context_, identities: &ExtraIdentityArgs, command: Vec<String>) -> 
         Some(code) => ExitCode::from(code.clamp(0, 255) as u8),
         None => ExitCode::from(128),
     })
+}
+
+/// Serve `agent` on `listener` on a thread of its own until `shutdown`.
+fn spawn_server<L: agent::Listener + 'static>(
+    listener: L,
+    agent: &Arc<Agent>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+    std::thread::spawn(move || agent::serve(listener, agent, shutdown))
+}
+
+/// Windows' OpenSSH, for git to use under `run`. Git for Windows otherwise
+/// runs its bundled ssh, which cannot reach the agent's named pipe. `None`
+/// when the user already chose an ssh for git (git prefers
+/// `GIT_SSH_COMMAND` and `core.sshCommand` over `GIT_SSH`, so those still
+/// win) or Windows' OpenSSH is not installed.
+#[cfg(windows)]
+fn git_ssh() -> Option<PathBuf> {
+    if std::env::var_os("GIT_SSH").is_some() || std::env::var_os("GIT_SSH_COMMAND").is_some() {
+        return None;
+    }
+    let root = std::env::var_os("SystemRoot")?;
+    let ssh = Path::new(&root).join(r"System32\OpenSSH\ssh.exe");
+    ssh.is_file().then_some(ssh)
 }
 
 /// Run ssh or mosh against the identity's host with a temporary agent that

@@ -31,7 +31,7 @@ test-util = []
 
 [dependencies]
 # Challenge confirmation types shared with the agent.
-ssh-agent-kit = "1.1.0"
+ssh-agent-kit = "1.2.0"
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
 ssh-encoding = "0.2"
 signature = "2"
@@ -65,7 +65,7 @@ hidapi = { version = "2.6", default-features = false, features = ["linux-native-
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 hidapi = { version = "2.6", default-features = false }
 
-# ssh-agent-kit 1.1.0 (Windows support) is not on crates.io yet; build it from
+# ssh-agent-kit 1.2.0 (Windows support) is not on crates.io yet; build it from
 # git until it is, then drop this.
 [patch.crates-io]
 ssh-agent-kit = { git = "https://github.com/rustafariandev/ssh-agent-kit" }

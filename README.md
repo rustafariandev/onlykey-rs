@@ -420,8 +420,27 @@ with your user name in place of `USER`. A shortcut in `shell:startup` running
   also answers PuTTY, WinSCP, and other tools that talk to Pageant, on both
   Pageant's pipe and its window. Either is skipped, with a warning, when a
   real Pageant is already running.
-- **Git.** Git for Windows bundles its own `ssh`, which cannot reach a named
-  pipe. Point Git at Windows' OpenSSH instead:
+- **Git Bash, MSYS2 and Cygwin.** The `ssh` and `ssh-add` these bundle
+  cannot open a named pipe, so `serve` also listens on a Cygwin-style
+  socket, `%LOCALAPPDATA%\okagent\agent.sock`. Only you can read it, and
+  clients running as other users are refused. In Git Bash:
+
+  ```sh
+  eval "$(okagent serve --daemon)"   # sh, pointing at the Cygwin socket
+  ssh-add -L
+  ```
+
+  okagent spots Git Bash and MSYS2 by `MSYSTEM`. From there, `serve` prints
+  sh instead of PowerShell, and `run`, `shell`, `ssh` and `ssh-copy-id`
+  hand their command a Cygwin socket rather than a pipe. Cygwin's own shell
+  sets no `MSYSTEM`, so there, export
+  `SSH_AUTH_SOCK=/cygdrive/c/Users/USER/AppData/Local/okagent/agent.sock`
+  yourself.
+- **Git from PowerShell or cmd.** Git for Windows runs its bundled `ssh` even
+  from PowerShell, and that `ssh` cannot reach the pipe. `okagent run` and
+  `okagent shell` set `GIT_SSH` to Windows' OpenSSH, unless `GIT_SSH` or
+  `GIT_SSH_COMMAND` is already set. With `okagent serve`, point Git at it
+  yourself:
   `git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe`.
 - **Windows' ssh-agent service.** It is separate from okagent. If it is
   running, its keys are not okagent's; it can stay stopped

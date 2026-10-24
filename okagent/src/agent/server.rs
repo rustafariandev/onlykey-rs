@@ -177,6 +177,21 @@ pub fn ephemeral_socket_path() -> PathBuf {
     ssh_agent_kit::ephemeral_socket_path("okagent")
 }
 
+/// Where `serve` puts the Cygwin-style socket that the ssh bundled with Git
+/// for Windows, MSYS2 and Cygwin connects to:
+/// `%LOCALAPPDATA%\okagent\agent.sock`.
+#[cfg(windows)]
+pub fn default_cygwin_socket_path() -> PathBuf {
+    ssh_agent_kit::server::runtime_dir("okagent").join("agent.sock")
+}
+
+/// A fresh per-process Cygwin-style socket path for `run`-style
+/// invocations, next to [`default_cygwin_socket_path`].
+#[cfg(windows)]
+pub fn ephemeral_cygwin_socket_path() -> PathBuf {
+    ssh_agent_kit::server::runtime_dir("okagent").join(format!("run-{}.sock", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
