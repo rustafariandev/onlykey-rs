@@ -617,11 +617,10 @@ Differences from the Python agent:
 
 ## Development
 
-The agent is built on [ssh-agent-kit](https://github.com/rustafariandev/ssh-agent-kit).
-Its Windows support (1.1.0) is not on crates.io yet, so `Cargo.toml` builds it
-from git through `[patch.crates-io]` until it is. To work on both at once,
-check it out next to this repository and point Cargo at it with a
-`.cargo/config.toml` (git-ignored):
+The agent is built on [ssh-agent-kit](https://github.com/rustafariandev/ssh-agent-kit),
+which Cargo fetches from crates.io. To work on both at once, check it out next
+to this repository and point Cargo at it with a `.cargo/config.toml`
+(git-ignored):
 
 ```sh
 git clone https://github.com/rustafariandev/ssh-agent-kit ../ssh-agent-kit

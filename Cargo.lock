@@ -1163,7 +1163,8 @@ dependencies = [
 [[package]]
 name = "ssh-agent-kit"
 version = "1.2.0"
-source = "git+https://github.com/rustafariandev/ssh-agent-kit#0a2ec48344e027bc3297af2b5d8b523fca2b051f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "265044fc3e585bab460532cd4737432588c33f2146d22206670375b69a161f9f"
 dependencies = [
  "arc-swap",
  "nix",

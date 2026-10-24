@@ -65,11 +65,6 @@ hidapi = { version = "2.6", default-features = false, features = ["linux-native-
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 hidapi = { version = "2.6", default-features = false }
 
-# ssh-agent-kit 1.2.0 (Windows support) is not on crates.io yet; build it from
-# git until it is, then drop this.
-[patch.crates-io]
-ssh-agent-kit = { git = "https://github.com/rustafariandev/ssh-agent-kit" }
-
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
