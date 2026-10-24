@@ -879,7 +879,7 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     // Bound before the pipe, so the socket is ready by the time
     // respawn_detached sees the pipe answer and prints its path.
     #[cfg(windows)]
-    let cygwin = bind_cygwin()?;
+    let cygwin = bind_cygwin(&path)?;
     let (listener, guard) = agent::bind_socket(&path)?;
     if args.daemon {
         #[cfg(unix)]
@@ -948,9 +948,8 @@ fn serve_as_pageant(agent: &Arc<Agent>, shutdown: &Arc<AtomicBool>) {
 /// Bash a failure is an error, since the snippet points there; elsewhere
 /// it is a warning, and the pipe still serves.
 #[cfg(windows)]
-fn bind_cygwin() -> Result<Option<(agent::CygwinListener, agent::SocketGuard)>> {
-    let path = agent::default_cygwin_socket_path();
-    match agent::bind_cygwin_socket(&path) {
+fn bind_cygwin(pipe: &Path) -> Result<Option<(agent::CygwinListener, agent::SocketGuard)>> {
+    match agent::bind_cygwin_socket(&agent::cygwin_socket_path(pipe)) {
         Ok(bound) => Ok(Some(bound)),
         Err(e) if msys_shell() => Err(e.into()),
         Err(e) => {
@@ -983,7 +982,7 @@ fn serve_env_snippet(socket: &Path, pid: u32) -> String {
 #[cfg(windows)]
 fn serve_env_snippet(pipe: &Path, pid: u32) -> String {
     if msys_shell() {
-        sh_env_snippet(&msys_path(&agent::default_cygwin_socket_path()), pid)
+        sh_env_snippet(&msys_path(&agent::cygwin_socket_path(pipe)), pid)
     } else {
         agent_env_snippet(pipe, pid)
     }

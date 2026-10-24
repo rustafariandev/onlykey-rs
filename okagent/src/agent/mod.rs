@@ -43,7 +43,7 @@ pub use ssh_agent_kit::{
 pub use onlykey::{Device, OnlyKeyBackend, Opener};
 pub use server::{Agent, AgentError, default_socket_path, ephemeral_socket_path};
 #[cfg(windows)]
-pub use server::{default_cygwin_socket_path, ephemeral_cygwin_socket_path};
+pub use server::{cygwin_socket_path, default_cygwin_socket_path, ephemeral_cygwin_socket_path};
 pub use sk::{SkBackend, SkDecoder, SkKey, SkOpener};
 #[cfg(feature = "dsa")]
 pub use ssh_agent_kit::DsaLocalKey;

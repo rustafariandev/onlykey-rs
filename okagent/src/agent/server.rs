@@ -185,6 +185,21 @@ pub fn default_cygwin_socket_path() -> PathBuf {
     ssh_agent_kit::server::runtime_dir("okagent").join("agent.sock")
 }
 
+/// The Cygwin-style socket that goes with the named pipe `pipe`: the
+/// default one for the default pipe, else one named after the pipe, such as
+/// `%LOCALAPPDATA%\okagent\work.sock` for `\\.\pipe\work`, so agents on
+/// different pipes do not compete for it.
+#[cfg(windows)]
+pub fn cygwin_socket_path(pipe: &std::path::Path) -> PathBuf {
+    if pipe == default_socket_path() {
+        return default_cygwin_socket_path();
+    }
+    let name = pipe.file_name().unwrap_or("agent".as_ref());
+    let mut file = name.to_owned();
+    file.push(".sock");
+    ssh_agent_kit::server::runtime_dir("okagent").join(file)
+}
+
 /// A fresh per-process Cygwin-style socket path for `run`-style
 /// invocations, next to [`default_cygwin_socket_path`].
 #[cfg(windows)]
@@ -245,6 +260,18 @@ mod tests {
             Curve::Ed25519,
             EccSlot::new(3).unwrap(),
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn each_pipe_has_its_own_cygwin_socket() {
+        assert_eq!(
+            cygwin_socket_path(&default_socket_path()),
+            default_cygwin_socket_path()
+        );
+        let work = cygwin_socket_path(std::path::Path::new(r"\\.\pipe\work"));
+        assert_eq!(work.file_name().unwrap(), "work.sock");
+        assert_eq!(work.parent(), default_cygwin_socket_path().parent());
     }
 
     #[test]
