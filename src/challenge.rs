@@ -660,6 +660,21 @@ mod tests {
         let path = dir.join("askpass");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A child forked by a parallel test can briefly hold our write handle,
+        // making exec fail with ETXTBSY; wait until the script can be run.
+        for _ in 0..100 {
+            match Command::new(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
         path.to_str().unwrap().to_owned()
     }
 
