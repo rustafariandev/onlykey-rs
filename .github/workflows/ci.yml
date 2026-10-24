@@ -16,6 +16,11 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    # A pull request from a branch here is already tested by its pushes;
+    # only one from a fork needs a run of its own.
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
