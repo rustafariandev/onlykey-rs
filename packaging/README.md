@@ -1,8 +1,9 @@
 # Packaging
 
-Packages for RHEL, Debian, Ubuntu, Arch and a universal static binary.
+Packages for RHEL, Debian, Ubuntu, Arch, a universal static binary, and a
+Windows zip ([below](#windows)).
 
-Every package installs the same payload:
+Every Linux package installs the same payload:
 
 | Path | File |
 | --- | --- |
@@ -42,7 +43,8 @@ make package-universal   # dist/okagent-<v>-x86_64-unknown-linux-musl.tar.gz
 make package-deb         # dist/okagent_<v>-1_amd64.deb  (Debian 12 + Ubuntu 22.04)
 make package-rpm         # dist/okagent-<v>-1.el8.x86_64.rpm
 make package-arch        # dist/okagent-<v>-1-x86_64.pkg.tar.zst
-make package-all
+make package-all         # every Linux package
+make package-windows     # dist/okagent-<v>-x86_64-pc-windows-msvc.{zip,msi} (on Windows)
 ```
 
 Or directly:
@@ -91,6 +93,62 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/okagent/agent.sock"
 ssh-add -L
 ```
 
+## Windows
+
+`packaging/windows/build.ps1` builds `okagent.exe` with the C runtime linked
+statically, so it needs no Visual C++ redistributable, and zips it with
+`install.ps1`, a PowerShell completion script, the README and the license:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Target aarch64-pc-windows-msvc
+```
+
+The second needs the MSVC ARM64 build tools; releases ship `x86_64` only.
+
+`install.ps1` installs for the current user, with no administrator rights:
+
+| What | Where |
+| --- | --- |
+| `okagent.exe`, `okagent-completion.ps1`, `install.ps1` | `%LOCALAPPDATA%\Programs\okagent` |
+| that directory | the user `PATH` |
+| `\\.\pipe\okagent-USER` | the user `SSH_AUTH_SOCK` (not with `-NoAuthSock`) |
+| `okagent serve --daemon` at logon | `shell:startup\okagent.lnk` (with `-Autostart`) |
+
+Run again from a newer zip, it stops the installed agent, replaces it, and
+starts it again if it autostarts. `install.ps1 -Uninstall` undoes everything
+but the config in `%APPDATA%\okagent`. `-Prefix DIR` installs elsewhere.
+
+### MSI
+
+`build.ps1 -Msi` also builds `okagent-<v>-x86_64-pc-windows-msvc.msi` from
+`packaging/windows/okagent.wxs` with the WiX 5 CLI:
+
+```powershell
+dotnet tool install --global wix --version 5.0.2
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Msi
+```
+
+The MSI is per-user too and installs what `install.ps1` does, to the same
+place, with `-Autostart` on by default. It is installed, upgraded and removed
+like any other: double-click it, or
+
+```powershell
+msiexec /i okagent-2.0.0-x86_64-pc-windows-msvc.msi              # quiet: add /qn
+msiexec /i okagent-2.0.0-x86_64-pc-windows-msvc.msi AUTOSTART=0 AUTHSOCK=0
+msiexec /x okagent-2.0.0-x86_64-pc-windows-msvc.msi
+```
+
+`AUTOSTART=0` skips the Startup shortcut and starting the agent; `AUTHSOCK=0`
+leaves `SSH_AUTH_SOCK` alone. Both are remembered by later upgrades. An
+upgrade or uninstall first stops every running `okagent.exe` of the user,
+wherever it was started from. Use either the MSI or `install.ps1`, not both:
+they share the install directory but do not know about each other.
+
+The executable is not code-signed. Windows marks files from a downloaded zip
+as coming from the internet; the installer clears that mark on what it
+installs.
+
 ## Releasing
 
 ```sh
@@ -110,8 +168,8 @@ downloaded file was built by that workflow from this repository:
 gh attestation verify okagent-*.tar.gz --repo rustafariandev/onlykey-rs
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Linux and
-macOS for every push and pull request.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Linux,
+macOS and Windows for every push and pull request.
 
 ## Layout
 
@@ -123,6 +181,9 @@ packaging/
   debian/                   native Debian/Ubuntu packaging
   rpm/okagent.spec          native RPM spec
   arch/PKGBUILD             Arch build recipe
+  windows/build.ps1         Windows zip
+  windows/install.ps1       per-user installer shipped in the zip
+  windows/okagent.wxs       WiX source for the MSI
   build-packages.sh         podman orchestration
   release.sh                version bump + tag
 Makefile                    wrappers over the scripts

@@ -43,7 +43,8 @@ pure-Rust CTAP2 client, with no C library involved.
 - Windows: the MSVC build tools (Visual Studio's "Desktop development with
   C++"), which build hidapi's Win32 backend, and Windows' own OpenSSH Client
   (Settings → System → Optional features). No driver is needed. See
-  [Windows](#windows) for how the agent is reached there.
+  [Windows](#windows) for how the agent is reached there. The release zip
+  needs neither the build tools nor a Visual C++ runtime.
 
 ```sh
 cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
@@ -54,7 +55,9 @@ Prebuilt packages and a static binary are published on the
 universal `x86_64` musl tarball, a `.deb` for Debian 12+ and Ubuntu 22.04+,
 an `.rpm` for RHEL 8+, and a `.pkg.tar.zst` for Arch. Each installs the
 binary, man page, a systemd user unit, the udev rule, and shell completions;
-see [`packaging/README.md`](packaging/README.md). `okagent completions SHELL`
+see [`packaging/README.md`](packaging/README.md). For Windows there is an
+`x86_64` MSI, and a zip whose `install.ps1` does the same; see
+[Windows](#windows). `okagent completions SHELL`
 prints a completion script, and `make package-all` builds every package
 locally with podman.
 
@@ -375,6 +378,28 @@ and `export SSH_AUTH_SOCK="$HOME/.okagent/agent.sock"`. The notifier is
 
 ### Windows
 
+The release MSI, `okagent-VERSION-x86_64-pc-windows-msvc.msi`, installs
+okagent for the current user (no administrator rights needed), starts the
+agent, and starts it again at every logon. Upgrade by installing a newer one,
+and remove it from Settings → Apps. `msiexec /i okagent-….msi AUTOSTART=0`
+installs it without autostart, and `AUTHSOCK=0` leaves `SSH_AUTH_SOCK` alone;
+see [`packaging/README.md`](packaging/README.md#msi).
+
+The release zip, `okagent-VERSION-x86_64-pc-windows-msvc.zip`, does the same
+without Windows Installer: it holds `okagent.exe` and an installer script.
+From the unzipped folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Autostart
+```
+
+It copies okagent to `%LOCALAPPDATA%\Programs\okagent`, adds that to your
+`PATH`, sets `SSH_AUTH_SOCK` for your user to the agent's pipe, and with
+`-Autostart` starts the agent now and at every logon. Run it again from a
+newer zip to upgrade. `-NoAuthSock` leaves `SSH_AUTH_SOCK` alone, and
+`install.ps1 -Uninstall`, run from the install folder, removes it all again.
+It prints the line to add to `$PROFILE` for tab completion.
+
 The agent listens on a named pipe, `\\.\pipe\okagent-USER` by default, which
 Windows' OpenSSH finds through `SSH_AUTH_SOCK` like a socket. In PowerShell:
 
@@ -385,7 +410,8 @@ Stop-Process -Id $env:SSH_AGENT_PID          # stop it again
 ```
 
 Without `--daemon` it serves in the foreground and prints the same two lines.
-To have every new shell use it, set `SSH_AUTH_SOCK` for your user once:
+Without the installer, to have every new shell use it, set `SSH_AUTH_SOCK`
+for your user once:
 `[Environment]::SetEnvironmentVariable('SSH_AUTH_SOCK', '\\.\pipe\okagent-USER', 'User')`,
 with your user name in place of `USER`. A shortcut in `shell:startup` running
 `okagent.exe serve --daemon` starts the agent at logon.
