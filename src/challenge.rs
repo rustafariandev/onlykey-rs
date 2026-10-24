@@ -166,7 +166,7 @@ impl PinPrompt for AskpassPin {
     }
 
     fn pin(&self, request: &PinRequest) -> PinAnswer {
-        let output = Command::new(&self.program)
+        let output = tty::command(&self.program)
             .arg(request.message())
             // Unset, it asks for a secret rather than a yes/no confirmation.
             .env_remove("SSH_ASKPASS_PROMPT")
@@ -404,7 +404,7 @@ impl ChallengeSink for AskpassConfirm {
     fn present(&self, _challenge: &Challenge) {}
 
     fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
-        let output = Command::new(&self.program)
+        let output = tty::command(&self.program)
             .arg(request.message())
             .env("SSH_ASKPASS_PROMPT", "confirm")
             .stdin(Stdio::null())
@@ -697,7 +697,13 @@ mod tests {
         }
         assert!(AskpassPin::new(&program).available());
         // Found through PATHEXT without its extension, and through PATH.
-        assert!(AskpassPin::new(program.trim_end_matches(".cmd")).available());
+        let bare = program.trim_end_matches(".cmd");
+        assert!(AskpassPin::new(bare).available());
+        // And run that way, though `Command` alone would only try `.exe`.
+        match AskpassPin::new(bare).pin(&request()) {
+            PinAnswer::Pin(pin) => assert_eq!(pin.as_str(), "1234"),
+            other => panic!("unexpected answer {other:?}"),
+        }
         assert!(AskpassPin::new("cmd").available());
         assert!(!AskpassPin::new("okagent-no-such-askpass").available());
         assert!(!AskpassPin::new(dir.path().to_str().unwrap()).available());
@@ -710,6 +716,10 @@ mod tests {
         let yes = askpass(
             dir.path(),
             r#"if "%SSH_ASKPASS_PROMPT%"=="confirm" echo yes"#,
+        );
+        assert_eq!(
+            AskpassConfirm::new(yes.trim_end_matches(".cmd")).confirm(&confirm_request()),
+            Some(true)
         );
         assert_eq!(
             AskpassConfirm::new(yes).confirm(&confirm_request()),

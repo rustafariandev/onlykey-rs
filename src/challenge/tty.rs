@@ -4,6 +4,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+use std::process::Command;
 
 /// The user's terminal, split into its input and output.
 pub(super) struct Tty {
@@ -43,9 +46,11 @@ pub(super) fn foreground() -> Option<Tty> {
     Some(Tty { input, output })
 }
 
-/// The console this process is attached to. Windows has no background
-/// process groups; an agent started with `serve --daemon` has no console at
-/// all, so opening it fails.
+/// The console this process is attached to. Windows has no foreground
+/// process group to check: under `okagent shell` the agent shares the
+/// console with the shell, which is safe while the shell waits on the ssh
+/// that asked but not for one it left running in the background. An agent
+/// started with `serve --daemon` has no console at all, so opening it fails.
 #[cfg(windows)]
 pub(super) fn foreground() -> Option<Tty> {
     // Write access too: changing the input mode and flushing it need it.
@@ -158,6 +163,12 @@ pub(super) fn is_executable(program: &str) -> bool {
 /// the `PATHEXT` extensions when it has none of its own.
 #[cfg(windows)]
 pub(super) fn is_executable(program: &str) -> bool {
+    find_executable(program).is_some()
+}
+
+/// The file [`is_executable`] finds for `program`.
+#[cfg(windows)]
+fn find_executable(program: &str) -> Option<PathBuf> {
     let program = Path::new(program);
     let extensions: Vec<String> = if program.extension().is_some() {
         vec![String::new()]
@@ -170,15 +181,27 @@ pub(super) fn is_executable(program: &str) -> bool {
             .collect()
     };
     let runnable = |path: &Path| {
-        extensions.iter().any(|ext| {
+        extensions.iter().find_map(|ext| {
             let mut candidate = path.as_os_str().to_owned();
             candidate.push(ext);
-            Path::new(&candidate).is_file()
+            let candidate = PathBuf::from(candidate);
+            candidate.is_file().then_some(candidate)
         })
     };
     if program.components().count() > 1 || program.is_absolute() {
         return runnable(program);
     }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| runnable(&dir.join(program))))
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| runnable(&dir.join(program)))
+}
+
+/// A command that runs `program` as [`is_executable`] finds it. On Windows
+/// `Command` alone only adds `.exe`, so an askpass named without its `.cmd`
+/// would be found and then fail to start.
+pub(super) fn command(program: &str) -> Command {
+    #[cfg(windows)]
+    if let Some(path) = find_executable(program) {
+        return Command::new(path);
+    }
+    Command::new(program)
 }
