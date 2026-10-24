@@ -435,9 +435,10 @@ with your user name in place of `USER`. A shortcut in `shell:startup` running
   `serve` prints sh instead of PowerShell, `shell` starts Git Bash's shell
   rather than `%COMSPEC%`, and `run`, `shell`, `ssh` and `ssh-copy-id` hand
   their command a Cygwin socket rather than a pipe. An agent on another
-  pipe (`--socket \\.\pipe\work`) gets a socket named after it, `work.sock`,
-  next to `agent.sock`. Cygwin's own shell
-  sets no `MSYSTEM`, so there, export
+  pipe gets a socket named after it, `work.sock` for `\\.\pipe\work`, next
+  to `agent.sock`. In Git Bash, single-quote a pipe name, as in
+  `--socket '\\.\pipe\work'`; unquoted, bash drops its backslashes.
+  Cygwin's own shell sets no `MSYSTEM`, so there, export
   `SSH_AUTH_SOCK=/cygdrive/c/Users/USER/AppData/Local/okagent/agent.sock`
   yourself.
 - **Git from PowerShell or cmd.** Git for Windows runs its bundled `ssh` even
