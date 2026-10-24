@@ -130,8 +130,8 @@ pub enum Cmd {
     Serve(ServeArgs),
     /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Run(RunArgs),
-    /// Start $SHELL (%COMSPEC% on Windows) with SSH_AUTH_SOCK and
-    /// SSH_AGENT_PID set for a temporary agent.
+    /// Start $SHELL (%COMSPEC% on Windows, except from Git Bash) with
+    /// SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Shell(ShellArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
@@ -570,7 +570,7 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
             #[cfg(unix)]
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             #[cfg(windows)]
-            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+            let shell = windows_shell();
             run(&ctx, &args.identities, vec![shell])
         }
         Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
@@ -1019,6 +1019,20 @@ fn launcher() -> Option<String> {
         parent = *grandparent;
     }
     None
+}
+
+/// The shell `okagent shell` starts: Git Bash's own from there, else
+/// `%COMSPEC%`. Git Bash hands `SHELL` to Windows programs as a Windows
+/// path.
+#[cfg(windows)]
+fn windows_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| {
+            msys_shell() && Path::new(shell).is_absolute() && Path::new(shell).is_file()
+        })
+        .or_else(|| std::env::var("COMSPEC").ok())
+        .unwrap_or_else(|| "cmd.exe".into())
 }
 
 /// `path` as MSYS2 and Cygwin take it in `SSH_AUTH_SOCK`: forward slashes.
