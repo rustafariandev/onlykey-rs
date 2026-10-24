@@ -91,6 +91,7 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .RB [ \-\-socket
 .IR path ]
 .RB [ \-\-daemon ]
+.RB [ \-\-pageant ]
 .RB [ \-\-pubkey\-file
 .IR file ]
 .RB [ \-i
@@ -486,7 +487,8 @@ so no key file is needed and
 must not be given.
 .TP
 .BI serve " " [ identity \fR.\|.\|.]
-Run a long-lived agent on a unix socket.
+Run a long-lived agent on a unix socket (on Windows, a named pipe; see
+.BR WINDOWS ).
 Without
 .BR \-\-daemon ,
 the agent stays in the foreground and prints lines of the form
@@ -784,6 +786,14 @@ The child detaches from the terminal and redirects standard input and
 output to
 .IR /dev/null ;
 log output still goes to standard error.
+On Windows the agent is instead started again as a detached process with
+no console, and the snippet is PowerShell, for
+.BR Invoke\-Expression .
+.TP
+.B \-\-pageant
+Windows only: also answer PuTTY, WinSCP and other Pageant clients, on
+Pageant's named pipe and through its window.
+Either is skipped, with a warning, when a Pageant already has it.
 .SH CHALLENGE PROMPT
 When an SSH client asks for a signature,
 .B okagent
@@ -897,6 +907,11 @@ See
 .BI key-lifetime " = " seconds
 See
 .BR \-\-key\-lifetime .
+.TP
+.BI pageant " = " bool
+See
+.BR \-\-pageant ;
+ignored outside Windows.
 .TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
@@ -1144,6 +1159,27 @@ and
 On macOS, run it from launchd instead; see the README for a
 .I ~/Library/LaunchAgents
 property list.
+.SH WINDOWS
+The agent listens on the named pipe
+.I \e\e.\epipe\eokagent\-USER
+by default, which Windows' OpenSSH reaches through
+.B SSH_AUTH_SOCK
+as it would a socket.
+The configuration file is
+.IR %APPDATA%\eokagent\econfig.toml ,
+and its ownership is not checked.
+The agent stops on Ctrl-C or
+.BR Stop\-Process ;
+there is no SIGHUP.
+.B shell
+starts
+.B %COMSPEC%
+rather than
+.BR $SHELL .
+Windows lets only an elevated process open a FIDO security key directly,
+so
+.B sk\-
+keys need an elevated agent there; OnlyKey keys do not.
 .SH NOTES
 Only the original OnlyKey is supported, not the OnlyKey DUO.
 The agent covers SSH only; GPG and age keys are out of scope.

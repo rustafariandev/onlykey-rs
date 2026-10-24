@@ -3,6 +3,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+#[cfg(unix)]
 use nix::unistd::{ForkResult, fork, setsid};
 use okagent::agent::{self, Agent, Opener, SkOpener};
 use okagent::agent::{client, sk};
@@ -46,7 +47,8 @@ pub struct Cli {
     )]
     pub log_file: Option<PathBuf>,
 
-    /// Config file (default: $XDG_CONFIG_HOME/okagent/config.toml).
+    /// Config file (default: $XDG_CONFIG_HOME/okagent/config.toml, or
+    /// %APPDATA%\okagent\config.toml on Windows).
     #[arg(
         long,
         global = true,
@@ -124,11 +126,12 @@ pub enum Cmd {
     /// Add the SSH keys stored on FIDO security keys (resident keys) to the
     /// agent, keeping whether each needs its PIN (unlike `ssh-add -K`).
     LoadResident(LoadResidentArgs),
-    /// Run the agent on a unix socket.
+    /// Run the agent on a unix socket (a named pipe on Windows).
     Serve(ServeArgs),
     /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Run(RunArgs),
-    /// Start $SHELL with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
+    /// Start $SHELL (%COMSPEC% on Windows) with SSH_AUTH_SOCK and
+    /// SSH_AGENT_PID set for a temporary agent.
     Shell(ShellArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
@@ -196,14 +199,19 @@ pub struct ServeArgs {
     pub identities: ExtraIdentityArgs,
 
     /// Socket path (default: $XDG_RUNTIME_DIR/okagent/agent.sock, or
-    /// $TMPDIR/okagent/agent.sock on macOS).
+    /// $TMPDIR/okagent/agent.sock on macOS; the pipe \\.\pipe\okagent-USER
+    /// on Windows).
     #[arg(long)]
     pub socket: Option<PathBuf>,
 
-    /// Fork into the background and print shell commands that set
-    /// SSH_AUTH_SOCK and SSH_AGENT_PID.
+    /// Run in the background and print shell commands (PowerShell on
+    /// Windows) that set SSH_AUTH_SOCK and SSH_AGENT_PID.
     #[arg(long, short)]
     pub daemon: bool,
+
+    /// Also answer PuTTY, WinSCP and other Pageant clients (Windows only).
+    #[arg(long, hide = cfg!(not(windows)))]
+    pub pageant: bool,
 
     #[command(flatten)]
     pub key: KeyArgs,
@@ -509,11 +517,13 @@ pub fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
         .with_target(false);
     match log_file {
         Some(path) => {
-            use std::os::unix::fs::OpenOptionsExt;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            // On Windows a new file inherits its directory's access list,
+            // which in the user's profile is the user's alone.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let file = options
                 .open(path)
                 .with_context(|| format!("opening log file {}", path.display()))?;
             builder
@@ -550,7 +560,10 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         Cmd::Serve(args) => serve(&ctx, args),
         Cmd::Run(args) => run(&ctx, &args.identities, args.command),
         Cmd::Shell(args) => {
+            #[cfg(unix)]
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            #[cfg(windows)]
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
             run(&ctx, &args.identities, vec![shell])
         }
         Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
@@ -825,6 +838,7 @@ fn shutdown_flag() -> Result<Arc<AtomicBool>> {
     for sig in [
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
+        #[cfg(unix)]
         signal_hook::consts::SIGHUP,
     ] {
         signal_hook::flag::register(sig, Arc::clone(&flag))?;
@@ -838,20 +852,69 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
         .socket
         .or_else(|| ctx.config.socket.clone())
         .unwrap_or_else(agent::default_socket_path);
+    if cfg!(not(windows)) {
+        if args.pageant {
+            bail!("--pageant is only available on Windows");
+        }
+        // A config shared with a Windows machine may ask for it.
+        if ctx.config.pageant == Some(true) {
+            tracing::debug!("ignoring `pageant` in the config: Pageant is Windows only");
+        }
+    }
+    // A pipe cannot be handed to another process, so on Windows the
+    // background copy binds it itself.
+    #[cfg(windows)]
+    if args.daemon && std::env::var_os(DETACHED_ENV).is_none() {
+        return respawn_detached(&path);
+    }
     let (listener, guard) = agent::bind_socket(&path)?;
     if args.daemon {
+        #[cfg(unix)]
         daemonize(&path)?;
     } else {
         eprint!("{}", agent_env_snippet(&path, std::process::id()));
     }
     let shutdown = shutdown_flag()?;
+    #[cfg(windows)]
+    if args.pageant || ctx.config.pageant.unwrap_or(false) {
+        serve_as_pageant(&agent, &shutdown);
+    }
     agent::serve(listener, agent, shutdown)?;
     drop(guard);
     Ok(ExitCode::SUCCESS)
 }
 
+/// Answer PuTTY's tools too, on threads of their own: newer ones on
+/// Pageant's pipe, older ones through its window. Either is skipped, with a
+/// warning, when a Pageant already has it.
+#[cfg(windows)]
+fn serve_as_pageant(agent: &Arc<Agent>, shutdown: &Arc<AtomicBool>) {
+    let pipe = agent::pageant_pipe_name()
+        .map_err(anyhow::Error::from)
+        .and_then(|name| Ok(agent::bind_socket(&name)?));
+    match pipe {
+        Ok((listener, guard)) => {
+            let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+            std::thread::spawn(move || {
+                let _guard = guard;
+                if let Err(e) = agent::serve(listener, agent, shutdown) {
+                    tracing::error!("Pageant pipe: {e}");
+                }
+            });
+        }
+        Err(e) => tracing::warn!("not serving Pageant's pipe: {e:#}"),
+    }
+    let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+    std::thread::spawn(move || {
+        if let Err(e) = agent::serve_pageant_window(agent, shutdown) {
+            tracing::warn!("not serving Pageant's window: {e}");
+        }
+    });
+}
+
 /// The lines `ssh-agent -s` would print: the socket and the agent's pid,
 /// so that `ssh-agent -k` can stop it.
+#[cfg(unix)]
 fn agent_env_snippet(socket: &Path, pid: u32) -> String {
     format!(
         "SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID={pid}; export SSH_AGENT_PID;\n",
@@ -862,6 +925,7 @@ fn agent_env_snippet(socket: &Path, pid: u32) -> String {
 /// `text` as one shell word: unchanged when it is plain, else single-quoted,
 /// so a socket path from `--socket` or the environment cannot run commands
 /// under `eval "$(okagent serve --daemon)"`.
+#[cfg(unix)]
 fn shell_quote(text: &str) -> String {
     let plain = !text.is_empty()
         && text
@@ -874,8 +938,94 @@ fn shell_quote(text: &str) -> String {
     }
 }
 
+/// The PowerShell equivalent, for `okagent serve --daemon | Invoke-Expression`.
+#[cfg(windows)]
+fn agent_env_snippet(socket: &Path, pid: u32) -> String {
+    format!(
+        "$env:SSH_AUTH_SOCK = {};\n$env:SSH_AGENT_PID = '{pid}';\n",
+        powershell_quote(&socket.display().to_string())
+    )
+}
+
+/// `text` as a PowerShell string literal that expands nothing. PowerShell
+/// also takes the typographic single quotes as quotes, so those are doubled
+/// as well.
+#[cfg(windows)]
+fn powershell_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for c in text.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// Set in the background copy that `serve --daemon` starts on Windows.
+#[cfg(windows)]
+const DETACHED_ENV: &str = "OKAGENT_DETACHED";
+
+/// Start this command again as a detached process with no console, wait
+/// until it answers on `socket`, then print the PowerShell snippet. Windows
+/// has no fork, and the console is what a detached agent must give up.
+#[cfg(windows)]
+fn respawn_detached(socket: &Path) -> Result<ExitCode> {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    if client::connect(socket).is_ok() {
+        bail!("an agent is already serving {}", socket.display());
+    }
+    // A child inherits every inheritable handle, not only the three it is
+    // given. Holding on to this process's stdout would keep the pipe of
+    // `okagent serve --daemon | Invoke-Expression` open after it exits.
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // SAFETY: changes only the flags of this process's own std handle;
+        // a null or invalid one makes the call fail harmlessly.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    }
+    let exe = std::env::current_exe().context("finding okagent's own path")?;
+    let mut child = Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(DETACHED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .context("starting the agent in the background")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client::connect(socket).is_err() {
+        if let Some(status) = child.try_wait()? {
+            bail!("the background agent exited ({status}); run `okagent serve` to see why");
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the background agent (pid {}) did not start serving {}",
+                child.id(),
+                socket.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    print!("{}", agent_env_snippet(socket, child.id()));
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Fork into the background. The parent prints the shell snippet and exits;
 /// the child detaches from the terminal.
+#[cfg(unix)]
 fn daemonize(socket: &Path) -> Result<()> {
     // SAFETY: no threads have been spawned yet and the child only continues
     // with async-signal-safe setup before returning to normal execution.
@@ -1121,6 +1271,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn env_snippet_matches_ssh_agent_output() {
         assert_eq!(
@@ -1171,6 +1322,7 @@ mod tests {
 
     /// A path the shell would split or expand is single-quoted, so `eval`
     /// sets it literally.
+    #[cfg(unix)]
     #[test]
     fn env_snippet_quotes_a_path_the_shell_would_change() {
         let path = "/tmp/a b;$(touch x)'q";
@@ -1179,6 +1331,28 @@ mod tests {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("{snippet}printf %s \"$SSH_AUTH_SOCK\""))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+    }
+
+    /// On Windows the snippet is PowerShell, and PowerShell sets a path
+    /// with quotes or `$(...)` in it literally.
+    #[cfg(windows)]
+    #[test]
+    fn env_snippet_is_powershell_that_sets_the_path_literally() {
+        assert_eq!(
+            agent_env_snippet(Path::new(r"\\.\pipe\okagent-ferris"), 42),
+            "$env:SSH_AUTH_SOCK = '\\\\.\\pipe\\okagent-ferris';\n$env:SSH_AGENT_PID = '42';\n"
+        );
+        let path = r"\\.\pipe\a b;$(Write-Output x)'q’r";
+        let snippet = agent_env_snippet(Path::new(path), 42);
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "{snippet}[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+                 [Console]::Out.Write($env:SSH_AUTH_SOCK)"
+            ))
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), path);

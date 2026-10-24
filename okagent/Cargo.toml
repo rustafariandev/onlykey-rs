@@ -22,9 +22,7 @@ dsa = ["ssh-agent-kit/dsa"]
 [dependencies]
 onlykey-agent = { path = "..", version = "2.0.0", features = ["serde"] }
 # The agent protocol and server; this crate adds the OnlyKey and FIDO backends.
-# Until it is on crates.io, build against a local checkout with a git-ignored
-# `.cargo/config.toml`; see "Development" in the README.
-ssh-agent-kit = "1.0.0"
+ssh-agent-kit = "1.1.0"
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
 ssh-encoding = "0.2"
 sha2 = "0.10"
@@ -35,16 +33,22 @@ clap_complete = "4.5"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 signal-hook = "0.3"
-nix = { version = "0.30", features = ["process", "fs", "user"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 tempfile = "3"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["process", "fs", "user"] }
+
+# Process creation flags and handle inheritance for `serve --daemon`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 onlykey-agent = { path = "..", version = "2.0.0", features = ["serde", "test-util"] }
-ssh-agent-kit = { version = "1.0.0", features = ["test-util"] }
+ssh-agent-kit = { version = "1.1.0", features = ["test-util"] }
 tempfile = "3"
 rsa = "0.9"
 signature = "2"

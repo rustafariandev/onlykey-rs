@@ -725,6 +725,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
  "zeroize",
 ]
 
@@ -767,6 +768,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "windows-sys",
  "zeroize",
 ]
 
@@ -1160,9 +1162,8 @@ dependencies = [
 
 [[package]]
 name = "ssh-agent-kit"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093c7c9c4fbe12720aea2446bb78d74794d80b0e6ea547baaedcf9739216d9be"
+version = "1.1.0"
+source = "git+https://github.com/rustafariandev/ssh-agent-kit#99d4f6135c6e561de2823350d15375013fe92e99"
 dependencies = [
  "arc-swap",
  "nix",
@@ -1174,6 +1175,7 @@ dependencies = [
  "ssh-key",
  "thiserror",
  "tracing",
+ "windows-sys",
  "zeroize",
 ]
 

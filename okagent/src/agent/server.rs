@@ -166,7 +166,8 @@ impl Handler for Agent {
 
 /// Where the agent listens by default: `$XDG_RUNTIME_DIR/okagent/agent.sock`,
 /// else `$TMPDIR/okagent/agent.sock` on macOS, else
-/// `/tmp/okagent-<uid>/agent.sock`.
+/// `/tmp/okagent-<uid>/agent.sock`; on Windows the named pipe
+/// `\\.\pipe\okagent-<user>`.
 pub fn default_socket_path() -> PathBuf {
     ssh_agent_kit::default_socket_path("okagent")
 }

@@ -27,7 +27,10 @@ pub const FIDO_USAGE: u16 = 0x01;
 #[cfg(target_os = "linux")]
 const PERMISSION_HINT: &str =
     "install the OnlyKey udev rule (49-onlykey.rules) and replug the device";
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+const PERMISSION_HINT: &str = "check that no other program has it open; \
+    Windows lets only an elevated (administrator) process open a FIDO security key directly";
+#[cfg(not(any(target_os = "linux", windows)))]
 const PERMISSION_HINT: &str = "check that no other program has the OnlyKey open";
 
 #[derive(Debug, Error)]
@@ -276,6 +279,11 @@ impl HidapiTransport {
             {
                 return Err(TransportError::PermissionDenied { path });
             }
+            // hidapi reports Windows errors as text: "CreateFile: (0x00000005) Access is denied."
+            #[cfg(windows)]
+            Err(HidError::HidApiError { message }) if message.contains("(0x00000005)") => {
+                return Err(TransportError::PermissionDenied { path });
+            }
             Err(e) => return Err(e.into()),
         };
         device.set_blocking_mode(true)?;
@@ -294,9 +302,14 @@ impl HidTransport for HidapiTransport {
     }
 
     fn write_report(&mut self, report: &Report) -> Result<(), TransportError> {
-        let written = self.device.write(report)?;
-        if written != REPORT_SIZE {
-            return Err(TransportError::ShortWrite(written));
+        // hidapi takes the first byte as the report ID. The device numbers
+        // none of its reports, so it is 0: Linux and macOS drop it before
+        // sending, and Windows needs it there.
+        let mut buf = [0u8; REPORT_SIZE + 1];
+        buf[1..].copy_from_slice(report);
+        let written = self.device.write(&buf)?;
+        if written != buf.len() {
+            return Err(TransportError::ShortWrite(written.saturating_sub(1)));
         }
         Ok(())
     }

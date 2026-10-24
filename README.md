@@ -17,7 +17,8 @@ Two crates:
 - **`okagent`**: a command-line SSH agent.
 - **`onlykey-agent`**: the library underneath it.
 
-Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macOS.
+Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux, macOS
+and Windows.
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
 (stored only). A plain ed25519, RSA or ECDSA (nistp256/384/521) private key
 (and DSA, with the `dsa` build feature) can also be loaded into a running agent with `ssh-add FILE` and signed in
@@ -39,6 +40,10 @@ pure-Rust CTAP2 client, with no C library involved.
   user use the token.
 - macOS: the Xcode Command Line Tools (`xcode-select --install`), which
   build hidapi's IOKit backend. No driver or permission setup is needed.
+- Windows: the MSVC build tools (Visual Studio's "Desktop development with
+  C++"), which build hidapi's Win32 backend, and Windows' own OpenSSH Client
+  (Settings → System → Optional features). No driver is needed. See
+  [Windows](#windows) for how the agent is reached there.
 
 ```sh
 cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
@@ -368,6 +373,43 @@ Then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.okagent.plis
 and `export SSH_AUTH_SOCK="$HOME/.okagent/agent.sock"`. The notifier is
 `brew install terminal-notifier`; the prompt is appended as the message.
 
+### Windows
+
+The agent listens on a named pipe, `\\.\pipe\okagent-USER` by default, which
+Windows' OpenSSH finds through `SSH_AUTH_SOCK` like a socket. In PowerShell:
+
+```powershell
+okagent serve --daemon | Invoke-Expression   # sets $env:SSH_AUTH_SOCK and $env:SSH_AGENT_PID
+ssh-add -L
+Stop-Process -Id $env:SSH_AGENT_PID          # stop it again
+```
+
+Without `--daemon` it serves in the foreground and prints the same two lines.
+To have every new shell use it, set `SSH_AUTH_SOCK` for your user once:
+`[Environment]::SetEnvironmentVariable('SSH_AUTH_SOCK', '\\.\pipe\okagent-USER', 'User')`,
+with your user name in place of `USER`. A shortcut in `shell:startup` running
+`okagent.exe serve --daemon` starts the agent at logon.
+
+- **Pageant.** `okagent serve --pageant` (or `pageant = true` in the config)
+  also answers PuTTY, WinSCP, and other tools that talk to Pageant, on both
+  Pageant's pipe and its window. Either is skipped, with a warning, when a
+  real Pageant is already running.
+- **Git.** Git for Windows bundles its own `ssh`, which cannot reach a named
+  pipe. Point Git at Windows' OpenSSH instead:
+  `git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe`.
+- **Windows' ssh-agent service.** It is separate from okagent. If it is
+  running, its keys are not okagent's; it can stay stopped
+  (`Get-Service ssh-agent`).
+- **Prompts.** The challenge digits and `ssh-add -c` confirmations appear in
+  the console the agent was started from. A `--daemon` agent has no console,
+  so use `--notify-command`, or an askpass program for security-key PINs.
+- **FIDO security keys (`sk-` keys).** Windows lets only an elevated
+  (administrator) process open a FIDO authenticator directly; everyone else
+  must go through Windows Hello. okagent talks to the authenticator directly,
+  so `sk-` keys need an elevated agent on Windows. OnlyKey keys, derived or
+  stored, need nothing special.
+- **Config.** The config file is `%APPDATA%\okagent\config.toml`.
+
 ## The onlykey-agent library
 
 ```toml
@@ -530,9 +572,11 @@ Differences from the Python agent:
 
 ## Development
 
-The agent is built on [ssh-agent-kit](https://github.com/rustafariandev/ssh-agent-kit),
-which is not on crates.io yet. Check it out next to this repository and point
-Cargo at it with a `.cargo/config.toml` (git-ignored):
+The agent is built on [ssh-agent-kit](https://github.com/rustafariandev/ssh-agent-kit).
+Its Windows support (1.1.0) is not on crates.io yet, so `Cargo.toml` builds it
+from git through `[patch.crates-io]` until it is. To work on both at once,
+check it out next to this repository and point Cargo at it with a
+`.cargo/config.toml` (git-ignored):
 
 ```sh
 git clone https://github.com/rustafariandev/ssh-agent-kit ../ssh-agent-kit

@@ -5,9 +5,10 @@
 //! forwarding), so the prompt is abstracted behind [`ChallengeSink`], and
 //! PIN entry behind [`PinPrompt`].
 
+mod tty;
+
 use crate::identity::KeySource;
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -161,7 +162,7 @@ impl AskpassPin {
 
 impl PinPrompt for AskpassPin {
     fn available(&self) -> bool {
-        is_executable(&self.program)
+        tty::is_executable(&self.program)
     }
 
     fn pin(&self, request: &PinRequest) -> PinAnswer {
@@ -191,19 +192,6 @@ impl PinPrompt for AskpassPin {
     }
 }
 
-/// Whether `program` names an executable file, directly when it contains a
-/// slash and otherwise through `PATH`, as a shell would find it.
-fn is_executable(program: &str) -> bool {
-    use nix::unistd::{AccessFlags, access};
-    use std::path::Path;
-    let runnable = |path: &Path| path.is_file() && access(path, AccessFlags::X_OK).is_ok();
-    if program.contains('/') {
-        return runnable(Path::new(program));
-    }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| runnable(&dir.join(program))))
-}
-
 /// The PIN in one line of input, without its line ending; empty means
 /// cancelled.
 fn answer(line: &str) -> PinAnswer {
@@ -219,61 +207,23 @@ fn answer(line: &str) -> PinAnswer {
 #[derive(Debug, Default)]
 pub struct TtyPin;
 
-/// The controlling terminal, opened for reading and writing, while this
-/// process is in its foreground process group. A background agent
-/// (`okagent serve &`, or one under `okagent shell`) shares the terminal with
-/// the user's shell: reading it would stop the agent with SIGTTIN, or take a
-/// line the user typed for another program as the answer.
-fn foreground_tty() -> Option<std::fs::File> {
-    let tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
-    let foreground = nix::unistd::tcgetpgrp(&tty).ok()?;
-    (foreground == nix::unistd::getpgrp()).then_some(tty)
-}
-
 impl PinPrompt for TtyPin {
     fn available(&self) -> bool {
-        foreground_tty().is_some()
+        tty::foreground().is_some()
     }
 
     fn pin(&self, request: &PinRequest) -> PinAnswer {
-        use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-
-        let Some(mut tty) = foreground_tty() else {
+        let Some(tty) = tty::foreground() else {
             return PinAnswer::Unavailable;
         };
-        let Ok(saved) = tcgetattr(&tty) else {
+        // Puts the terminal back however the read ends.
+        let Some(_echo_off) = tty.echo_off() else {
             return PinAnswer::Unavailable;
         };
-        let mut quiet = saved.clone();
-        quiet.local_flags.remove(LocalFlags::ECHO);
-        // Still echo the newline, so the next output starts on its own line.
-        quiet.local_flags.insert(LocalFlags::ECHONL);
-        if tcsetattr(&tty, SetArg::TCSAFLUSH, &quiet).is_err() {
+        if write!(&tty.output, "{} ", request.message()).is_err() {
             return PinAnswer::Unavailable;
         }
-        /// Puts the terminal back however the read ends.
-        struct Restore<'a>(&'a std::fs::File, nix::sys::termios::Termios);
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                let _ = tcsetattr(self.0, SetArg::TCSAFLUSH, &self.1);
-            }
-        }
-        let reader = match tty.try_clone() {
-            Ok(reader) => reader,
-            Err(_) => {
-                let _ = tcsetattr(&tty, SetArg::TCSAFLUSH, &saved);
-                return PinAnswer::Unavailable;
-            }
-        };
-        let _restore = Restore(&reader, saved);
-        if write!(tty, "{} ", request.message()).is_err() {
-            return PinAnswer::Unavailable;
-        }
-        match read_secret_line(&reader) {
+        match read_secret_line(&tty.input) {
             // End of input (Ctrl-D) cancels.
             Ok(None) => PinAnswer::Cancelled,
             Ok(Some(line)) => answer(&line),
@@ -417,17 +367,13 @@ impl ChallengeSink for TtyPrompt {
     }
 
     fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
-        use nix::sys::termios::{FlushArg, tcflush};
-
-        let mut tty = foreground_tty()?;
-        let reader = tty.try_clone().ok()?;
-        // Drop typeahead, so only an answer typed after the prompt counts.
-        tcflush(&tty, FlushArg::TCIFLUSH).ok()?;
-        if write!(tty, "{} ", request.message()).is_err() {
+        let tty = tty::foreground()?;
+        tty.discard_input()?;
+        if write!(&tty.output, "{} ", request.message()).is_err() {
             return None;
         }
         let mut line = String::new();
-        match BufReader::new(&reader).read_line(&mut line) {
+        match BufReader::new(&tty.input).read_line(&mut line) {
             Ok(0) | Err(_) => None,
             Ok(_) => Some(matches!(
                 line.trim().to_ascii_lowercase().as_str(),
@@ -479,11 +425,7 @@ impl ChallengeSink for AskpassConfirm {
 /// Write one line to the controlling terminal, or stderr if there is none.
 fn write_tty(message: &str) {
     let line = format!("{message}\n");
-    let written = OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .and_then(|mut tty| tty.write_all(line.as_bytes()));
-    if written.is_err() {
+    if tty::write_line(&line).is_err() {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
 }
@@ -712,6 +654,7 @@ mod tests {
     }
 
     /// A small askpass script, as `SSH_ASKPASS` would name.
+    #[cfg(unix)]
     fn askpass(dir: &std::path::Path, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("askpass");
@@ -720,6 +663,50 @@ mod tests {
         path.to_str().unwrap().to_owned()
     }
 
+    /// A small askpass batch file, as `SSH_ASKPASS` would name.
+    #[cfg(windows)]
+    fn askpass(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("askpass.cmd");
+        std::fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn askpass_batch_files_answer_and_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = askpass(dir.path(), "echo %~1| findstr /c:ferris >nul && echo 1234");
+        match AskpassPin::new(&program).pin(&request()) {
+            PinAnswer::Pin(pin) => assert_eq!(pin.as_str(), "1234"),
+            other => panic!("unexpected answer {other:?}"),
+        }
+        assert!(AskpassPin::new(&program).available());
+        // Found through PATHEXT without its extension, and through PATH.
+        assert!(AskpassPin::new(program.trim_end_matches(".cmd")).available());
+        assert!(AskpassPin::new("cmd").available());
+        assert!(!AskpassPin::new("okagent-no-such-askpass").available());
+        assert!(!AskpassPin::new(dir.path().to_str().unwrap()).available());
+        let program = askpass(dir.path(), "exit /b 1");
+        assert!(matches!(
+            AskpassPin::new(program).pin(&request()),
+            PinAnswer::Cancelled
+        ));
+
+        let yes = askpass(
+            dir.path(),
+            r#"if "%SSH_ASKPASS_PROMPT%"=="confirm" echo yes"#,
+        );
+        assert_eq!(
+            AskpassConfirm::new(yes).confirm(&confirm_request()),
+            Some(true)
+        );
+        assert_eq!(
+            AskpassConfirm::new(askpass(dir.path(), "echo no")).confirm(&confirm_request()),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn askpass_reads_the_pin_and_treats_failure_as_cancel() {
         let dir = tempfile::tempdir().unwrap();
@@ -747,6 +734,7 @@ mod tests {
         assert!(matches!(missing.pin(&request()), PinAnswer::Unavailable));
     }
 
+    #[cfg(unix)]
     #[test]
     fn askpass_is_available_only_when_executable() {
         let dir = tempfile::tempdir().unwrap();
@@ -767,6 +755,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn askpass_confirms_on_yes_and_reads_the_prompt() {
         let dir = tempfile::tempdir().unwrap();

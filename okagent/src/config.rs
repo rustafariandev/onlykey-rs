@@ -1,4 +1,5 @@
-//! Optional TOML configuration: `$XDG_CONFIG_HOME/okagent/config.toml`.
+//! Optional TOML configuration: `$XDG_CONFIG_HOME/okagent/config.toml`, or
+//! `%APPDATA%\okagent\config.toml` on Windows.
 //!
 //! ```toml
 //! curve = "ed25519"            # default curve for identities below and on the command line
@@ -9,6 +10,7 @@
 //! askpass = "/usr/libexec/openssh/ssh-askpass"  # asks for security key PINs
 //! pin-cache = 300              # seconds to reuse a security key's PIN; 0 = ask every time
 //! key-lifetime = 600           # default lifetime of keys added later; 0 = until removed
+//! pageant = true               # Windows: `serve` also answers PuTTY and other Pageant clients
 //!
 //! [[identity]]
 //! name = "ferris@example.com"
@@ -50,6 +52,9 @@ pub struct Config {
     /// Default lifetime in seconds for keys added later without their own
     /// `ssh-add -t`; 0 keeps them until removed.
     pub key_lifetime: Option<u32>,
+    /// Whether `serve` also answers Pageant clients; Windows only, ignored
+    /// elsewhere.
+    pub pageant: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +151,7 @@ impl Config {
 }
 
 /// `$XDG_CONFIG_HOME/okagent/config.toml`, falling back to `~/.config`.
+#[cfg(unix)]
 pub fn default_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -154,9 +160,17 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("okagent").join("config.toml"))
 }
 
+/// `%APPDATA%\okagent\config.toml`.
+#[cfg(windows)]
+pub fn default_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA").filter(|dir| !dir.is_empty())?;
+    Some(PathBuf::from(base).join("okagent").join("config.toml"))
+}
+
 /// As ssh checks its config: the file must belong to this user or root and
 /// not be writable by anyone else, since `askpass` and `notify-command` name
 /// programs okagent runs.
+#[cfg(unix)]
 fn check_owner(meta: &std::fs::Metadata) -> Result<(), &'static str> {
     use std::os::unix::fs::MetadataExt;
 
@@ -167,6 +181,13 @@ fn check_owner(meta: &std::fs::Metadata) -> Result<(), &'static str> {
     if meta.mode() & 0o022 != 0 {
         return Err("other users can write to it");
     }
+    Ok(())
+}
+
+/// Not checked on Windows: a file under `%APPDATA%` inherits an access list
+/// that admits only the user, the administrators and the system.
+#[cfg(windows)]
+fn check_owner(_meta: &std::fs::Metadata) -> Result<(), &'static str> {
     Ok(())
 }
 
@@ -258,6 +279,7 @@ mod tests {
     }
 
     /// A config other users could change is refused, as ssh refuses its own.
+    #[cfg(unix)]
     #[test]
     fn a_config_others_can_write_is_refused() {
         use std::os::unix::fs::PermissionsExt;

@@ -1,8 +1,10 @@
-//! Drives the agent over its unix socket with real OpenSSH tools.
+//! Drives the agent over its unix socket (a named pipe on Windows) with real
+//! OpenSSH tools.
 
 mod common;
 
 use common::SigningFake;
+use okagent::agent::client::{self, ClientStream};
 use okagent::agent::wire;
 use okagent::agent::{self, Agent, Extension, ExtensionContext, ExtensionReply, Opener};
 use onlykey_agent::challenge::RecordingSink;
@@ -10,8 +12,7 @@ use onlykey_agent::identity::{Curve, EccSlot, KeySource, KeySpec, RsaSlot, Slot}
 use ssh_encoding::Decode;
 use ssh_encoding::Encode;
 use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +37,7 @@ impl Harness {
     /// extensions or otherwise tweak it before the socket opens.
     fn serve(agent: Agent, sink: Arc<RecordingSink>) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("agent.sock");
+        let socket = socket_in(dir.path());
         let agent = Arc::new(agent);
         let (listener, guard) = agent::bind_socket(&socket).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -57,7 +58,7 @@ impl Harness {
     }
 
     fn cmd(&self, program: &str) -> Command {
-        let mut c = Command::new(program);
+        let mut c = Command::new(tool(program));
         c.env("SSH_AUTH_SOCK", &self.socket);
         c
     }
@@ -116,18 +117,70 @@ fn stored_entries() -> Vec<KeySpec> {
     ]
 }
 
+/// Where a test agent listens: `agent.sock` in `dir`, or on Windows a pipe
+/// name no other test uses.
+fn socket_in(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::AtomicUsize;
+        let _ = dir;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        PathBuf::from(format!(
+            r"\\.\pipe\okagent-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+    #[cfg(unix)]
+    dir.join("agent.sock")
+}
+
+/// The OpenSSH tool `name`. On Windows, Win32-OpenSSH's (from
+/// `$OKAGENT_OPENSSH`, else where Windows installs it), not whatever comes
+/// first on `PATH`: the `ssh-add` Git for Windows bundles cannot reach an
+/// agent on a named pipe.
+fn tool(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let dir = std::env::var_os("OKAGENT_OPENSSH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+                Path::new(&root).join(r"System32\OpenSSH")
+            });
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.exists() {
+            return exe;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// An askpass program in `dir` that answers `passphrase`: a shell script, or
+/// on Windows a batch file.
+fn askpass_program(dir: &Path, passphrase: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let script = dir.join("askpass.cmd");
+        // `echo.` prints an empty line, where a bare `echo` reports its state.
+        std::fs::write(&script, format!("@echo.{passphrase}\r\n")).unwrap();
+        script
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("askpass.sh");
+        std::fs::write(&script, format!("#!/bin/sh\necho '{passphrase}'\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+}
+
 /// Run `ssh-add` with `passphrase` supplied through SSH_ASKPASS.
 fn ssh_add_with_passphrase(h: &Harness, dir: &Path, flag: &str, passphrase: &str) -> bool {
-    let askpass = dir.join("askpass.sh");
-    std::fs::write(&askpass, format!("#!/bin/sh\necho '{passphrase}'\n")).unwrap();
-    std::fs::set_permissions(
-        &askpass,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .unwrap();
     h.cmd("ssh-add")
         .arg(flag)
-        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS", askpass_program(dir, passphrase))
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env("DISPLAY", ":0")
         .stdin(Stdio::null())
@@ -174,16 +227,9 @@ fn ssh_add_card(h: &Harness, dir: &Path, flag: &str, provider: &str) -> bool {
 
 /// Run `ssh-add` with `args`, answering any prompt with an empty passphrase.
 fn ssh_add_card_args(h: &Harness, dir: &Path, args: &[&str]) -> bool {
-    let askpass = dir.join("askpass.sh");
-    std::fs::write(&askpass, "#!/bin/sh\necho\n").unwrap();
-    std::fs::set_permissions(
-        &askpass,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .unwrap();
     h.cmd("ssh-add")
         .args(args)
-        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS", askpass_program(dir, ""))
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env("DISPLAY", ":0")
         .stdin(Stdio::null())
@@ -265,7 +311,7 @@ fn ssh_add_loads_a_regular_ed25519_key() {
     let h = Harness::start(entries());
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("id_ed25519");
-    let generated = Command::new("ssh-keygen")
+    let generated = Command::new(tool("ssh-keygen"))
         .args(["-t", "ed25519", "-N", "", "-C", "regular@example.com", "-f"])
         .arg(&key_path)
         .stdout(Stdio::null())
@@ -312,11 +358,12 @@ fn ssh_add_smartcard_honours_a_lifetime() {
         return;
     }
     let h = Harness::start(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
     // The constrained request (ssh-add -t) is accepted and the key is served.
     assert!(
         h.cmd("ssh-add")
             .args(["-t", "60", "-s", "ferris@example.com"])
-            .env("SSH_ASKPASS", "/bin/true")
+            .env("SSH_ASKPASS", askpass_program(dir.path(), ""))
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")
             .stdin(Stdio::null())
@@ -329,8 +376,8 @@ fn ssh_add_smartcard_honours_a_lifetime() {
     assert_eq!(listed_keys(&h), 1);
 }
 
-fn have(tool: &str) -> bool {
-    Command::new(tool)
+fn have(name: &str) -> bool {
+    Command::new(tool(name))
         .arg("-V")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -378,7 +425,7 @@ fn sign_and_check(h: &Harness, dir: &Path, pub_line: &str, name: &str) {
     let sig_path = dir.join(format!("{name}.msg.sig"));
     assert!(sig_path.exists());
 
-    let mut check = Command::new("ssh-keygen")
+    let mut check = Command::new(tool("ssh-keygen"))
         .args(["-Y", "check-novalidate", "-n", "okagent-test", "-f"])
         .arg(&pub_path)
         .arg("-s")
@@ -518,7 +565,7 @@ fn rsa_key_refuses_sha1_signature_requests() {
 }
 
 fn roundtrip(socket: &Path, body: &[u8]) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket).unwrap();
+    let mut stream = client::connect(socket).unwrap();
     wire::write_frame(&mut stream, body).unwrap();
     wire::read_frame(&mut stream).unwrap().unwrap()
 }
@@ -566,14 +613,14 @@ fn registered_extension_answers_over_the_socket() {
 fn certify(dir: &Path, pub_path: &Path) -> String {
     let ca = dir.join("ca");
     if !ca.exists() {
-        let made = Command::new("ssh-keygen")
+        let made = Command::new(tool("ssh-keygen"))
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "ca", "-f"])
             .arg(&ca)
             .status()
             .unwrap();
         assert!(made.success(), "ssh-keygen (CA) failed");
     }
-    let signed = Command::new("ssh-keygen")
+    let signed = Command::new(tool("ssh-keygen"))
         .args(["-q", "-s"])
         .arg(&ca)
         .args(["-I", "okagent-test", "-n", "ferris", "-V", "-5m:+1h"])
@@ -587,6 +634,14 @@ fn certify(dir: &Path, pub_path: &Path) -> String {
         .unwrap()
         .trim()
         .to_owned()
+}
+
+/// Whether this ssh-add knows `option`; it connects to the agent before it
+/// reads its options, so it asks `h`.
+fn ssh_add_has_option(h: &Harness, option: &str) -> bool {
+    let out = h.cmd("ssh-add").args([option, "-l"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    !(stderr.contains("unknown option") || stderr.contains("illegal option"))
 }
 
 fn listing(h: &Harness) -> Vec<String> {
@@ -608,6 +663,12 @@ fn token_keys_serve_certificates() {
         return;
     }
     let h = Harness::start(Vec::new());
+    // Certificates for `-s` keys came with `-C`; the ssh-add Windows ships
+    // (OpenSSH 9.5) has neither.
+    if !ssh_add_has_option(&h, "-C") {
+        eprintln!("ssh-add cannot attach certificates to -s keys; skipping");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     assert!(ssh_add_card(&h, dir.path(), "-s", "ferris@example.com"));
     let key_line = listing(&h).pop().unwrap();
@@ -703,7 +764,7 @@ fn confirm_constrained_key_asks_before_each_signature() {
 
 /// A connection bound with `session-bind@openssh.com` for forwarding, as the
 /// agent connection `ssh -A` relays from a remote host looks.
-fn forwarded_connection(h: &Harness) -> UnixStream {
+fn forwarded_connection(h: &Harness) -> ClientStream {
     use signature::Signer;
 
     let host = ssh_key::private::PrivateKey::new(
@@ -718,14 +779,14 @@ fn forwarded_connection(h: &Harness) -> UnixStream {
     let mut signature_bytes = Vec::new();
     signature.encode(&mut signature_bytes).unwrap();
 
-    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let mut stream = client::connect(&h.socket).unwrap();
     let bind = session_bind_body(host.public_key(), session_id, &signature_bytes, true);
     assert_eq!(exchange(&mut stream, &bind), vec![wire::SSH_AGENT_SUCCESS]);
     stream
 }
 
 /// Send one request on an open connection and read its reply.
-fn exchange(stream: &mut UnixStream, body: &[u8]) -> Vec<u8> {
+fn exchange(stream: &mut ClientStream, body: &[u8]) -> Vec<u8> {
     wire::write_frame(stream, body).unwrap();
     wire::read_frame(stream).unwrap().unwrap()
 }
@@ -800,7 +861,7 @@ fn certificate_keeps_its_constraints_when_its_key_is_removed() {
     let h = Harness::start(Vec::new());
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("id_ed25519");
-    let made = Command::new("ssh-keygen")
+    let made = Command::new(tool("ssh-keygen"))
         .args(["-q", "-t", "ed25519", "-N", "", "-C", "cert@example.com"])
         .arg("-f")
         .arg(&key_path)

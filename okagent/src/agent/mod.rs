@@ -54,6 +54,8 @@ pub use ssh_agent_kit::{
 pub use ssh_agent_kit::{
     EcdsaLocalKey, Ed25519LocalKey, LocalKey, LocalKeyError, LocalKeyRef, RsaLocalKey,
 };
+#[cfg(windows)]
+pub use ssh_agent_kit::{pageant_pipe_name, serve_pageant_window};
 
 use std::sync::{Mutex, MutexGuard};
 
