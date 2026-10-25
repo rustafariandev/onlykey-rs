@@ -926,6 +926,13 @@ fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
     if args.daemon {
         #[cfg(unix)]
         daemonize(&path)?;
+        // As daemonize does on Unix: Windows locks a process's working
+        // directory, which would keep the folder serve was started in from
+        // being deleted, or its drive from being ejected.
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let _ = std::env::set_current_dir(root);
+        }
     } else {
         eprint!("{}", serve_env_snippet(&path, std::process::id()));
     }
