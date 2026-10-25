@@ -804,12 +804,7 @@ fn add_identity(socket: &Path, body: &[u8]) -> Result<(), client::ClientError> {
 fn add_identity(socket: &Path, body: &[u8]) -> Result<(), client::ClientError> {
     use client::ClientError;
     use okagent::agent::wire;
-    const PIPE_PREFIX: &str = r"\\.\pipe\";
-    let is_pipe = socket
-        .to_str()
-        .and_then(|s| s.get(..PIPE_PREFIX.len()))
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PIPE_PREFIX));
-    if is_pipe {
+    if is_pipe_name(socket) {
         return client::add_identity(socket, body);
     }
     let mut stream = agent::connect_cygwin(socket).map_err(|source| ClientError::Connect {
@@ -1008,25 +1003,48 @@ fn bind_cygwin(pipe: &Path) -> Result<Option<(agent::CygwinListener, agent::Sock
     }
 }
 
-/// Whether okagent was started from an MSYS2 shell, such as Git Bash, whose
-/// `ssh` reaches the agent only through a Cygwin-style socket. `MSYSTEM`
-/// says so, except that cmd and PowerShell started from Git Bash inherit
-/// it too, so it does not count when one of those started okagent.
+/// Whether `path` is a pipe name, `\\.\pipe\NAME`.
 #[cfg(windows)]
-fn msys_shell() -> bool {
-    std::env::var_os("MSYSTEM").is_some_and(|s| !s.is_empty())
-        && !launcher().is_some_and(|exe| {
-            ["cmd.exe", "powershell.exe", "pwsh.exe"]
-                .iter()
-                .any(|shell| exe.eq_ignore_ascii_case(shell))
-        })
+fn is_pipe_name(path: &Path) -> bool {
+    const PIPE_PREFIX: &str = r"\\.\pipe\";
+    path.to_str()
+        .and_then(|s| s.get(..PIPE_PREFIX.len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PIPE_PREFIX))
+        && path.as_os_str().len() > PIPE_PREFIX.len()
 }
 
-/// The file name of the program that started okagent, looking past
-/// okagent itself, as the background copy of `serve --daemon` was started
-/// by another. `None` if it cannot be told.
+/// The shells of MSYS2 and Git Bash, whose `ssh` is a Cygwin program.
 #[cfg(windows)]
-fn launcher() -> Option<String> {
+const MSYS_SHELLS: [&str; 6] = [
+    "bash.exe", "sh.exe", "dash.exe", "zsh.exe", "fish.exe", "mksh.exe",
+];
+
+/// Windows' own shells, whose `ssh` is Windows' OpenSSH.
+#[cfg(windows)]
+const WINDOWS_SHELLS: [&str; 3] = ["cmd.exe", "powershell.exe", "pwsh.exe"];
+
+/// Whether okagent was started from an MSYS2 shell, such as Git Bash, whose
+/// `ssh` reaches the agent only through a Cygwin-style socket: `MSYSTEM`
+/// says so, and the nearest shell okagent descends from is an MSYS2 one.
+/// cmd and PowerShell started from Git Bash inherit `MSYSTEM` too, and so
+/// may a program started from Explorer. Worked out once, as it walks every
+/// process on the system.
+#[cfg(windows)]
+fn msys_shell() -> bool {
+    static MSYS_SHELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MSYS_SHELL.get_or_init(|| {
+        std::env::var_os("MSYSTEM").is_some_and(|s| !s.is_empty())
+            && launching_shell()
+                .is_some_and(|exe| MSYS_SHELLS.iter().any(|s| exe.eq_ignore_ascii_case(s)))
+    })
+}
+
+/// The file name of the nearest shell okagent descends from, looking past
+/// other programs in between: okagent itself, as the background copy of
+/// `serve --daemon` was started by another, or one such as cargo or make.
+/// `None` if there is none or it cannot be told.
+#[cfg(windows)]
+fn launching_shell() -> Option<String> {
     use std::collections::HashMap;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -1058,16 +1076,49 @@ fn launcher() -> Option<String> {
     // SAFETY: `snapshot` is open and not used again.
     unsafe { CloseHandle(snapshot) };
 
-    let (mut parent, own) = processes.get(&std::process::id())?.clone();
+    let mut child = std::process::id();
+    let mut child_started = started(child)?;
     // Bounded, in case reused process ids make a loop.
     for _ in 0..processes.len() {
-        let (grandparent, exe) = processes.get(&parent)?;
-        if !exe.eq_ignore_ascii_case(&own) {
+        let (parent, _) = processes.get(&child)?;
+        let (_, exe) = processes.get(parent)?;
+        // A parent that has exited may have left its id to a newer process.
+        let parent_started = started(*parent)?;
+        if parent_started > child_started {
+            return None;
+        }
+        if MSYS_SHELLS
+            .iter()
+            .chain(&WINDOWS_SHELLS)
+            .any(|shell| exe.eq_ignore_ascii_case(shell))
+        {
             return Some(exe.clone());
         }
-        parent = *grandparent;
+        (child, child_started) = (*parent, parent_started);
     }
     None
+}
+
+/// When the process `pid` started, in 100 ns units since 1601.
+#[cfg(windows)]
+fn started(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: no pointers are passed; the result is checked.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut times = [FILETIME::default(); 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: `process` is open with the access GetProcessTimes needs, and
+    // each FILETIME outlives the call.
+    let ok = unsafe { GetProcessTimes(process, created, exited, kernel, user) } != 0;
+    // SAFETY: `process` is open and not used again.
+    unsafe { CloseHandle(process) };
+    ok.then(|| u64::from(times[0].dwHighDateTime) << 32 | u64::from(times[0].dwLowDateTime))
 }
 
 /// The shell `okagent shell` starts: Git Bash's own from there, else
@@ -1173,6 +1224,13 @@ fn respawn_detached(socket: &Path) -> Result<ExitCode> {
     use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
 
+    // Checked here, as the copy reports nothing but its exit code.
+    if !is_pipe_name(socket) {
+        bail!(
+            r"cannot bind {}: not a pipe name (\\.\pipe\NAME)",
+            socket.display()
+        );
+    }
     if client::connect(socket).is_ok() {
         bail!("an agent is already serving {}", socket.display());
     }
@@ -1854,6 +1912,25 @@ mod tests {
         shutdown.store(true, Ordering::SeqCst);
         server.join().unwrap().unwrap();
         drop(guard);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_names_are_told_from_paths() {
+        assert!(is_pipe_name(Path::new(r"\\.\pipe\okagent")));
+        assert!(is_pipe_name(Path::new(r"\\.\PIPE\okagent")));
+        assert!(!is_pipe_name(Path::new(r"\\.\pipe\")));
+        assert!(!is_pipe_name(Path::new("C:/Users/ferris/agent.sock")));
+        assert!(!is_pipe_name(Path::new("/run/user/1000/okagent.sock")));
+    }
+
+    /// `serve --daemon` reports a socket that is not a pipe name itself,
+    /// before starting a copy that could only exit.
+    #[cfg(windows)]
+    #[test]
+    fn daemon_refuses_a_socket_that_is_not_a_pipe() {
+        let error = respawn_detached(Path::new("/run/user/1000/okagent.sock")).unwrap_err();
+        assert!(error.to_string().contains("not a pipe name"), "{error:#}");
     }
 
     /// The background copy of `serve --daemon` is told its pipe however
