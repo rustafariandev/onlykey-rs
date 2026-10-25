@@ -1172,12 +1172,12 @@ also listens on a Cygwin-style socket,
 for the
 .B ssh
 bundled with Git for Windows, MSYS2 and Cygwin, which cannot open a pipe.
-With
+An agent on any other pipe, given with
 .B \-\-socket
 or a configured
 .BR socket ,
-that socket is named after the pipe instead, as in
-.I work.sock
+uses a socket named after the pipe instead, as in
+.I pipe\-work.sock
 for
 .IR \e\e.\epipe\ework .
 When

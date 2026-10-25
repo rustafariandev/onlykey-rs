@@ -187,16 +187,34 @@ pub fn default_cygwin_socket_path() -> PathBuf {
 
 /// The Cygwin-style socket that goes with the named pipe `pipe`: the
 /// default one for the default pipe, else one named after the pipe, such as
-/// `%LOCALAPPDATA%\okagent\work.sock` for `\\.\pipe\work`, so agents on
-/// different pipes do not compete for it.
+/// `%LOCALAPPDATA%\okagent\pipe-work.sock` for `\\.\pipe\work`, so agents
+/// on different pipes do not compete for it.
+///
+/// Pipe names ignore case and may hold `\`, `:` and other characters a file
+/// name cannot, so the whole name after `\\.\pipe\` is lowercased and every
+/// character but a letter, digit, `-` or `_` is written as `%XX` bytes. The
+/// `pipe-` prefix keeps it apart from `agent.sock` and `run-PID.sock`.
 #[cfg(windows)]
 pub fn cygwin_socket_path(pipe: &std::path::Path) -> PathBuf {
-    if pipe == default_socket_path() {
+    if pipe
+        .as_os_str()
+        .eq_ignore_ascii_case(default_socket_path().as_os_str())
+    {
         return default_cygwin_socket_path();
     }
-    let name = pipe.file_name().unwrap_or("agent".as_ref());
-    let mut file = name.to_owned();
-    file.push(".sock");
+    let full = pipe.to_string_lossy().to_lowercase();
+    let name = full.strip_prefix(r"\\.\pipe\").unwrap_or(&full);
+    let mut file = String::from("pipe-");
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            file.push(c);
+        } else {
+            for byte in c.to_string().bytes() {
+                file.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    file.push_str(".sock");
     ssh_agent_kit::server::runtime_dir("okagent").join(file)
 }
 
@@ -269,9 +287,27 @@ mod tests {
             cygwin_socket_path(&default_socket_path()),
             default_cygwin_socket_path()
         );
-        let work = cygwin_socket_path(std::path::Path::new(r"\\.\pipe\work"));
-        assert_eq!(work.file_name().unwrap(), "work.sock");
-        assert_eq!(work.parent(), default_cygwin_socket_path().parent());
+        let default = default_socket_path().to_string_lossy().to_uppercase();
+        assert_eq!(
+            cygwin_socket_path(std::path::Path::new(&default)),
+            default_cygwin_socket_path(),
+            "pipe names ignore case"
+        );
+        let file = |pipe: &str| {
+            let path = cygwin_socket_path(std::path::Path::new(pipe));
+            assert_eq!(path.parent(), default_cygwin_socket_path().parent());
+            path.file_name().unwrap().to_str().unwrap().to_owned()
+        };
+        assert_eq!(file(r"\\.\pipe\work"), "pipe-work.sock");
+        assert_eq!(file(r"\\.\PIPE\Work"), "pipe-work.sock");
+        // Never the default socket or a `run` one.
+        assert_eq!(file(r"\\.\pipe\agent"), "pipe-agent.sock");
+        assert_eq!(file(r"\\.\pipe\run-1234"), "pipe-run-1234.sock");
+        // Every pipe its own file, and a valid one.
+        assert_eq!(file(r"\\.\pipe\x\work"), "pipe-x%5Cwork.sock");
+        assert_eq!(file(r"\\.\pipe\a:b*?"), "pipe-a%3Ab%2A%3F.sock");
+        assert_eq!(file(r"\\.\pipe\.."), "pipe-%2E%2E.sock");
+        assert_eq!(file(r"\\.\pipe\é"), "pipe-%C3%A9.sock");
     }
 
     #[test]
