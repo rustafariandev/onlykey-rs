@@ -792,6 +792,41 @@ fn load_resident(ctx: &Context_, args: &LoadResidentArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Add a key to the agent at `socket`.
+#[cfg(unix)]
+fn add_identity(socket: &Path, body: &[u8]) -> Result<(), client::ClientError> {
+    client::add_identity(socket, body)
+}
+
+/// Add a key to the agent at `socket`: a pipe name, or the Cygwin socket
+/// that `serve`, `run` and `shell` put in Git Bash's `SSH_AUTH_SOCK`.
+#[cfg(windows)]
+fn add_identity(socket: &Path, body: &[u8]) -> Result<(), client::ClientError> {
+    use client::ClientError;
+    use okagent::agent::wire;
+    const PIPE_PREFIX: &str = r"\\.\pipe\";
+    let is_pipe = socket
+        .to_str()
+        .and_then(|s| s.get(..PIPE_PREFIX.len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PIPE_PREFIX));
+    if is_pipe {
+        return client::add_identity(socket, body);
+    }
+    let mut stream = agent::connect_cygwin(socket).map_err(|source| ClientError::Connect {
+        path: socket.to_owned(),
+        source,
+    })?;
+    let mut request = Vec::with_capacity(1 + body.len());
+    request.push(wire::SSH2_AGENTC_ADD_IDENTITY);
+    request.extend_from_slice(body);
+    wire::write_frame(&mut stream, &request)?;
+    match wire::read_frame(&mut stream)?.as_deref() {
+        Some([wire::SSH_AGENT_SUCCESS]) => Ok(()),
+        Some(_) => Err(ClientError::Refused),
+        None => Err(ClientError::Closed),
+    }
+}
+
 /// Add one security key's resident SSH keys to the agent at `socket`;
 /// returns how many.
 fn load_resident_from(
@@ -828,7 +863,7 @@ fn load_resident_from(
         }
         let verify = credman::needs_verification(hid, credential)?;
         let (public, body) = sk::resident_key(credential, verify)?;
-        client::add_identity(socket, &body)?;
+        add_identity(socket, &body)?;
         eprintln!(
             "Resident key added: {} ({} {}{})",
             public.comment(),
@@ -1768,6 +1803,47 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.socket.as_deref(), Some(Path::new("/tmp/a.sock")));
+    }
+
+    /// `load-resident` adds keys over the Cygwin socket that Git Bash's
+    /// `SSH_AUTH_SOCK` names, written with forward slashes.
+    #[cfg(windows)]
+    #[test]
+    fn adds_a_key_over_a_cygwin_socket() {
+        use onlykey_agent::challenge::RecordingSink;
+        use onlykey_agent::ssh_key::private::Ed25519Keypair;
+        use ssh_encoding::Encode;
+
+        let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
+        let agent = Arc::new(Agent::new(
+            Vec::new(),
+            opener,
+            Arc::new(RecordingSink::default()),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let (listener, guard) = agent::bind_cygwin_socket(&socket).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_server(listener, &agent, &shutdown);
+
+        let pair = Ed25519Keypair::from_seed(&[0x5A; 32]);
+        let mut body = Vec::new();
+        "ssh-ed25519".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        "ferris@example.com".encode(&mut body).unwrap();
+        let sock_env = PathBuf::from(msys_path(&socket));
+        add_identity(&sock_env, &body).unwrap();
+        let served = agent.public_keys();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].comment(), "ferris@example.com");
+        assert!(matches!(
+            add_identity(&dir.path().join("missing.sock"), &body),
+            Err(client::ClientError::Connect { .. })
+        ));
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        drop(guard);
     }
 
     /// The background copy of `serve --daemon` is told its pipe however
