@@ -134,9 +134,9 @@ place, with `-Autostart` on by default. It is installed, upgraded and removed
 like any other: double-click it, or
 
 ```powershell
-msiexec /i okagent-2.0.0-x86_64-pc-windows-msvc.msi              # quiet: add /qn
-msiexec /i okagent-2.0.0-x86_64-pc-windows-msvc.msi AUTOSTART=0 AUTHSOCK=0
-msiexec /x okagent-2.0.0-x86_64-pc-windows-msvc.msi
+msiexec /i okagent-2.1.0-x86_64-pc-windows-msvc.msi              # quiet: add /qn
+msiexec /i okagent-2.1.0-x86_64-pc-windows-msvc.msi AUTOSTART=0 AUTHSOCK=0
+msiexec /x okagent-2.1.0-x86_64-pc-windows-msvc.msi
 ```
 
 `AUTOSTART=0` skips the Startup shortcut and starting the agent; `AUTHSOCK=0`
