@@ -33,11 +33,19 @@ const PERMISSION_HINT: &str = "check that no other program has it open; \
 #[cfg(not(any(target_os = "linux", windows)))]
 const PERMISSION_HINT: &str = "check that no other program has the OnlyKey open";
 
+// Windows hides FIDO security keys from unelevated processes, so a missing
+// key there reads as absent rather than as permission denied.
+#[cfg(windows)]
+pub(crate) const NO_FIDO_HINT: &str = "is one plugged in, and is this running as administrator? \
+    Windows shows FIDO security keys only to elevated processes";
+#[cfg(not(windows))]
+pub(crate) const NO_FIDO_HINT: &str = "is one plugged in?";
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("no OnlyKey found; is it plugged in?")]
     NotFound,
-    #[error("no FIDO security key found; is one plugged in?")]
+    #[error("no FIDO security key found; {NO_FIDO_HINT}")]
     NoDevice,
     #[error("permission denied opening {path}; {PERMISSION_HINT}")]
     PermissionDenied { path: String },
