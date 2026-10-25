@@ -194,6 +194,10 @@ pub fn default_cygwin_socket_path() -> PathBuf {
 /// name cannot, so the whole name after `\\.\pipe\` is lowercased and every
 /// character but a letter, digit, `-` or `_` is written as `%XX` bytes. The
 /// `pipe-` prefix keeps it apart from `agent.sock` and `run-PID.sock`.
+///
+/// Cygwin's unix socket paths are limited to 108 bytes, so a name that
+/// would make the path longer is replaced by a hash of it:
+/// `pipe.HASH.sock`, which no escaped name can be, as `.` is escaped.
 #[cfg(windows)]
 pub fn cygwin_socket_path(pipe: &std::path::Path) -> PathBuf {
     if pipe
@@ -215,7 +219,17 @@ pub fn cygwin_socket_path(pipe: &std::path::Path) -> PathBuf {
         }
     }
     file.push_str(".sock");
-    ssh_agent_kit::server::runtime_dir("okagent").join(file)
+    let dir = ssh_agent_kit::server::runtime_dir("okagent");
+    let path = dir.join(file);
+    // Room for the terminating NUL, and for `/cygdrive/c` in place of
+    // `C:`, the longest way a Cygwin program spells the path.
+    if path.as_os_str().len() + "/cygdrive".len() < 108 {
+        return path;
+    }
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(name.as_bytes());
+    let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("pipe.{hex}.sock"))
 }
 
 /// A fresh per-process Cygwin-style socket path for `run`-style
@@ -308,6 +322,13 @@ mod tests {
         assert_eq!(file(r"\\.\pipe\a:b*?"), "pipe-a%3Ab%2A%3F.sock");
         assert_eq!(file(r"\\.\pipe\.."), "pipe-%2E%2E.sock");
         assert_eq!(file(r"\\.\pipe\é"), "pipe-%C3%A9.sock");
+        // A name too long for a Cygwin socket path is hashed.
+        let long = format!(r"\\.\pipe\{}", "x.".repeat(40));
+        let hashed = file(&long);
+        assert!(hashed.starts_with("pipe.") && hashed.ends_with(".sock"));
+        assert_eq!(hashed.len(), "pipe..sock".len() + 16);
+        assert_eq!(file(&long.to_uppercase()), hashed, "pipe names ignore case");
+        assert_ne!(file(&format!("{long}y")), hashed);
     }
 
     #[test]
