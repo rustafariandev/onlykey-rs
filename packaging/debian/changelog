@@ -1,3 +1,9 @@
+okagent (2.1.0-1) unstable; urgency=medium
+
+  * New upstream release v2.1.0.
+
+ -- Rustafarian Dev <rustafarian.dev@gmail.com>  Sat, 24 Oct 2026 22:58:16 -0400
+
 okagent (2.0.0-1) unstable; urgency=medium
 
   * New upstream release v2.0.0.
