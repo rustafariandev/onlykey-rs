@@ -195,7 +195,8 @@ with `okagent load-resident` rather than `ssh-add -K`, which drops the
 verify-required flag so the authenticator hides such a key and it cannot sign.
 With several authenticators attached, okagent
 asks each one silently which holds the credential, so only that one asks
-for a touch. The OnlyKey's own FIDO applet is left out; to sign with it, or
+for a touch. The OnlyKey's own FIDO applet is left out unless no other
+authenticator is attached; to sign with it alongside another, or
 to pin one device, pass `--fido-device /dev/hidrawN` (or set `fido-device`
 in the config):
 

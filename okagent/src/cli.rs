@@ -79,9 +79,9 @@ pub struct KeyArgs {
 #[derive(Debug, Args, Default, Clone)]
 #[command(next_help_heading = "Security key options")]
 pub struct SkArgs {
-    /// FIDO security key to use for `sk-` keys, by hidraw path substring.
+    /// FIDO security key to use for `sk-` keys, by HID path substring.
     /// Defaults to whichever attached authenticator, other than the OnlyKey,
-    /// holds the key.
+    /// holds the key; the OnlyKey's own when it is the only one.
     #[arg(long, value_name = "PATH")]
     pub fido_device: Option<String>,
 

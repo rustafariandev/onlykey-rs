@@ -189,6 +189,12 @@ fn is_fido_candidate(
         }
 }
 
+/// Whether an enumerated HID interface is an OnlyKey's own FIDO interface,
+/// the fallback when no other authenticator is attached.
+fn is_onlykey_fido(usb_id: (u16, u16), (usage_page, usage): (u16, u16)) -> bool {
+    usage_page == FIDO_USAGE_PAGE && usage == FIDO_USAGE && USB_IDS.contains(&usb_id)
+}
+
 /// A real OnlyKey reached through hidapi.
 pub struct HidapiTransport {
     device: HidDevice,
@@ -206,11 +212,13 @@ impl HidapiTransport {
     ///
     /// `device` is an optional path substring to narrow the choice; without
     /// it the caller asks each device which one holds its credential. The
-    /// OnlyKey's own FIDO interface is skipped unless `device` names it, so
-    /// the token that serves the agent's other keys is not picked by accident.
+    /// OnlyKey's own FIDO interface is skipped unless `device` names it or no
+    /// other authenticator is attached, so the token that serves the agent's
+    /// other keys is not picked by accident alongside a separate key.
     /// Interfaces that cannot be opened are skipped with a warning; if none
     /// opens, the first error is returned.
     pub fn open_all_fido(device: Option<&str>) -> Result<Vec<Self>, TransportError> {
+        let named = device.is_some();
         let device = device.map(str::to_owned);
         let filter = move |info: &DeviceInfo| {
             is_fido_candidate(
@@ -221,9 +229,21 @@ impl HidapiTransport {
             )
         };
         let api = Self::refreshed_api()?;
+        let mut candidates = Self::candidates(&api, filter);
+        if candidates.is_empty() && !named {
+            candidates = Self::candidates(&api, |info| {
+                is_onlykey_fido(
+                    (info.vendor_id(), info.product_id()),
+                    (info.usage_page(), info.usage()),
+                )
+            });
+            if !candidates.is_empty() {
+                tracing::debug!("no other FIDO security key attached; using the OnlyKey's own");
+            }
+        }
         let mut opened = Vec::new();
         let mut first_error = None;
-        for info in Self::candidates(&api, filter) {
+        for info in candidates {
             match Self::open_info(&api, info, "FIDO security key") {
                 Ok(transport) => opened.push(transport),
                 Err(e) => {
@@ -444,6 +464,16 @@ mod tests {
         // Other interfaces are never FIDO candidates.
         let keyboard = (0x0001, 0x0006);
         assert!(!is_fido_candidate(yubikey, keyboard, "/dev/hidraw3", None));
+    }
+
+    #[test]
+    fn fido_fallback_takes_only_the_onlykeys_own_interface() {
+        let fido = (FIDO_USAGE_PAGE, FIDO_USAGE);
+        let command = (COMMAND_USAGE_PAGE, 0x01);
+        assert!(is_onlykey_fido(USB_IDS[0], fido));
+        assert!(is_onlykey_fido(USB_IDS[1], fido));
+        assert!(!is_onlykey_fido(USB_IDS[0], command));
+        assert!(!is_onlykey_fido((0x1050, 0x0407), fido));
     }
 
     #[test]
