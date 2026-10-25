@@ -1144,11 +1144,7 @@ fn respawn_detached(socket: &Path) -> Result<ExitCode> {
     }
     let exe = std::env::current_exe().context("finding okagent's own path")?;
     let mut child = Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        // Passed on rather than resolved again, so the copy binds the pipe
-        // this process waits on.
-        .arg("--detached")
-        .arg(socket)
+        .args(detached_args(std::env::args_os().skip(1).collect(), socket))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1171,6 +1167,21 @@ fn respawn_detached(socket: &Path) -> Result<ExitCode> {
     }
     print!("{}", serve_env_snippet(socket, child.id()));
     Ok(ExitCode::SUCCESS)
+}
+
+/// The arguments for the background copy of `serve --daemon`: this
+/// command's own, with `--detached socket` passed on rather than resolved
+/// again, so the copy binds the pipe this process waits on. It goes before
+/// any `--`, after which it would be taken for two identities, and the copy
+/// would start a copy of its own, and so on.
+#[cfg(windows)]
+fn detached_args(mut args: Vec<std::ffi::OsString>, socket: &Path) -> Vec<std::ffi::OsString> {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    args.splice(at..at, ["--detached".into(), socket.into()]);
+    args
 }
 
 /// Fork into the background. The parent prints the shell snippet and exits;
@@ -1753,6 +1764,35 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.socket.as_deref(), Some(Path::new("/tmp/a.sock")));
+    }
+
+    /// The background copy of `serve --daemon` is told its pipe however
+    /// the command was written, so it never starts a copy of its own.
+    #[cfg(windows)]
+    #[test]
+    fn the_detached_copy_is_told_its_pipe() {
+        let pipe = Path::new(r"\\.\pipe\okagent-test");
+        for command in [
+            &["-v", "serve", "--daemon"][..],
+            &["serve", "--daemon", "ferris@example.com"],
+            &["serve", "--daemon", "--", "ferris@example.com", "--"],
+        ] {
+            let args = command.iter().map(Into::into).collect();
+            let args = std::iter::once("okagent".into()).chain(detached_args(args, pipe));
+            let Cmd::Serve(serve) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("unexpected command");
+            };
+            assert_eq!(serve.detached.as_deref(), Some(pipe), "{command:?}");
+            assert!(
+                !serve
+                    .identities
+                    .base
+                    .identity
+                    .iter()
+                    .any(|i| i == "--detached"),
+                "{command:?}"
+            );
+        }
     }
 
     /// Commands take only the options they use.
