@@ -1270,24 +1270,27 @@ fn run(ctx: &Context_, identities: &ExtraIdentityArgs, command: Vec<String>) -> 
     // From Git Bash, the command's ssh is Git's own, which reaches only a
     // Cygwin-style socket.
     #[cfg(windows)]
-    let (guard, server) = if msys_shell() {
+    let cygwin = if msys_shell() {
         let path = agent::ephemeral_cygwin_socket_path();
         let (listener, guard) = agent::bind_cygwin_socket(&path)?;
         child.env("SSH_AUTH_SOCK", msys_path(&path));
-        (guard, spawn_server(listener, &agent, &shutdown))
+        Some((guard, spawn_server(listener, &agent, &shutdown)))
     } else {
-        let (listener, guard) = agent::bind_socket(&agent::ephemeral_socket_path())?;
-        child.env("SSH_AUTH_SOCK", guard.path());
-        if let Some(ssh) = git_ssh() {
-            child.env("GIT_SSH", ssh);
-        }
-        (guard, spawn_server(listener, &agent, &shutdown))
+        None
     };
     #[cfg(unix)]
-    let (guard, server) = {
-        let (listener, guard) = agent::bind_socket(&agent::ephemeral_socket_path())?;
-        child.env("SSH_AUTH_SOCK", guard.path());
-        (guard, spawn_server(listener, &agent, &shutdown))
+    let cygwin = None;
+    let (guard, server) = match cygwin {
+        Some(served) => served,
+        None => {
+            let (listener, guard) = agent::bind_socket(&agent::ephemeral_socket_path())?;
+            child.env("SSH_AUTH_SOCK", guard.path());
+            #[cfg(windows)]
+            if let Some(ssh) = git_ssh() {
+                child.env("GIT_SSH", ssh);
+            }
+            (guard, spawn_server(listener, &agent, &shutdown))
+        }
     };
     let status = child.status().with_context(|| format!("running {program}"));
     shutdown.store(true, Ordering::SeqCst);
