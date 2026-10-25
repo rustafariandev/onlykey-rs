@@ -46,13 +46,29 @@ pub(super) fn foreground() -> Option<Tty> {
     Some(Tty { input, output })
 }
 
-/// The console this process is attached to. Windows has no foreground
-/// process group to check: under `okagent shell` the agent shares the
-/// console with the shell, which is safe while the shell waits on the ssh
-/// that asked but not for one it left running in the background. An agent
-/// started with `serve --daemon` has no console at all, so opening it fails.
+/// Set by [`give_up_console`].
+#[cfg(windows)]
+static CONSOLE_GIVEN_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Never read the console again in this process, for when it is handed to
+/// an interactive shell (`okagent shell`). Windows has no foreground
+/// process group to tell the agent that the shell, or an ssh session it
+/// runs, is reading the console too: a PIN read while ssh is in raw mode
+/// would be split between the agent and the remote host. PINs and
+/// confirmations then go to askpass, as they do under a Unix shell.
+#[cfg(windows)]
+pub fn give_up_console() {
+    CONSOLE_GIVEN_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The console this process is attached to, unless it gave it up with
+/// [`give_up_console`]. An agent started with `serve --daemon` has no
+/// console at all, so opening it fails.
 #[cfg(windows)]
 pub(super) fn foreground() -> Option<Tty> {
+    if CONSOLE_GIVEN_UP.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
     // Write access too: changing the input mode and flushing it need it.
     let input = OpenOptions::new()
         .read(true)

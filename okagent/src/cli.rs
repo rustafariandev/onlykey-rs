@@ -571,6 +571,10 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             #[cfg(windows)]
             let shell = windows_shell();
+            // As a Unix shell takes the terminal's foreground: the agent
+            // must not read the console that the shell and its ssh read.
+            #[cfg(windows)]
+            onlykey_agent::challenge::give_up_console();
             run(&ctx, &args.identities, vec![shell])
         }
         Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),

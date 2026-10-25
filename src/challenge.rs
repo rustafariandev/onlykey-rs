@@ -7,6 +7,9 @@
 
 mod tty;
 
+#[cfg(windows)]
+pub use tty::give_up_console;
+
 use crate::identity::KeySource;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
