@@ -24,7 +24,7 @@ pub mod der;
 pub mod fake;
 pub mod pin;
 
-use crate::transport::TransportError;
+use crate::transport::{NO_FIDO_HINT, TransportError};
 use ctaphid::MAX_MESSAGE;
 use thiserror::Error;
 
@@ -35,7 +35,7 @@ pub use pin::PinProtocol;
 pub enum FidoError {
     #[error(transparent)]
     Transport(#[from] TransportError),
-    #[error("no FIDO security key found; is one plugged in?")]
+    #[error("no FIDO security key found; {NO_FIDO_HINT}")]
     NoDevice,
     #[error("security key HID error {0:#04x}")]
     Hid(u8),

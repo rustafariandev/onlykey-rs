@@ -27,14 +27,25 @@ pub const FIDO_USAGE: u16 = 0x01;
 #[cfg(target_os = "linux")]
 const PERMISSION_HINT: &str =
     "install the OnlyKey udev rule (49-onlykey.rules) and replug the device";
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+const PERMISSION_HINT: &str = "check that no other program has it open; \
+    Windows lets only an elevated (administrator) process open a FIDO security key directly";
+#[cfg(not(any(target_os = "linux", windows)))]
 const PERMISSION_HINT: &str = "check that no other program has the OnlyKey open";
+
+// Windows hides FIDO security keys from unelevated processes, so a missing
+// key there reads as absent rather than as permission denied.
+#[cfg(windows)]
+pub(crate) const NO_FIDO_HINT: &str = "is one plugged in, and is this running as administrator? \
+    Windows shows FIDO security keys only to elevated processes";
+#[cfg(not(windows))]
+pub(crate) const NO_FIDO_HINT: &str = "is one plugged in?";
 
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("no OnlyKey found; is it plugged in?")]
     NotFound,
-    #[error("no FIDO security key found; is one plugged in?")]
+    #[error("no FIDO security key found; {NO_FIDO_HINT}")]
     NoDevice,
     #[error("permission denied opening {path}; {PERMISSION_HINT}")]
     PermissionDenied { path: String },
@@ -186,6 +197,12 @@ fn is_fido_candidate(
         }
 }
 
+/// Whether an enumerated HID interface is an OnlyKey's own FIDO interface,
+/// the fallback when no other authenticator is attached.
+fn is_onlykey_fido(usb_id: (u16, u16), (usage_page, usage): (u16, u16)) -> bool {
+    usage_page == FIDO_USAGE_PAGE && usage == FIDO_USAGE && USB_IDS.contains(&usb_id)
+}
+
 /// A real OnlyKey reached through hidapi.
 pub struct HidapiTransport {
     device: HidDevice,
@@ -203,11 +220,13 @@ impl HidapiTransport {
     ///
     /// `device` is an optional path substring to narrow the choice; without
     /// it the caller asks each device which one holds its credential. The
-    /// OnlyKey's own FIDO interface is skipped unless `device` names it, so
-    /// the token that serves the agent's other keys is not picked by accident.
+    /// OnlyKey's own FIDO interface is skipped unless `device` names it or no
+    /// other authenticator is attached, so the token that serves the agent's
+    /// other keys is not picked by accident alongside a separate key.
     /// Interfaces that cannot be opened are skipped with a warning; if none
     /// opens, the first error is returned.
     pub fn open_all_fido(device: Option<&str>) -> Result<Vec<Self>, TransportError> {
+        let named = device.is_some();
         let device = device.map(str::to_owned);
         let filter = move |info: &DeviceInfo| {
             is_fido_candidate(
@@ -218,9 +237,21 @@ impl HidapiTransport {
             )
         };
         let api = Self::refreshed_api()?;
+        let mut candidates = Self::candidates(&api, filter);
+        if candidates.is_empty() && !named {
+            candidates = Self::candidates(&api, |info| {
+                is_onlykey_fido(
+                    (info.vendor_id(), info.product_id()),
+                    (info.usage_page(), info.usage()),
+                )
+            });
+            if !candidates.is_empty() {
+                tracing::debug!("no other FIDO security key attached; using the OnlyKey's own");
+            }
+        }
         let mut opened = Vec::new();
         let mut first_error = None;
-        for info in Self::candidates(&api, filter) {
+        for info in candidates {
             match Self::open_info(&api, info, "FIDO security key") {
                 Ok(transport) => opened.push(transport),
                 Err(e) => {
@@ -276,6 +307,11 @@ impl HidapiTransport {
             {
                 return Err(TransportError::PermissionDenied { path });
             }
+            // hidapi reports Windows errors as text: "CreateFile: (0x00000005) Access is denied."
+            #[cfg(windows)]
+            Err(HidError::HidApiError { message }) if message.contains("(0x00000005)") => {
+                return Err(TransportError::PermissionDenied { path });
+            }
             Err(e) => return Err(e.into()),
         };
         device.set_blocking_mode(true)?;
@@ -294,9 +330,14 @@ impl HidTransport for HidapiTransport {
     }
 
     fn write_report(&mut self, report: &Report) -> Result<(), TransportError> {
-        let written = self.device.write(report)?;
-        if written != REPORT_SIZE {
-            return Err(TransportError::ShortWrite(written));
+        // hidapi takes the first byte as the report ID. The device numbers
+        // none of its reports, so it is 0: Linux and macOS drop it before
+        // sending, and Windows needs it there.
+        let mut buf = [0u8; REPORT_SIZE + 1];
+        buf[1..].copy_from_slice(report);
+        let written = self.device.write(&buf)?;
+        if written != buf.len() {
+            return Err(TransportError::ShortWrite(written.saturating_sub(1)));
         }
         Ok(())
     }
@@ -431,6 +472,16 @@ mod tests {
         // Other interfaces are never FIDO candidates.
         let keyboard = (0x0001, 0x0006);
         assert!(!is_fido_candidate(yubikey, keyboard, "/dev/hidraw3", None));
+    }
+
+    #[test]
+    fn fido_fallback_takes_only_the_onlykeys_own_interface() {
+        let fido = (FIDO_USAGE_PAGE, FIDO_USAGE);
+        let command = (COMMAND_USAGE_PAGE, 0x01);
+        assert!(is_onlykey_fido(USB_IDS[0], fido));
+        assert!(is_onlykey_fido(USB_IDS[1], fido));
+        assert!(!is_onlykey_fido(USB_IDS[0], command));
+        assert!(!is_onlykey_fido((0x1050, 0x0407), fido));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 VERSION := $(shell cargo metadata --no-deps --format-version 1 | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)
 
-.PHONY: help build test lint fmt package package-deb package-rpm package-arch package-universal package-all clean release
+.PHONY: help build test lint fmt package package-deb package-rpm package-arch package-universal package-windows package-all clean release
 
 help:
 	@echo "make build            cargo build --release"
@@ -11,7 +11,8 @@ help:
 	@echo "make package-deb      Debian 12 + Ubuntu 22.04 .deb (podman)"
 	@echo "make package-rpm      Rocky 8 .rpm (podman)"
 	@echo "make package-arch     Arch .pkg.tar.zst (podman)"
-	@echo "make package-all      all of the above"
+	@echo "make package-windows  Windows .zip and .msi (on Windows, needs WiX 5)"
+	@echo "make package-all      all of the Linux packages"
 	@echo "make release VERSION=x.y.z  bump version, tag and push"
 
 build:
@@ -35,6 +36,9 @@ package-rpm:
 
 package-arch:
 	bash packaging/build-packages.sh arch
+
+package-windows:
+	powershell -NoProfile -ExecutionPolicy Bypass -File packaging/windows/build.ps1 -Msi
 
 package-all:
 	bash packaging/build-packages.sh all

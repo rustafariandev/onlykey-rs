@@ -91,6 +91,7 @@ okagent \- SSH agent backed by an OnlyKey hardware token
 .RB [ \-\-socket
 .IR path ]
 .RB [ \-\-daemon ]
+.RB [ \-\-pageant ]
 .RB [ \-\-pubkey\-file
 .IR file ]
 .RB [ \-i
@@ -323,7 +324,8 @@ Add the SSH keys stored on FIDO security keys (resident keys, made with
 to the agent, as
 .B ssh-add \-K
 does, but keeping whether each needs the authenticator's PIN.
-Every attached security key other than the OnlyKey is read, or only the one
+Every attached security key other than the OnlyKey is read (the OnlyKey's own
+FIDO interface when no other is attached), or only the one
 .B \-\-fido\-device
 names; each asks for its PIN as
 .B \-\-askpass
@@ -486,7 +488,8 @@ so no key file is needed and
 must not be given.
 .TP
 .BI serve " " [ identity \fR.\|.\|.]
-Run a long-lived agent on a unix socket.
+Run a long-lived agent on a unix socket (on Windows, a named pipe; see
+.BR WINDOWS ).
 Without
 .BR \-\-daemon ,
 the agent stays in the foreground and prints lines of the form
@@ -640,7 +643,9 @@ for
 keys.
 By default every attached authenticator other than the OnlyKey is asked,
 without a touch, whether it holds the key, and the first that does signs;
-give the OnlyKey's own FIDO interface here to sign with it instead.
+when no other is attached, the OnlyKey's own FIDO interface is used.
+With another attached, give the OnlyKey's own FIDO interface here to sign
+with it instead.
 U2F-only (CTAP1) authenticators are not supported.
 .B okagent devices \-\-fido
 lists the paths.
@@ -784,6 +789,15 @@ The child detaches from the terminal and redirects standard input and
 output to
 .IR /dev/null ;
 log output still goes to standard error.
+On Windows the agent is instead started again as a detached process with
+no console, and the snippet is PowerShell, for
+.BR Invoke\-Expression ,
+except from Git Bash or MSYS2, where it is sh naming the Cygwin socket.
+.TP
+.B \-\-pageant
+Windows only: also answer PuTTY, WinSCP and other Pageant clients, on
+Pageant's named pipe and through its window.
+Either is skipped, with a warning, when a Pageant already has it.
 .SH CHALLENGE PROMPT
 When an SSH client asks for a signature,
 .B okagent
@@ -897,6 +911,11 @@ See
 .BI key-lifetime " = " seconds
 See
 .BR \-\-key\-lifetime .
+.TP
+.BI pageant " = " bool
+See
+.BR \-\-pageant ;
+ignored outside Windows.
 .TP
 .B [[identity]]
 One table per identity, used when no identities are given on the command
@@ -1144,6 +1163,67 @@ and
 On macOS, run it from launchd instead; see the README for a
 .I ~/Library/LaunchAgents
 property list.
+.SH WINDOWS
+The agent listens on the named pipe
+.I \e\e.\epipe\eokagent\-USER
+by default, which Windows' OpenSSH reaches through
+.B SSH_AUTH_SOCK
+as it would a socket.
+.B serve
+also listens on a Cygwin-style socket,
+.IR %LOCALAPPDATA%\eokagent\eagent.sock ,
+for the
+.B ssh
+bundled with Git for Windows, MSYS2 and Cygwin, which cannot open a pipe.
+An agent on any other pipe, given with
+.B \-\-socket
+or a configured
+.BR socket ,
+uses a socket named after the pipe instead, as in
+.I pipe\-work.sock
+for
+.IR \e\e.\epipe\ework .
+When
+.B MSYSTEM
+is set, as in Git Bash, and okagent was not started from cmd or
+PowerShell,
+.B serve
+prints sh that points at that socket, and
+.BR run ,
+.BR shell ,
+.B ssh
+and
+.B ssh\-copy\-id
+give their command a temporary one.
+Otherwise
+.B run
+and
+.B shell
+set
+.B GIT_SSH
+to Windows' OpenSSH, unless
+.B GIT_SSH
+or
+.B GIT_SSH_COMMAND
+is set, since Git runs its bundled
+.B ssh
+even from PowerShell.
+The configuration file is
+.IR %APPDATA%\eokagent\econfig.toml ,
+and its ownership is not checked.
+The agent stops on Ctrl-C or
+.BR Stop\-Process ;
+there is no SIGHUP.
+.B shell
+starts
+.B %COMSPEC%
+rather than
+.BR $SHELL ,
+except from Git Bash, where it starts Git Bash's shell.
+Windows lets only an elevated process open a FIDO security key directly,
+so
+.B sk\-
+keys need an elevated agent there; OnlyKey keys do not.
 .SH NOTES
 Only the original OnlyKey is supported, not the OnlyKey DUO.
 The agent covers SSH only; GPG and age keys are out of scope.

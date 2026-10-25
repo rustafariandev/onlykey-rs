@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  okagent's Windows installer, built by build.ps1 -Msi with WiX 5.
+
+  A per-user package, like install.ps1: no administrator rights, files in
+  %LOCALAPPDATA%\Programs\okagent, and the user's PATH and SSH_AUTH_SOCK.
+  Public properties, remembered across upgrades:
+
+    AUTOSTART=0  no Startup shortcut, and the agent is not started
+    AUTHSOCK=0   leave the user's SSH_AUTH_SOCK alone
+
+  Preprocessor variables: Version (X.Y.Z) and Stage (the unzipped files).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="okagent"
+           Manufacturer="Rustafarian Dev"
+           Version="$(Version)"
+           UpgradeCode="91FB94BC-D07B-4BB4-B1A4-2D2932911E5C"
+           Scope="perUser"
+           Language="1033">
+    <SummaryInformation Description="SSH agent backed by an OnlyKey hardware token" />
+    <MajorUpgrade DowngradeErrorMessage="A newer okagent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/rustafariandev/onlykey-rs" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!--
+      Remembered settings. AppSearch would overwrite a value given on the
+      command line with the saved one, so the command line's is kept aside
+      first and put back after; the default applies only when neither is set.
+    -->
+    <Property Id="AUTOSTART" Secure="yes">
+      <RegistrySearch Id="AutostartSearch" Root="HKCU" Key="Software\okagent"
+                      Name="Autostart" Type="raw" />
+    </Property>
+    <Property Id="AUTHSOCK" Secure="yes">
+      <RegistrySearch Id="AuthSockSearch" Root="HKCU" Key="Software\okagent"
+                      Name="AuthSock" Type="raw" />
+    </Property>
+    <SetProperty Id="CMDLINE_AUTOSTART" Value="[AUTOSTART]" Before="AppSearch"
+                 Sequence="first" Condition="AUTOSTART" />
+    <SetProperty Id="AUTOSTART" Value="[CMDLINE_AUTOSTART]" After="AppSearch"
+                 Sequence="first" Condition="CMDLINE_AUTOSTART" />
+    <SetProperty Id="CMDLINE_AUTHSOCK" Value="[AUTHSOCK]" Before="AppSearch"
+                 Sequence="first" Condition="AUTHSOCK" />
+    <SetProperty Id="AUTHSOCK" Value="[CMDLINE_AUTHSOCK]" After="AppSearch"
+                 Sequence="first" Condition="CMDLINE_AUTHSOCK" />
+    <SetProperty Action="DefaultAutostart" Id="AUTOSTART" Value="1"
+                 After="SetAUTOSTART" Sequence="first" Condition="NOT AUTOSTART" />
+    <SetProperty Action="DefaultAuthSock" Id="AUTHSOCK" Value="1"
+                 After="SetAUTHSOCK" Sequence="first" Condition="NOT AUTHSOCK" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="okagent" />
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      Per-user components keep their key path in HKCU, as Windows Installer
+      requires of files in the user's profile. A component with both files
+      and a registry key path needs a fixed GUID; keep this one's set of
+      files the same, or give it a new GUID.
+    -->
+    <ComponentGroup Id="Okagent" Directory="INSTALLFOLDER">
+      <Component Id="Program" Guid="19A6EC94-EDB7-4EE5-A0B1-60C89E130EAB">
+        <File Id="okagent.exe" Source="$(Stage)\okagent.exe" />
+        <File Id="completion" Source="$(Stage)\okagent-completion.ps1" />
+        <File Id="readme" Source="$(Stage)\README.md" />
+        <File Id="license" Source="$(Stage)\LICENSE" Name="LICENSE.txt" />
+        <RegistryValue Root="HKCU" Key="Software\okagent" Name="InstallDir"
+                       Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\okagent" Name="Autostart"
+                       Value="[AUTOSTART]" />
+        <RegistryValue Root="HKCU" Key="Software\okagent" Name="AuthSock"
+                       Value="[AUTHSOCK]" />
+        <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
+                     Action="set" System="no" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\okagent" Action="removeOnUninstall" />
+      </Component>
+      <Component Id="AuthSock" Condition="AUTHSOCK = &quot;1&quot;">
+        <!-- The pipe ssh-agent-kit names after GetUserNameW, as LogonUser is. -->
+        <Environment Id="SshAuthSock" Name="SSH_AUTH_SOCK"
+                     Value="\\.\pipe\okagent-[LogonUser]" Action="set" System="no" />
+        <RegistryValue Root="HKCU" Key="Software\okagent\Components" Name="AuthSock"
+                       Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="Autostart" Condition="AUTOSTART = &quot;1&quot;">
+        <!-- Minimized: the daemon flag starts the agent and returns at once. -->
+        <Shortcut Id="StartupShortcut" Directory="StartupFolder" Name="okagent"
+                  Target="[#okagent.exe]" Arguments="serve --daemon"
+                  WorkingDirectory="INSTALLFOLDER" Show="minimized"
+                  Description="okagent: SSH agent backed by an OnlyKey" />
+        <RegistryValue Root="HKCU" Key="Software\okagent\Components" Name="Autostart"
+                       Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="Okagent" />
+    </Feature>
+
+    <!--
+      Windows cannot replace or delete a running program, so a running agent
+      is stopped before an upgrade or uninstall. This matches by name, so it
+      also stops an okagent.exe run from elsewhere.
+    -->
+    <util:CloseApplication Id="StopAgent" Target="okagent.exe"
+                           TerminateProcess="1" RebootPrompt="no" />
+
+    <!--
+      Start the agent once installed. WixQuietExec runs it with no console
+      window and waits for the daemonizing okagent to return, which it does as soon
+      as the background agent answers on its pipe.
+    -->
+    <SetProperty Id="WixQuietExecCmdLine" Value="&quot;[#okagent.exe]&quot; serve --daemon"
+                 Before="StartAgent" Sequence="execute" />
+    <CustomAction Id="StartAgent" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="StartAgent" After="InstallFinalize"
+              Condition="AUTOSTART = &quot;1&quot; AND NOT REMOVE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

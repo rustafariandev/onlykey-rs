@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Every branch push; tag pushes are left to the release workflow.
   push:
-    branches: [main, master]
+    branches: ["**"]
   pull_request:
 
 permissions:
@@ -15,23 +16,32 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    # A pull request from a branch here is already tested by its pushes;
+    # only one from a fork needs a run of its own.
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Windows OpenSSH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/windows-openssh.ps1
       - name: Test
         run: cargo test --workspace
         env:

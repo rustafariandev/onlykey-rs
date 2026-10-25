@@ -3,6 +3,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+#[cfg(unix)]
 use nix::unistd::{ForkResult, fork, setsid};
 use okagent::agent::{self, Agent, Opener, SkOpener};
 use okagent::agent::{client, sk};
@@ -46,7 +47,8 @@ pub struct Cli {
     )]
     pub log_file: Option<PathBuf>,
 
-    /// Config file (default: $XDG_CONFIG_HOME/okagent/config.toml).
+    /// Config file (default: $XDG_CONFIG_HOME/okagent/config.toml, or
+    /// %APPDATA%\okagent\config.toml on Windows).
     #[arg(
         long,
         global = true,
@@ -77,9 +79,9 @@ pub struct KeyArgs {
 #[derive(Debug, Args, Default, Clone)]
 #[command(next_help_heading = "Security key options")]
 pub struct SkArgs {
-    /// FIDO security key to use for `sk-` keys, by hidraw path substring.
+    /// FIDO security key to use for `sk-` keys, by HID path substring.
     /// Defaults to whichever attached authenticator, other than the OnlyKey,
-    /// holds the key.
+    /// holds the key; the OnlyKey's own when it is the only one.
     #[arg(long, value_name = "PATH")]
     pub fido_device: Option<String>,
 
@@ -124,11 +126,12 @@ pub enum Cmd {
     /// Add the SSH keys stored on FIDO security keys (resident keys) to the
     /// agent, keeping whether each needs its PIN (unlike `ssh-add -K`).
     LoadResident(LoadResidentArgs),
-    /// Run the agent on a unix socket.
+    /// Run the agent on a unix socket (a named pipe on Windows).
     Serve(ServeArgs),
     /// Run a command with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Run(RunArgs),
-    /// Start $SHELL with SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
+    /// Start $SHELL (%COMSPEC% on Windows, except from Git Bash) with
+    /// SSH_AUTH_SOCK and SSH_AGENT_PID set for a temporary agent.
     Shell(ShellArgs),
     /// Connect with ssh using the identity's key.
     Ssh(SshArgs),
@@ -196,14 +199,26 @@ pub struct ServeArgs {
     pub identities: ExtraIdentityArgs,
 
     /// Socket path (default: $XDG_RUNTIME_DIR/okagent/agent.sock, or
-    /// $TMPDIR/okagent/agent.sock on macOS).
+    /// $TMPDIR/okagent/agent.sock on macOS; the pipe \\.\pipe\okagent-USER
+    /// on Windows).
     #[arg(long)]
     pub socket: Option<PathBuf>,
 
-    /// Fork into the background and print shell commands that set
-    /// SSH_AUTH_SOCK and SSH_AGENT_PID.
+    /// Run in the background and print shell commands (PowerShell on
+    /// Windows, except sh from Git Bash) that set SSH_AUTH_SOCK and
+    /// SSH_AGENT_PID.
     #[arg(long, short)]
     pub daemon: bool,
+
+    /// Also answer PuTTY, WinSCP and other Pageant clients (Windows only).
+    #[arg(long, hide = cfg!(not(windows)))]
+    pub pageant: bool,
+
+    /// Set by `serve --daemon` on the background copy it starts: the pipe
+    /// it waits on, so the copy binds that one and does not start another.
+    #[cfg(windows)]
+    #[arg(long, hide = true, value_name = "PIPE")]
+    pub detached: Option<PathBuf>,
 
     #[command(flatten)]
     pub key: KeyArgs,
@@ -509,11 +524,13 @@ pub fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
         .with_target(false);
     match log_file {
         Some(path) => {
-            use std::os::unix::fs::OpenOptionsExt;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            // On Windows a new file inherits its directory's access list,
+            // which in the user's profile is the user's alone.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let file = options
                 .open(path)
                 .with_context(|| format!("opening log file {}", path.display()))?;
             builder
@@ -550,7 +567,14 @@ pub fn main(cli: Cli) -> Result<ExitCode> {
         Cmd::Serve(args) => serve(&ctx, args),
         Cmd::Run(args) => run(&ctx, &args.identities, args.command),
         Cmd::Shell(args) => {
+            #[cfg(unix)]
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            #[cfg(windows)]
+            let shell = windows_shell();
+            // As a Unix shell takes the terminal's foreground: the agent
+            // must not read the console that the shell and its ssh read.
+            #[cfg(windows)]
+            onlykey_agent::challenge::give_up_console();
             run(&ctx, &args.identities, vec![shell])
         }
         Cmd::Ssh(args) => connect(&ctx, args, Remote::Ssh),
@@ -768,6 +792,36 @@ fn load_resident(ctx: &Context_, args: &LoadResidentArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Add a key to the agent at `socket`.
+#[cfg(unix)]
+fn add_identity(socket: &Path, body: &[u8]) -> Result<(), client::ClientError> {
+    client::add_identity(socket, body)
+}
+
+/// Add a key to the agent at `socket`: a pipe name, or the Cygwin socket
+/// that `serve`, `run` and `shell` put in Git Bash's `SSH_AUTH_SOCK`.
+#[cfg(windows)]
+fn add_identity(socket: &Path, body: &[u8]) -> Result<(), client::ClientError> {
+    use client::ClientError;
+    use okagent::agent::wire;
+    if is_pipe_name(socket) {
+        return client::add_identity(socket, body);
+    }
+    let mut stream = agent::connect_cygwin(socket).map_err(|source| ClientError::Connect {
+        path: socket.to_owned(),
+        source,
+    })?;
+    let mut request = Vec::with_capacity(1 + body.len());
+    request.push(wire::SSH2_AGENTC_ADD_IDENTITY);
+    request.extend_from_slice(body);
+    wire::write_frame(&mut stream, &request)?;
+    match wire::read_frame(&mut stream)?.as_deref() {
+        Some([wire::SSH_AGENT_SUCCESS]) => Ok(()),
+        Some(_) => Err(ClientError::Refused),
+        None => Err(ClientError::Closed),
+    }
+}
+
 /// Add one security key's resident SSH keys to the agent at `socket`;
 /// returns how many.
 fn load_resident_from(
@@ -804,7 +858,7 @@ fn load_resident_from(
         }
         let verify = credman::needs_verification(hid, credential)?;
         let (public, body) = sk::resident_key(credential, verify)?;
-        client::add_identity(socket, &body)?;
+        add_identity(socket, &body)?;
         eprintln!(
             "Resident key added: {} ({} {}{})",
             public.comment(),
@@ -825,6 +879,7 @@ fn shutdown_flag() -> Result<Arc<AtomicBool>> {
     for sig in [
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
+        #[cfg(unix)]
         signal_hook::consts::SIGHUP,
     ] {
         signal_hook::flag::register(sig, Arc::clone(&flag))?;
@@ -833,29 +888,286 @@ fn shutdown_flag() -> Result<Arc<AtomicBool>> {
 }
 
 fn serve(ctx: &Context_, args: ServeArgs) -> Result<ExitCode> {
+    // Built before `serve --daemon` respawns on Windows, though the copy
+    // builds it again: the copy has no stderr, so a bad identity or pubkey
+    // file is reported here rather than as an exit code.
     let agent = ctx.agent(&args.identities.base, &args.identities.additional)?;
     let path = args
         .socket
         .or_else(|| ctx.config.socket.clone())
         .unwrap_or_else(agent::default_socket_path);
+    if cfg!(not(windows)) {
+        if args.pageant {
+            bail!("--pageant is only available on Windows");
+        }
+        // A config shared with a Windows machine may ask for it.
+        if ctx.config.pageant == Some(true) {
+            tracing::debug!("ignoring `pageant` in the config: Pageant is Windows only");
+        }
+    }
+    // A pipe cannot be handed to another process, so on Windows the
+    // background copy binds it itself.
+    #[cfg(windows)]
+    let path = match args.detached {
+        Some(pipe) => pipe,
+        None if args.daemon => return respawn_detached(&path),
+        None => path,
+    };
+    // Bound before the pipe, so the socket is ready by the time
+    // respawn_detached sees the pipe answer and prints its path.
+    #[cfg(windows)]
+    let cygwin = bind_cygwin(&path)?;
     let (listener, guard) = agent::bind_socket(&path)?;
     if args.daemon {
+        #[cfg(unix)]
         daemonize(&path)?;
+        // As daemonize does on Unix: Windows locks a process's working
+        // directory, which would keep the folder serve was started in from
+        // being deleted, or its drive from being ejected.
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let _ = std::env::set_current_dir(root);
+        }
     } else {
-        eprint!("{}", agent_env_snippet(&path, std::process::id()));
+        eprint!("{}", serve_env_snippet(&path, std::process::id()));
     }
     let shutdown = shutdown_flag()?;
-    agent::serve(listener, agent, shutdown)?;
+    #[cfg(windows)]
+    let cygwin = cygwin.map(|(listener, guard)| {
+        let (agent, shutdown) = (Arc::clone(&agent), Arc::clone(&shutdown));
+        std::thread::spawn(move || {
+            let _guard = guard;
+            if let Err(e) = agent::serve(listener, agent, shutdown) {
+                tracing::error!("Cygwin socket: {e}");
+            }
+        })
+    });
+    #[cfg(windows)]
+    if args.pageant || ctx.config.pageant.unwrap_or(false) {
+        serve_as_pageant(&agent, &shutdown);
+    }
+    let served = agent::serve(listener, agent, Arc::clone(&shutdown));
+    // The process exits without waiting for other threads, so wait for this
+    // one to remove its socket file.
+    #[cfg(windows)]
+    if let Some(cygwin) = cygwin {
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = cygwin.join();
+    }
+    served?;
     drop(guard);
     Ok(ExitCode::SUCCESS)
 }
 
+/// Answer PuTTY's tools too, on threads of their own: newer ones on
+/// Pageant's pipe, older ones through its window. Either is skipped, with a
+/// warning, when a Pageant already has it.
+#[cfg(windows)]
+fn serve_as_pageant(agent: &Arc<Agent>, shutdown: &Arc<AtomicBool>) {
+    let pipe = agent::pageant_pipe_name()
+        .map_err(anyhow::Error::from)
+        .and_then(|name| Ok(agent::bind_socket(&name)?));
+    match pipe {
+        Ok((listener, guard)) => {
+            let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+            std::thread::spawn(move || {
+                let _guard = guard;
+                if let Err(e) = agent::serve(listener, agent, shutdown) {
+                    tracing::error!("Pageant pipe: {e}");
+                }
+            });
+        }
+        Err(e) => tracing::warn!("not serving Pageant's pipe: {e:#}"),
+    }
+    let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+    std::thread::spawn(move || {
+        if let Err(e) = agent::serve_pageant_window(agent, shutdown) {
+            tracing::warn!("not serving Pageant's window: {e}");
+        }
+    });
+}
+
+/// Bind the Cygwin-style socket that the ssh bundled with Git for Windows,
+/// MSYS2 and Cygwin reaches the agent on. From an MSYS2 shell such as Git
+/// Bash a failure is an error, since the snippet points there; elsewhere
+/// it is a warning, and the pipe still serves.
+#[cfg(windows)]
+fn bind_cygwin(pipe: &Path) -> Result<Option<(agent::CygwinListener, agent::SocketGuard)>> {
+    match agent::bind_cygwin_socket(&agent::cygwin_socket_path(pipe)) {
+        Ok(bound) => Ok(Some(bound)),
+        Err(e) if msys_shell() => Err(e.into()),
+        Err(e) => {
+            tracing::warn!("not serving a Cygwin socket for Git Bash's ssh: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Whether `path` is a pipe name, `\\.\pipe\NAME`.
+#[cfg(windows)]
+fn is_pipe_name(path: &Path) -> bool {
+    const PIPE_PREFIX: &str = r"\\.\pipe\";
+    path.to_str()
+        .and_then(|s| s.get(..PIPE_PREFIX.len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PIPE_PREFIX))
+        && path.as_os_str().len() > PIPE_PREFIX.len()
+}
+
+/// The shells of MSYS2 and Git Bash, whose `ssh` is a Cygwin program.
+#[cfg(windows)]
+const MSYS_SHELLS: [&str; 6] = [
+    "bash.exe", "sh.exe", "dash.exe", "zsh.exe", "fish.exe", "mksh.exe",
+];
+
+/// Windows' own shells, whose `ssh` is Windows' OpenSSH.
+#[cfg(windows)]
+const WINDOWS_SHELLS: [&str; 3] = ["cmd.exe", "powershell.exe", "pwsh.exe"];
+
+/// Whether okagent was started from an MSYS2 shell, such as Git Bash, whose
+/// `ssh` reaches the agent only through a Cygwin-style socket: `MSYSTEM`
+/// says so, and the nearest shell okagent descends from is an MSYS2 one.
+/// cmd and PowerShell started from Git Bash inherit `MSYSTEM` too, and so
+/// may a program started from Explorer. Worked out once, as it walks every
+/// process on the system.
+#[cfg(windows)]
+fn msys_shell() -> bool {
+    static MSYS_SHELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MSYS_SHELL.get_or_init(|| {
+        std::env::var_os("MSYSTEM").is_some_and(|s| !s.is_empty())
+            && launching_shell()
+                .is_some_and(|exe| MSYS_SHELLS.iter().any(|s| exe.eq_ignore_ascii_case(s)))
+    })
+}
+
+/// The file name of the nearest shell okagent descends from, looking past
+/// other programs in between: okagent itself, as the background copy of
+/// `serve --daemon` was started by another, or one such as cargo or make.
+/// `None` if there is none or it cannot be told.
+#[cfg(windows)]
+fn launching_shell() -> Option<String> {
+    use std::collections::HashMap;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: no pointers are passed; the result is checked.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // Each process's parent and file name.
+    let mut processes = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `snapshot` is open and `entry` is a PROCESSENTRY32W with its
+    // size set, as both calls require.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(260);
+        let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        processes.insert(entry.th32ProcessID, (entry.th32ParentProcessID, exe));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is open and not used again.
+    unsafe { CloseHandle(snapshot) };
+
+    let mut child = std::process::id();
+    let mut child_started = started(child)?;
+    // Bounded, in case reused process ids make a loop.
+    for _ in 0..processes.len() {
+        let (parent, _) = processes.get(&child)?;
+        let (_, exe) = processes.get(parent)?;
+        // A parent that has exited may have left its id to a newer process.
+        let parent_started = started(*parent)?;
+        if parent_started > child_started {
+            return None;
+        }
+        if MSYS_SHELLS
+            .iter()
+            .chain(&WINDOWS_SHELLS)
+            .any(|shell| exe.eq_ignore_ascii_case(shell))
+        {
+            return Some(exe.clone());
+        }
+        (child, child_started) = (*parent, parent_started);
+    }
+    None
+}
+
+/// When the process `pid` started, in 100 ns units since 1601.
+#[cfg(windows)]
+fn started(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: no pointers are passed; the result is checked.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut times = [FILETIME::default(); 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: `process` is open with the access GetProcessTimes needs, and
+    // each FILETIME outlives the call.
+    let ok = unsafe { GetProcessTimes(process, created, exited, kernel, user) } != 0;
+    // SAFETY: `process` is open and not used again.
+    unsafe { CloseHandle(process) };
+    ok.then(|| u64::from(times[0].dwHighDateTime) << 32 | u64::from(times[0].dwLowDateTime))
+}
+
+/// The shell `okagent shell` starts: Git Bash's own from there, else
+/// `%COMSPEC%`. Git Bash hands `SHELL` to Windows programs as a Windows
+/// path.
+#[cfg(windows)]
+fn windows_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| {
+            msys_shell() && Path::new(shell).is_absolute() && Path::new(shell).is_file()
+        })
+        .or_else(|| std::env::var("COMSPEC").ok())
+        .unwrap_or_else(|| "cmd.exe".into())
+}
+
+/// `path` as MSYS2 and Cygwin take it in `SSH_AUTH_SOCK`: forward slashes.
+#[cfg(windows)]
+fn msys_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// What `serve` prints: on Windows, sh for an MSYS2 shell, whose ssh uses
+/// the Cygwin socket, else PowerShell for the pipe.
+#[cfg(unix)]
+fn serve_env_snippet(socket: &Path, pid: u32) -> String {
+    agent_env_snippet(socket, pid)
+}
+
+#[cfg(windows)]
+fn serve_env_snippet(pipe: &Path, pid: u32) -> String {
+    if msys_shell() {
+        sh_env_snippet(&msys_path(&agent::cygwin_socket_path(pipe)), pid)
+    } else {
+        agent_env_snippet(pipe, pid)
+    }
+}
+
 /// The lines `ssh-agent -s` would print: the socket and the agent's pid,
 /// so that `ssh-agent -k` can stop it.
+#[cfg(unix)]
 fn agent_env_snippet(socket: &Path, pid: u32) -> String {
+    sh_env_snippet(&socket.display().to_string(), pid)
+}
+
+fn sh_env_snippet(socket: &str, pid: u32) -> String {
     format!(
         "SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID={pid}; export SSH_AGENT_PID;\n",
-        shell_quote(&socket.display().to_string())
+        shell_quote(socket)
     )
 }
 
@@ -874,8 +1186,111 @@ fn shell_quote(text: &str) -> String {
     }
 }
 
+/// The PowerShell equivalent, for `okagent serve --daemon | Invoke-Expression`.
+#[cfg(windows)]
+fn agent_env_snippet(socket: &Path, pid: u32) -> String {
+    format!(
+        "$env:SSH_AUTH_SOCK = {};\n$env:SSH_AGENT_PID = '{pid}';\n",
+        powershell_quote(&socket.display().to_string())
+    )
+}
+
+/// `text` as a PowerShell string literal that expands nothing. PowerShell
+/// also takes the typographic single quotes as quotes, so those are doubled
+/// as well.
+#[cfg(windows)]
+fn powershell_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for c in text.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// Start this command again as a detached process with no console, wait
+/// until it answers on `socket`, then print the PowerShell snippet. Windows
+/// has no fork, and the console is what a detached agent must give up.
+#[cfg(windows)]
+fn respawn_detached(socket: &Path) -> Result<ExitCode> {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    // Checked here, as the copy reports nothing but its exit code.
+    if !is_pipe_name(socket) {
+        bail!(
+            r"cannot bind {}: not a pipe name (\\.\pipe\NAME)",
+            socket.display()
+        );
+    }
+    if client::connect(socket).is_ok() {
+        bail!("an agent is already serving {}", socket.display());
+    }
+    // A child inherits every inheritable handle, not only the three it is
+    // given. Holding on to this process's stdout would keep the pipe of
+    // `okagent serve --daemon | Invoke-Expression` open after it exits.
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // SAFETY: changes only the flags of this process's own std handle;
+        // a null or invalid one makes the call fail harmlessly.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    }
+    let exe = std::env::current_exe().context("finding okagent's own path")?;
+    let mut child = Command::new(exe)
+        .args(detached_args(std::env::args_os().skip(1).collect(), socket))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .context("starting the agent in the background")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client::connect(socket).is_err() {
+        if let Some(status) = child.try_wait()? {
+            bail!("the background agent exited ({status}); run `okagent serve` to see why");
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the background agent (pid {}) did not start serving {}",
+                child.id(),
+                socket.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    print!("{}", serve_env_snippet(socket, child.id()));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The arguments for the background copy of `serve --daemon`: this
+/// command's own, with `--detached socket` passed on rather than resolved
+/// again, so the copy binds the pipe this process waits on. It goes before
+/// any `--`, after which it would be taken for two identities, and the copy
+/// would start a copy of its own, and so on.
+#[cfg(windows)]
+fn detached_args(mut args: Vec<std::ffi::OsString>, socket: &Path) -> Vec<std::ffi::OsString> {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    args.splice(at..at, ["--detached".into(), socket.into()]);
+    args
+}
+
 /// Fork into the background. The parent prints the shell snippet and exits;
 /// the child detaches from the terminal.
+#[cfg(unix)]
 fn daemonize(socket: &Path) -> Result<()> {
     // SAFETY: no threads have been spawned yet and the child only continues
     // with async-signal-safe setup before returning to normal execution.
@@ -902,23 +1317,40 @@ fn daemonize(socket: &Path) -> Result<()> {
 /// and `SSH_AGENT_PID` set, and stop the agent when it exits.
 fn run(ctx: &Context_, identities: &ExtraIdentityArgs, command: Vec<String>) -> Result<ExitCode> {
     let agent = ctx.agent(&identities.base, &identities.additional)?;
-    let path = agent::ephemeral_socket_path();
-    let (listener, guard) = agent::bind_socket(&path)?;
-    let shutdown = shutdown_flag()?;
-    let server = {
-        let agent = Arc::clone(&agent);
-        let shutdown = Arc::clone(&shutdown);
-        std::thread::spawn(move || agent::serve(listener, agent, shutdown))
-    };
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("no command given"))?;
-    let status = Command::new(program)
+    let shutdown = shutdown_flag()?;
+    let mut child = Command::new(program);
+    child
         .args(args)
-        .env("SSH_AUTH_SOCK", guard.path())
-        .env("SSH_AGENT_PID", std::process::id().to_string())
-        .status()
-        .with_context(|| format!("running {program}"));
+        .env("SSH_AGENT_PID", std::process::id().to_string());
+    // From Git Bash, the command's ssh is Git's own, which reaches only a
+    // Cygwin-style socket.
+    #[cfg(windows)]
+    let cygwin = if msys_shell() {
+        let path = agent::ephemeral_cygwin_socket_path();
+        let (listener, guard) = agent::bind_cygwin_socket(&path)?;
+        child.env("SSH_AUTH_SOCK", msys_path(&path));
+        Some((guard, spawn_server(listener, &agent, &shutdown)))
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let cygwin = None;
+    let (guard, server) = match cygwin {
+        Some(served) => served,
+        None => {
+            let (listener, guard) = agent::bind_socket(&agent::ephemeral_socket_path())?;
+            child.env("SSH_AUTH_SOCK", guard.path());
+            #[cfg(windows)]
+            if let Some(ssh) = git_ssh() {
+                child.env("GIT_SSH", ssh);
+            }
+            (guard, spawn_server(listener, &agent, &shutdown))
+        }
+    };
+    let status = child.status().with_context(|| format!("running {program}"));
     shutdown.store(true, Ordering::SeqCst);
     let _ = server.join();
     drop(guard);
@@ -927,6 +1359,31 @@ fn run(ctx: &Context_, identities: &ExtraIdentityArgs, command: Vec<String>) -> 
         Some(code) => ExitCode::from(code.clamp(0, 255) as u8),
         None => ExitCode::from(128),
     })
+}
+
+/// Serve `agent` on `listener` on a thread of its own until `shutdown`.
+fn spawn_server<L: agent::Listener + 'static>(
+    listener: L,
+    agent: &Arc<Agent>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+    std::thread::spawn(move || agent::serve(listener, agent, shutdown))
+}
+
+/// Windows' OpenSSH, for git to use under `run`. Git for Windows otherwise
+/// runs its bundled ssh, which cannot reach the agent's named pipe. `None`
+/// when the user already chose an ssh for git (git prefers
+/// `GIT_SSH_COMMAND` and `core.sshCommand` over `GIT_SSH`, so those still
+/// win) or Windows' OpenSSH is not installed.
+#[cfg(windows)]
+fn git_ssh() -> Option<PathBuf> {
+    if std::env::var_os("GIT_SSH").is_some() || std::env::var_os("GIT_SSH_COMMAND").is_some() {
+        return None;
+    }
+    let root = std::env::var_os("SystemRoot")?;
+    let ssh = Path::new(&root).join(r"System32\OpenSSH\ssh.exe");
+    ssh.is_file().then_some(ssh)
 }
 
 /// Run ssh or mosh against the identity's host with a temporary agent that
@@ -1121,6 +1578,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn env_snippet_matches_ssh_agent_output() {
         assert_eq!(
@@ -1171,6 +1629,7 @@ mod tests {
 
     /// A path the shell would split or expand is single-quoted, so `eval`
     /// sets it literally.
+    #[cfg(unix)]
     #[test]
     fn env_snippet_quotes_a_path_the_shell_would_change() {
         let path = "/tmp/a b;$(touch x)'q";
@@ -1179,6 +1638,28 @@ mod tests {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("{snippet}printf %s \"$SSH_AUTH_SOCK\""))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+    }
+
+    /// On Windows the snippet is PowerShell, and PowerShell sets a path
+    /// with quotes or `$(...)` in it literally.
+    #[cfg(windows)]
+    #[test]
+    fn env_snippet_is_powershell_that_sets_the_path_literally() {
+        assert_eq!(
+            agent_env_snippet(Path::new(r"\\.\pipe\okagent-ferris"), 42),
+            "$env:SSH_AUTH_SOCK = '\\\\.\\pipe\\okagent-ferris';\n$env:SSH_AGENT_PID = '42';\n"
+        );
+        let path = r"\\.\pipe\a b;$(Write-Output x)'q’r";
+        let snippet = agent_env_snippet(Path::new(path), 42);
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "{snippet}[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+                 [Console]::Out.Write($env:SSH_AUTH_SOCK)"
+            ))
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
@@ -1390,6 +1871,95 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.socket.as_deref(), Some(Path::new("/tmp/a.sock")));
+    }
+
+    /// `load-resident` adds keys over the Cygwin socket that Git Bash's
+    /// `SSH_AUTH_SOCK` names, written with forward slashes.
+    #[cfg(windows)]
+    #[test]
+    fn adds_a_key_over_a_cygwin_socket() {
+        use onlykey_agent::challenge::RecordingSink;
+        use onlykey_agent::ssh_key::private::Ed25519Keypair;
+        use ssh_encoding::Encode;
+
+        let opener: Opener = Arc::new(|| panic!("OnlyKey must not be opened"));
+        let agent = Arc::new(Agent::new(
+            Vec::new(),
+            opener,
+            Arc::new(RecordingSink::default()),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let (listener, guard) = agent::bind_cygwin_socket(&socket).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_server(listener, &agent, &shutdown);
+
+        let pair = Ed25519Keypair::from_seed(&[0x5A; 32]);
+        let mut body = Vec::new();
+        "ssh-ed25519".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        "ferris@example.com".encode(&mut body).unwrap();
+        let sock_env = PathBuf::from(msys_path(&socket));
+        add_identity(&sock_env, &body).unwrap();
+        let served = agent.public_keys();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].comment(), "ferris@example.com");
+        assert!(matches!(
+            add_identity(&dir.path().join("missing.sock"), &body),
+            Err(client::ClientError::Connect { .. })
+        ));
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        drop(guard);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_names_are_told_from_paths() {
+        assert!(is_pipe_name(Path::new(r"\\.\pipe\okagent")));
+        assert!(is_pipe_name(Path::new(r"\\.\PIPE\okagent")));
+        assert!(!is_pipe_name(Path::new(r"\\.\pipe\")));
+        assert!(!is_pipe_name(Path::new("C:/Users/ferris/agent.sock")));
+        assert!(!is_pipe_name(Path::new("/run/user/1000/okagent.sock")));
+    }
+
+    /// `serve --daemon` reports a socket that is not a pipe name itself,
+    /// before starting a copy that could only exit.
+    #[cfg(windows)]
+    #[test]
+    fn daemon_refuses_a_socket_that_is_not_a_pipe() {
+        let error = respawn_detached(Path::new("/run/user/1000/okagent.sock")).unwrap_err();
+        assert!(error.to_string().contains("not a pipe name"), "{error:#}");
+    }
+
+    /// The background copy of `serve --daemon` is told its pipe however
+    /// the command was written, so it never starts a copy of its own.
+    #[cfg(windows)]
+    #[test]
+    fn the_detached_copy_is_told_its_pipe() {
+        let pipe = Path::new(r"\\.\pipe\okagent-test");
+        for command in [
+            &["-v", "serve", "--daemon"][..],
+            &["serve", "--daemon", "ferris@example.com"],
+            &["serve", "--daemon", "--", "ferris@example.com", "--"],
+        ] {
+            let args = command.iter().map(Into::into).collect();
+            let args = std::iter::once("okagent".into()).chain(detached_args(args, pipe));
+            let Cmd::Serve(serve) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("unexpected command");
+            };
+            assert_eq!(serve.detached.as_deref(), Some(pipe), "{command:?}");
+            assert!(
+                !serve
+                    .identities
+                    .base
+                    .identity
+                    .iter()
+                    .any(|i| i == "--detached"),
+                "{command:?}"
+            );
+        }
     }
 
     /// Commands take only the options they use.

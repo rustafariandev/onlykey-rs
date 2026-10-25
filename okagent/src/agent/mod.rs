@@ -42,14 +42,21 @@ pub use ssh_agent_kit::{
 
 pub use onlykey::{Device, OnlyKeyBackend, Opener};
 pub use server::{Agent, AgentError, default_socket_path, ephemeral_socket_path};
+#[cfg(windows)]
+pub use server::{cygwin_socket_path, default_cygwin_socket_path, ephemeral_cygwin_socket_path};
 pub use sk::{SkBackend, SkDecoder, SkKey, SkOpener};
 #[cfg(feature = "dsa")]
 pub use ssh_agent_kit::DsaLocalKey;
 pub use ssh_agent_kit::{
     AssociatedCerts, BindError, CertError, CertKey, Connection, ConstraintError, ConstraintHop,
     DestinationConstraint, Extension, ExtensionContext, ExtensionReply, HostKeySpec,
-    KeyDecodeError, KeyDecoder, KeyRegistry, SessionBinding, SignerRef, SocketError, SocketGuard,
-    Userauth, bind_socket, serve,
+    KeyDecodeError, KeyDecoder, KeyRegistry, Listener, SessionBinding, SignerRef, SocketError,
+    SocketGuard, Userauth, bind_socket, serve,
+};
+#[cfg(windows)]
+pub use ssh_agent_kit::{
+    CygwinListener, CygwinStream, bind_cygwin_socket, connect_cygwin, pageant_pipe_name,
+    serve_pageant_window,
 };
 pub use ssh_agent_kit::{
     EcdsaLocalKey, Ed25519LocalKey, LocalKey, LocalKeyError, LocalKeyRef, RsaLocalKey,

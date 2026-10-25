@@ -17,7 +17,8 @@ Two crates:
 - **`okagent`**: a command-line SSH agent.
 - **`onlykey-agent`**: the library underneath it.
 
-Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux and macOS.
+Scope: SSH only (no GPG, no age), the original OnlyKey (not DUO), Linux, macOS
+and Windows.
 Key types: ed25519 and nistp256 (derived or stored), RSA 2048 and 4096
 (stored only). A plain ed25519, RSA or ECDSA (nistp256/384/521) private key
 (and DSA, with the `dsa` build feature) can also be loaded into a running agent with `ssh-add FILE` and signed in
@@ -39,6 +40,11 @@ pure-Rust CTAP2 client, with no C library involved.
   user use the token.
 - macOS: the Xcode Command Line Tools (`xcode-select --install`), which
   build hidapi's IOKit backend. No driver or permission setup is needed.
+- Windows: the MSVC build tools (Visual Studio's "Desktop development with
+  C++"), which build hidapi's Win32 backend, and Windows' own OpenSSH Client
+  (Settings → System → Optional features). No driver is needed. See
+  [Windows](#windows) for how the agent is reached there. The release zip
+  needs neither the build tools nor a Visual C++ runtime.
 
 ```sh
 cargo install --git https://github.com/rustafariandev/onlykey-rs okagent
@@ -49,7 +55,9 @@ Prebuilt packages and a static binary are published on the
 universal `x86_64` musl tarball, a `.deb` for Debian 12+ and Ubuntu 22.04+,
 an `.rpm` for RHEL 8+, and a `.pkg.tar.zst` for Arch. Each installs the
 binary, man page, a systemd user unit, the udev rule, and shell completions;
-see [`packaging/README.md`](packaging/README.md). `okagent completions SHELL`
+see [`packaging/README.md`](packaging/README.md). For Windows there is an
+`x86_64` MSI, and a zip whose `install.ps1` does the same; see
+[Windows](#windows). `okagent completions SHELL`
 prints a completion script, and `make package-all` builds every package
 locally with podman.
 
@@ -187,7 +195,8 @@ with `okagent load-resident` rather than `ssh-add -K`, which drops the
 verify-required flag so the authenticator hides such a key and it cannot sign.
 With several authenticators attached, okagent
 asks each one silently which holds the credential, so only that one asks
-for a touch. The OnlyKey's own FIDO applet is left out; to sign with it, or
+for a touch. The OnlyKey's own FIDO applet is left out unless no other
+authenticator is attached; to sign with it alongside another, or
 to pin one device, pass `--fido-device /dev/hidrawN` (or set `fido-device`
 in the config):
 
@@ -368,6 +377,133 @@ Then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.okagent.plis
 and `export SSH_AUTH_SOCK="$HOME/.okagent/agent.sock"`. The notifier is
 `brew install terminal-notifier`; the prompt is appended as the message.
 
+### Windows
+
+The release MSI, `okagent-VERSION-x86_64-pc-windows-msvc.msi`, installs
+okagent for the current user (no administrator rights needed), starts the
+agent, and starts it again at every logon. Upgrade by installing a newer one,
+and remove it from Settings → Apps. `msiexec /i okagent-….msi AUTOSTART=0`
+installs it without autostart, and `AUTHSOCK=0` leaves `SSH_AUTH_SOCK` alone;
+see [`packaging/README.md`](packaging/README.md#msi).
+
+The release zip, `okagent-VERSION-x86_64-pc-windows-msvc.zip`, does the same
+without Windows Installer: it holds `okagent.exe` and an installer script.
+From the unzipped folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Autostart
+```
+
+It copies okagent to `%LOCALAPPDATA%\Programs\okagent`, adds that to your
+`PATH`, sets `SSH_AUTH_SOCK` for your user to the agent's pipe, and with
+`-Autostart` starts the agent now and at every logon. Run it again from a
+newer zip to upgrade. `-NoAuthSock` leaves `SSH_AUTH_SOCK` alone, and
+`install.ps1 -Uninstall`, run from the install folder, removes it all again.
+It prints the line to add to `$PROFILE` for tab completion.
+
+The agent listens on a named pipe, `\\.\pipe\okagent-USER` by default, which
+Windows' OpenSSH finds through `SSH_AUTH_SOCK` like a socket. In PowerShell:
+
+```powershell
+okagent serve --daemon | Invoke-Expression   # sets $env:SSH_AUTH_SOCK and $env:SSH_AGENT_PID
+ssh-add -L
+Stop-Process -Id $env:SSH_AGENT_PID          # stop it again
+```
+
+Without `--daemon` it serves in the foreground and prints the same two lines.
+Without the installer, to have every new shell use it, set `SSH_AUTH_SOCK`
+for your user once:
+`[Environment]::SetEnvironmentVariable('SSH_AUTH_SOCK', '\\.\pipe\okagent-USER', 'User')`,
+with your user name in place of `USER`. A shortcut in `shell:startup` running
+`okagent.exe serve --daemon` starts the agent at logon.
+
+- **Pageant.** `okagent serve --pageant` (or `pageant = true` in the config)
+  also answers PuTTY, WinSCP, and other tools that talk to Pageant, on both
+  Pageant's pipe and its window. Either is skipped, with a warning, when a
+  real Pageant is already running. See [PuTTY](#putty) below.
+- **Git Bash, MSYS2 and Cygwin.** The `ssh` and `ssh-add` these bundle
+  cannot open a named pipe, so `serve` also listens on a Cygwin-style
+  socket, `%LOCALAPPDATA%\okagent\agent.sock`. Only you can read it, and
+  clients running as other users are refused. In Git Bash:
+
+  ```sh
+  eval "$(okagent serve --daemon)"   # sh, pointing at the Cygwin socket
+  ssh-add -L
+  ```
+
+  okagent spots Git Bash and MSYS2 by `MSYSTEM`, unless it was started from
+  cmd or PowerShell, which inherit it when opened from Git Bash. From there,
+  `serve` prints sh instead of PowerShell, `shell` starts Git Bash's shell
+  rather than `%COMSPEC%`, and `run`, `shell`, `ssh` and `ssh-copy-id` hand
+  their command a Cygwin socket rather than a pipe. An agent on another
+  pipe gets a socket named after it, `pipe-work.sock` for `\\.\pipe\work`,
+  next to `agent.sock`. In Git Bash, single-quote a pipe name, as in
+  `--socket '\\.\pipe\work'`; unquoted, bash drops its backslashes.
+  Cygwin's own shell sets no `MSYSTEM`, so there, export
+  `SSH_AUTH_SOCK=/cygdrive/c/Users/USER/AppData/Local/okagent/agent.sock`
+  yourself.
+- **Git from PowerShell or cmd.** Git for Windows runs its bundled `ssh` even
+  from PowerShell, and that `ssh` cannot reach the pipe. `okagent run` and
+  `okagent shell` set `GIT_SSH` to Windows' OpenSSH, unless `GIT_SSH` or
+  `GIT_SSH_COMMAND` is already set. With `okagent serve`, point Git at it
+  yourself:
+  `git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe`.
+- **Windows' ssh-agent service.** It is separate from okagent. If it is
+  running, its keys are not okagent's; it can stay stopped
+  (`Get-Service ssh-agent`).
+- **Prompts.** The challenge digits and `ssh-add -c` confirmations appear in
+  the console the agent was started from. A `--daemon` agent has no console,
+  so use `--notify-command`, or an askpass program for security-key PINs.
+- **FIDO security keys (`sk-` keys).** Windows lets only an elevated
+  (administrator) process open a FIDO authenticator directly; everyone else
+  must go through Windows Hello. okagent talks to the authenticator directly,
+  so `sk-` keys need an elevated agent on Windows. OnlyKey keys, derived or
+  stored, need nothing special.
+- **Config.** The config file is `%APPDATA%\okagent\config.toml`.
+
+#### PuTTY
+
+PuTTY, Plink, PSCP, PSFTP, WinSCP and FileZilla look for Pageant, so okagent
+stands in for it. Quit Pageant first: okagent will not take over a Pageant
+that is already running.
+
+1. Turn on Pageant support. The agent the installer starts at logon runs
+   plain `okagent serve --daemon`, so put it in the config,
+   `%APPDATA%\okagent\config.toml`, along with the keys to offer:
+
+   ```toml
+   pageant = true
+
+   [[identity]]
+   name = "ferris@example.com"
+   ```
+
+   Then restart the agent (or log off and on again):
+
+   ```powershell
+   Stop-Process -Name okagent
+   okagent serve --daemon | Invoke-Expression
+   ```
+
+   To try it without touching the config, run
+   `okagent serve --pageant ferris@example.com` in a console instead; it
+   serves in the foreground until Ctrl+C. Keys can also be added to a
+   running agent with `ssh-add -s ferris@example.com`.
+
+2. Put the public key on the server. `okagent pubkey ferris@example.com`
+   prints the line for its `~/.ssh/authorized_keys`.
+
+3. Connect. PuTTY asks Pageant for keys by default (Connection → SSH →
+   Auth → Credentials, "Attempt authentication using Pageant"), so set only
+   the host and user name, and leave the private key file empty. From the
+   command line, `plink ferris@example.com` works the same way, and
+   `GIT_SSH=C:\Program Files\PuTTY\plink.exe` makes Git (and TortoiseGit)
+   use it.
+
+On each login, press the button the OnlyKey lights up. The challenge digits
+show in the console the agent runs in; the agent started at logon has none,
+so add `notify-command` to the config to see them.
+
 ## The onlykey-agent library
 
 ```toml
@@ -531,8 +667,9 @@ Differences from the Python agent:
 ## Development
 
 The agent is built on [ssh-agent-kit](https://github.com/rustafariandev/ssh-agent-kit),
-which is not on crates.io yet. Check it out next to this repository and point
-Cargo at it with a `.cargo/config.toml` (git-ignored):
+which Cargo fetches from crates.io. To work on both at once, check it out next
+to this repository and point Cargo at it with a `.cargo/config.toml`
+(git-ignored):
 
 ```sh
 git clone https://github.com/rustafariandev/ssh-agent-kit ../ssh-agent-kit

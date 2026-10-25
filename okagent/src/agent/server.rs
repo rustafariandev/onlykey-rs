@@ -166,7 +166,8 @@ impl Handler for Agent {
 
 /// Where the agent listens by default: `$XDG_RUNTIME_DIR/okagent/agent.sock`,
 /// else `$TMPDIR/okagent/agent.sock` on macOS, else
-/// `/tmp/okagent-<uid>/agent.sock`.
+/// `/tmp/okagent-<uid>/agent.sock`; on Windows the named pipe
+/// `\\.\pipe\okagent-<user>`.
 pub fn default_socket_path() -> PathBuf {
     ssh_agent_kit::default_socket_path("okagent")
 }
@@ -174,6 +175,68 @@ pub fn default_socket_path() -> PathBuf {
 /// A fresh per-process socket path for `run`-style invocations.
 pub fn ephemeral_socket_path() -> PathBuf {
     ssh_agent_kit::ephemeral_socket_path("okagent")
+}
+
+/// Where `serve` puts the Cygwin-style socket that the ssh bundled with Git
+/// for Windows, MSYS2 and Cygwin connects to:
+/// `%LOCALAPPDATA%\okagent\agent.sock`.
+#[cfg(windows)]
+pub fn default_cygwin_socket_path() -> PathBuf {
+    ssh_agent_kit::server::runtime_dir("okagent").join("agent.sock")
+}
+
+/// The Cygwin-style socket that goes with the named pipe `pipe`: the
+/// default one for the default pipe, else one named after the pipe, such as
+/// `%LOCALAPPDATA%\okagent\pipe-work.sock` for `\\.\pipe\work`, so agents
+/// on different pipes do not compete for it.
+///
+/// Pipe names ignore case and may hold `\`, `:` and other characters a file
+/// name cannot, so the whole name after `\\.\pipe\` is lowercased and every
+/// character but a letter, digit, `-` or `_` is written as `%XX` bytes. The
+/// `pipe-` prefix keeps it apart from `agent.sock` and `run-PID.sock`.
+///
+/// Cygwin's unix socket paths are limited to 108 bytes, so a name that
+/// would make the path longer is replaced by a hash of it:
+/// `pipe.HASH.sock`, which no escaped name can be, as `.` is escaped.
+#[cfg(windows)]
+pub fn cygwin_socket_path(pipe: &std::path::Path) -> PathBuf {
+    if pipe
+        .as_os_str()
+        .eq_ignore_ascii_case(default_socket_path().as_os_str())
+    {
+        return default_cygwin_socket_path();
+    }
+    let full = pipe.to_string_lossy().to_lowercase();
+    let name = full.strip_prefix(r"\\.\pipe\").unwrap_or(&full);
+    let mut file = String::from("pipe-");
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            file.push(c);
+        } else {
+            for byte in c.to_string().bytes() {
+                file.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    file.push_str(".sock");
+    let dir = ssh_agent_kit::server::runtime_dir("okagent");
+    let path = dir.join(file);
+    // Room for the terminating NUL, and for `/cygdrive/c` in place of
+    // `C:`, the longest way a Cygwin program spells the path.
+    if path.as_os_str().len() + "/cygdrive".len() < 108 {
+        return path;
+    }
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(name.as_bytes());
+    let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("pipe.{hex}.sock"))
+}
+
+/// A fresh per-process Cygwin-style socket path for `run`-style
+/// invocations, next to [`default_cygwin_socket_path`].
+#[cfg(windows)]
+pub fn ephemeral_cygwin_socket_path() -> PathBuf {
+    ssh_agent_kit::server::runtime_dir("okagent").join(format!("run-{}.sock", std::process::id()))
 }
 
 #[cfg(test)]
@@ -229,6 +292,43 @@ mod tests {
             Curve::Ed25519,
             EccSlot::new(3).unwrap(),
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn each_pipe_has_its_own_cygwin_socket() {
+        assert_eq!(
+            cygwin_socket_path(&default_socket_path()),
+            default_cygwin_socket_path()
+        );
+        let default = default_socket_path().to_string_lossy().to_uppercase();
+        assert_eq!(
+            cygwin_socket_path(std::path::Path::new(&default)),
+            default_cygwin_socket_path(),
+            "pipe names ignore case"
+        );
+        let file = |pipe: &str| {
+            let path = cygwin_socket_path(std::path::Path::new(pipe));
+            assert_eq!(path.parent(), default_cygwin_socket_path().parent());
+            path.file_name().unwrap().to_str().unwrap().to_owned()
+        };
+        assert_eq!(file(r"\\.\pipe\work"), "pipe-work.sock");
+        assert_eq!(file(r"\\.\PIPE\Work"), "pipe-work.sock");
+        // Never the default socket or a `run` one.
+        assert_eq!(file(r"\\.\pipe\agent"), "pipe-agent.sock");
+        assert_eq!(file(r"\\.\pipe\run-1234"), "pipe-run-1234.sock");
+        // Every pipe its own file, and a valid one.
+        assert_eq!(file(r"\\.\pipe\x\work"), "pipe-x%5Cwork.sock");
+        assert_eq!(file(r"\\.\pipe\a:b*?"), "pipe-a%3Ab%2A%3F.sock");
+        assert_eq!(file(r"\\.\pipe\.."), "pipe-%2E%2E.sock");
+        assert_eq!(file(r"\\.\pipe\é"), "pipe-%C3%A9.sock");
+        // A name too long for a Cygwin socket path is hashed.
+        let long = format!(r"\\.\pipe\{}", "x.".repeat(40));
+        let hashed = file(&long);
+        assert!(hashed.starts_with("pipe.") && hashed.ends_with(".sock"));
+        assert_eq!(hashed.len(), "pipe..sock".len() + 16);
+        assert_eq!(file(&long.to_uppercase()), hashed, "pipe names ignore case");
+        assert_ne!(file(&format!("{long}y")), hashed);
     }
 
     #[test]

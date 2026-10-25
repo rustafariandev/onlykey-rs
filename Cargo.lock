@@ -725,6 +725,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
  "zeroize",
 ]
 
@@ -767,6 +768,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "unicode-normalization",
+ "windows-sys",
  "zeroize",
 ]
 
@@ -1160,9 +1163,9 @@ dependencies = [
 
 [[package]]
 name = "ssh-agent-kit"
-version = "1.0.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093c7c9c4fbe12720aea2446bb78d74794d80b0e6ea547baaedcf9739216d9be"
+checksum = "265044fc3e585bab460532cd4737432588c33f2146d22206670375b69a161f9f"
 dependencies = [
  "arc-swap",
  "nix",
@@ -1174,6 +1177,7 @@ dependencies = [
  "ssh-key",
  "thiserror",
  "tracing",
+ "windows-sys",
  "zeroize",
 ]
 
@@ -1299,6 +1303,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "toml"
 version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1409,6 +1419,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "utf8parse"

@@ -5,10 +5,10 @@
 #   packaging/release.sh 0.2.0 --push     # also push the commit and tag
 #
 # Updates Cargo.toml, Cargo.lock, packaging/debian/changelog,
-# packaging/arch/PKGBUILD and packaging/rpm/okagent.spec, runs fmt, clippy and
-# the tests, commits, and creates an annotated vX.Y.Z tag. Pushing the tag
-# triggers .github/workflows/release.yml, which builds every package and
-# attaches it to the GitHub release.
+# packaging/arch/PKGBUILD, packaging/rpm/okagent.spec and the man page header,
+# runs fmt, clippy and the tests, commits, and creates an annotated vX.Y.Z
+# tag. Pushing the tag triggers .github/workflows/release.yml, which builds
+# every package and attaches it to the GitHub release.
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -76,13 +76,17 @@ spec_date="$(LC_ALL=C date '+%a %b %d %Y')"
 } > packaging/rpm/okagent.spec.new
 mv packaging/rpm/okagent.spec.new packaging/rpm/okagent.spec
 
+echo "==> okagent/okagent.1"
+sed -i -E "s/^\.TH OKAGENT 1 \"[^\"]*\" \"okagent [^\"]*\"/.TH OKAGENT 1 \"$(date +%F)\" \"okagent $version\"/" \
+  okagent/okagent.1
+
 echo "==> verifying"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 echo "==> committing"
-git add Cargo.toml Cargo.lock okagent/Cargo.toml packaging/debian/changelog \
+git add Cargo.toml Cargo.lock okagent/Cargo.toml okagent/okagent.1 packaging/debian/changelog \
   packaging/arch/PKGBUILD packaging/rpm/okagent.spec
 git commit -m "Release $tag"
 git tag -a "$tag" -m "okagent $version"
