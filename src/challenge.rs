@@ -195,15 +195,26 @@ impl PinPrompt for AskpassPin {
     }
 }
 
-/// The PIN in one line of input, without its line ending; empty means
-/// cancelled.
+/// The PIN in one line of input, without its line ending and in Unicode
+/// Normalization Form C, so that `é` typed as one code point or as `e` and
+/// a combining accent is the same PIN; empty means cancelled.
 fn answer(line: &str) -> PinAnswer {
     let pin = line.trim_end_matches(['\n', '\r']);
     if pin.is_empty() {
         PinAnswer::Cancelled
     } else {
-        PinAnswer::Pin(Zeroizing::new(pin.to_owned()))
+        PinAnswer::Pin(nfc(pin))
     }
+}
+
+/// `text` in Normalization Form C, written into a buffer that never grows,
+/// so the returned, wiped one is the only full copy. NFC is at most three
+/// times as long as its input in UTF-8 (UAX #15).
+fn nfc(text: &str) -> Zeroizing<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut normalized = Zeroizing::new(String::with_capacity(3 * text.len()));
+    normalized.extend(text.nfc());
+    normalized
 }
 
 /// Reads the PIN from the controlling terminal with echo off.
@@ -223,10 +234,10 @@ impl PinPrompt for TtyPin {
         let Some(_echo_off) = tty.echo_off() else {
             return PinAnswer::Unavailable;
         };
-        if write!(&tty.output, "{} ", request.message()).is_err() {
+        if tty.write_str(&format!("{} ", request.message())).is_err() {
             return PinAnswer::Unavailable;
         }
-        match read_secret_line(&tty.input) {
+        match tty.read_secret_line() {
             // End of input (Ctrl-D) cancels.
             Ok(None) => PinAnswer::Cancelled,
             Ok(Some(line)) => answer(&line),
@@ -242,7 +253,8 @@ const MAX_SECRET_LINE: usize = 256;
 /// Read one line a byte at a time into a buffer that never grows, so the
 /// returned, wiped one is the only copy: a `BufReader` would keep the PIN in
 /// its own buffer, and a growing `String` in each one it outgrew. `None` at
-/// end of input.
+/// end of input. The Windows console is read as UTF-16 instead.
+#[cfg(any(unix, test))]
 fn read_secret_line(mut reader: impl std::io::Read) -> std::io::Result<Option<Zeroizing<String>>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_SECRET_LINE));
     let mut byte = Zeroizing::new([0u8; 1]);
@@ -372,7 +384,7 @@ impl ChallengeSink for TtyPrompt {
     fn confirm(&self, request: &ConfirmRequest) -> Option<bool> {
         let tty = tty::foreground()?;
         tty.discard_input()?;
-        if write!(&tty.output, "{} ", request.message()).is_err() {
+        if tty.write_str(&format!("{} ", request.message())).is_err() {
             return None;
         }
         let mut line = String::new();
@@ -586,6 +598,19 @@ mod tests {
         );
         assert!(read_secret_line(&[b'1'; MAX_SECRET_LINE + 1][..]).is_err());
         assert!(read_secret_line(&b"\xff\n"[..]).is_err());
+    }
+
+    #[test]
+    fn pins_are_in_normalization_form_c() {
+        let PinAnswer::Pin(pin) = answer("cafe\u{301}\r\n") else {
+            panic!("no PIN");
+        };
+        assert_eq!(pin.as_str(), "caf\u{e9}");
+        let PinAnswer::Pin(pin) = answer("caf\u{e9}") else {
+            panic!("no PIN");
+        };
+        assert_eq!(pin.as_str(), "caf\u{e9}");
+        assert!(matches!(answer("\r\n"), PinAnswer::Cancelled));
     }
 
     #[test]

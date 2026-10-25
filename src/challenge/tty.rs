@@ -7,6 +7,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::process::Command;
+use zeroize::Zeroizing;
 
 /// The user's terminal, split into its input and output.
 pub(super) struct Tty {
@@ -15,15 +16,50 @@ pub(super) struct Tty {
 }
 
 /// Write one line to the terminal.
+#[cfg(unix)]
 pub(super) fn write_line(line: &str) -> io::Result<()> {
-    #[cfg(unix)]
-    const OUTPUT: &str = "/dev/tty";
-    #[cfg(windows)]
-    const OUTPUT: &str = "CONOUT$";
     OpenOptions::new()
         .write(true)
-        .open(OUTPUT)?
+        .open("/dev/tty")?
         .write_all(line.as_bytes())
+}
+
+/// Write one line to the console.
+#[cfg(windows)]
+pub(super) fn write_line(line: &str) -> io::Result<()> {
+    write_console(&OpenOptions::new().write(true).open("CONOUT$")?, line)
+}
+
+/// Write `text` to the console `output` with `WriteConsoleW`: written as
+/// bytes, it would be shown in the console's code page, not as UTF-8.
+#[cfg(windows)]
+fn write_console(output: &File, text: &str) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::WriteConsoleW;
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rest = &wide[..];
+    while !rest.is_empty() {
+        let mut written = 0;
+        // SAFETY: the handle is the open console output; `rest` and
+        // `written` outlive the call, which reads at most `rest.len()` units.
+        if unsafe {
+            WriteConsoleW(
+                output.as_raw_handle(),
+                rest.as_ptr(),
+                rest.len() as u32,
+                &mut written,
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        rest = &rest[written as usize..];
+    }
+    Ok(())
 }
 
 /// The controlling terminal while this process is in its foreground process
@@ -90,6 +126,16 @@ pub(super) struct EchoOff<'a> {
 
 #[cfg(unix)]
 impl Tty {
+    /// Write `text` to the terminal.
+    pub fn write_str(&self, text: &str) -> io::Result<()> {
+        (&self.output).write_all(text.as_bytes())
+    }
+
+    /// Read one line: see [`read_secret_line`](super::read_secret_line).
+    pub fn read_secret_line(&self) -> io::Result<Option<Zeroizing<String>>> {
+        super::read_secret_line(&self.input)
+    }
+
     /// Stop echoing input, dropping any typeahead.
     pub fn echo_off(&self) -> Option<EchoOff<'_>> {
         use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
@@ -122,6 +168,63 @@ impl Tty {
     fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         use std::os::windows::io::AsRawHandle;
         self.input.as_raw_handle()
+    }
+
+    /// Write `text` to the console.
+    pub fn write_str(&self, text: &str) -> io::Result<()> {
+        write_console(&self.output, text)
+    }
+
+    /// Read one line with `ReadConsoleW`, a UTF-16 unit at a time into a
+    /// buffer that never grows, as [`read_secret_line`](super::read_secret_line)
+    /// does with bytes: read as bytes, it would come in the console's code
+    /// page, not UTF-8. `None` at end of input: Ctrl-Z, or a read that ended
+    /// with nothing typed.
+    pub fn read_secret_line(&self) -> io::Result<Option<Zeroizing<String>>> {
+        use windows_sys::Win32::System::Console::ReadConsoleW;
+        let mut units = Zeroizing::new(Vec::<u16>::with_capacity(super::MAX_SECRET_LINE));
+        let mut unit = Zeroizing::new([0u16; 1]);
+        loop {
+            let mut read = 0;
+            // SAFETY: the handle is the open console input; `unit` holds
+            // the one unit asked for, and it and `read` outlive the call.
+            if unsafe {
+                ReadConsoleW(
+                    self.handle(),
+                    unit.as_mut_ptr().cast(),
+                    1,
+                    &mut read,
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if read == 0 {
+                if units.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            if unit[0] == u16::from(b'\n') {
+                break;
+            }
+            if units.len() == super::MAX_SECRET_LINE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+            }
+            units.push(unit[0]);
+        }
+        // The console hands Ctrl-Z over as a character, not as end of input.
+        let line = units.strip_suffix(&[u16::from(b'\r')]).unwrap_or(&units);
+        if line == [0x1A] {
+            return Ok(None);
+        }
+        // Each unit is at most three bytes of UTF-8; a surrogate pair, four.
+        let mut text = Zeroizing::new(String::with_capacity(3 * units.len()));
+        for c in char::decode_utf16(units.iter().copied()) {
+            text.push(c.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-16"))?);
+        }
+        Ok(Some(text))
     }
 
     /// Stop echoing input, dropping any typeahead.
